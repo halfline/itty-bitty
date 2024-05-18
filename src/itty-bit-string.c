@@ -116,16 +116,16 @@ itty_bit_string_exclusive_or (itty_bit_string_t *a,
         size_t b_padding = max_number_of_words - b->number_of_words;
 
         if (a_padding > 0) {
-                itty_bit_string_append_zeros(a, a_padding);
+                itty_bit_string_append_zeros (a, a_padding);
         }
 
         if (b_padding > 0) {
-                itty_bit_string_append_zeros(b, b_padding);
+                itty_bit_string_append_zeros (b, b_padding);
         }
 
-        itty_bit_string_t *result = itty_bit_string_new();
+        itty_bit_string_t *result = itty_bit_string_new ();
         result->number_of_words = max_number_of_words;
-        result->words = malloc(result->number_of_words * WORD_SIZE_IN_BYTES);
+        result->words = malloc (result->number_of_words * WORD_SIZE_IN_BYTES);
 
         for (size_t i = 0; i < max_number_of_words; i++) {
                 result->words[i] = a->words[i] ^ b->words[i];
@@ -143,16 +143,16 @@ itty_bit_string_combine (itty_bit_string_t *a,
         size_t b_padding = max_number_of_words - b->number_of_words;
 
         if (a_padding > 0) {
-                itty_bit_string_append_zeros(a, a_padding);
+                itty_bit_string_append_zeros (a, a_padding);
         }
 
         if (b_padding > 0) {
-                itty_bit_string_append_zeros(b, b_padding);
+                itty_bit_string_append_zeros (b, b_padding);
         }
 
-        itty_bit_string_t *result = itty_bit_string_new();
+        itty_bit_string_t *result = itty_bit_string_new ();
         result->number_of_words = max_number_of_words;
-        result->words = malloc(result->number_of_words * WORD_SIZE_IN_BYTES);
+        result->words = malloc (result->number_of_words * WORD_SIZE_IN_BYTES);
 
         for (size_t i = 0; i < max_number_of_words; i++) {
                 result->words[i] = a->words[i] | b->words[i];
