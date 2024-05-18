@@ -62,6 +62,11 @@ void itty_bit_string_list_free (itty_bit_string_list_t *list);
 void itty_bit_string_list_append (itty_bit_string_list_t *list,
                                   itty_bit_string_t      *itty_bit_string);
 
+itty_bit_string_list_t *itty_bit_string_list_exclusive_or (itty_bit_string_list_t *list_a,
+                                                           itty_bit_string_list_t *list_b);
+
+itty_bit_string_t *itty_bit_string_list_condense (itty_bit_string_list_t *list);
+
 void itty_bit_string_list_iterator_init (itty_bit_string_list_t          *list,
                                          itty_bit_string_list_iterator_t *iterator);
 
