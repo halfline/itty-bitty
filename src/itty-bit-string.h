@@ -25,7 +25,7 @@ struct itty_bit_string_list_iterator_t {
 };
 
 struct itty_bit_string_iterator_t {
-        itty_bit_string_t *itty_bit_string;
+        itty_bit_string_t *bit_string;
         size_t             current_index;
 };
 

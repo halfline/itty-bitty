@@ -25,7 +25,7 @@ struct itty_bit_string_t {
 };
 
 struct itty_bit_string_list_t {
-        itty_bit_string_t **itty_bit_strings;
+        itty_bit_string_t **bit_strings;
         size_t         count;
 };
 
@@ -35,7 +35,7 @@ struct itty_bit_string_map_file_t {
         void       *mapped_data;
         size_t      word_count_per_bit_string;
         size_t      current_index;
-        itty_bit_string_list_t *itty_bit_string_list;
+        itty_bit_string_list_t *bit_string_list;
 };
 
 itty_bit_string_t *
@@ -194,7 +194,7 @@ itty_bit_string_list_t *
 itty_bit_string_list_new (void)
 {
         itty_bit_string_list_t *list = malloc (sizeof (itty_bit_string_list_t));
-        list->itty_bit_strings = NULL;
+        list->bit_strings = NULL;
         list->count = 0;
         return list;
 }
@@ -206,19 +206,19 @@ itty_bit_string_list_free (itty_bit_string_list_t *list)
                 return;
         }
         for (size_t i = 0; i < list->count; i++) {
-                itty_bit_string_free (list->itty_bit_strings[i]);
+                itty_bit_string_free (list->bit_strings[i]);
         }
-        free (list->itty_bit_strings);
+        free (list->bit_strings);
         free (list);
 }
 
 void
 itty_bit_string_list_append (itty_bit_string_list_t *list,
-                             itty_bit_string_t      *itty_bit_string)
+                             itty_bit_string_t      *bit_string)
 {
-        list->itty_bit_strings = realloc (list->itty_bit_strings,
+        list->bit_strings = realloc (list->bit_strings,
                                     (list->count + 1) * sizeof (itty_bit_string_t *));
-        list->itty_bit_strings[list->count] = itty_bit_string;
+        list->bit_strings[list->count] = bit_string;
         list->count++;
 }
 
@@ -232,23 +232,23 @@ itty_bit_string_list_iterator_init (itty_bit_string_list_t          *list,
 
 bool
 itty_bit_string_list_iterator_next (itty_bit_string_list_iterator_t  *iterator,
-                                    itty_bit_string_t               **itty_bit_string)
+                                    itty_bit_string_t               **bit_string)
 {
         if (iterator->current_index < iterator->list->count) {
-                *itty_bit_string = iterator->list->itty_bit_strings[iterator->current_index];
+                *bit_string = iterator->list->bit_strings[iterator->current_index];
                 iterator->current_index++;
                 return true;
         } else {
-                *itty_bit_string = NULL;
+                *bit_string = NULL;
                 return false;
         }
 }
 
 void
-itty_bit_string_iterator_init (itty_bit_string_t          *itty_bit_string,
+itty_bit_string_iterator_init (itty_bit_string_t          *bit_string,
                                itty_bit_string_iterator_t *iterator)
 {
-        iterator->itty_bit_string = itty_bit_string;
+        iterator->bit_string = bit_string;
         iterator->current_index = 0;
 }
 
@@ -256,8 +256,8 @@ bool
 itty_bit_string_iterator_next (itty_bit_string_iterator_t *iterator,
                                size_t                     *word)
 {
-        if (iterator->current_index < iterator->itty_bit_string->number_of_words) {
-                *word = iterator->itty_bit_string->words[iterator->current_index];
+        if (iterator->current_index < iterator->bit_string->number_of_words) {
+                *word = iterator->bit_string->words[iterator->current_index];
                 iterator->current_index++;
                 return true;
         } else {
@@ -268,18 +268,18 @@ itty_bit_string_iterator_next (itty_bit_string_iterator_t *iterator,
 
 itty_bit_string_list_t *
 itty_bit_string_split (itty_bit_string_t *itty_bit_string,
-                       size_t             number_of_itty_bit_strings)
+                       size_t             number_of_bit_strings)
 {
-        if (number_of_itty_bit_strings == 0) {
+        if (number_of_bit_strings == 0) {
                 return NULL;
         }
 
         size_t total_bits = itty_bit_string->number_of_words * WORD_SIZE_IN_BITS;
-        size_t bits_per_split = (total_bits + number_of_itty_bit_strings - 1) / number_of_itty_bit_strings;
+        size_t bits_per_split = (total_bits + number_of_bit_strings - 1) / number_of_bit_strings;
         size_t words_per_split = (bits_per_split + WORD_SIZE_IN_BITS - 1) / WORD_SIZE_IN_BITS;
 
         itty_bit_string_list_t *split_list = itty_bit_string_list_new ();
-        for (size_t i = 0; i < number_of_itty_bit_strings; i++) {
+        for (size_t i = 0; i < number_of_bit_strings; i++) {
                 itty_bit_string_t *split = itty_bit_string_new ();
                 for (size_t j = 0; j < words_per_split; j++) {
                         size_t word_index = i * words_per_split + j;
@@ -426,7 +426,7 @@ itty_bit_string_list_popcount_softmax (itty_bit_string_list_t *list,
         if (cumulative_ones != total_bits && softmax_list->count > 0) {
                 size_t excess_ones = cumulative_ones - total_bits;
                 size_t last_word_index = num_words - 1;
-                softmax_list->itty_bit_strings[softmax_list->count - 1]->words[last_word_index] >>= excess_ones;
+                softmax_list->bit_strings[softmax_list->count - 1]->words[last_word_index] >>= excess_ones;
         }
 
         return softmax_list;
@@ -448,7 +448,7 @@ void
 itty_bit_string_list_sort (itty_bit_string_list_t      *list,
                            itty_bit_string_sort_order_t order)
 {
-        qsort_r (list->itty_bit_strings, list->count, sizeof (itty_bit_string_t *), itty_bit_string_compare_qsort, &order);
+        qsort_r (list->bit_strings, list->count, sizeof (itty_bit_string_t *), itty_bit_string_compare_qsort, &order);
 }
 
 itty_bit_string_map_file_t *
@@ -480,7 +480,7 @@ itty_bit_string_map_file_new (const char *file_name,
 
         mapped_file->word_count_per_bit_string = word_count_per_bit_string;
         mapped_file->current_index = 0;
-        mapped_file->itty_bit_string_list = itty_bit_string_list_new ();
+        mapped_file->bit_string_list = itty_bit_string_list_new ();
 
         return mapped_file;
 }
@@ -493,13 +493,13 @@ itty_bit_string_map_file_free (itty_bit_string_map_file_t *mapped_file)
         }
 
         itty_bit_string_list_iterator_t iterator;
-        itty_bit_string_list_iterator_init (mapped_file->itty_bit_string_list, &iterator);
+        itty_bit_string_list_iterator_init (mapped_file->bit_string_list, &iterator);
         itty_bit_string_t *itty_bit_string;
         while (itty_bit_string_list_iterator_next (&iterator, &itty_bit_string)) {
                 itty_bit_string->words = NULL;  // Clear the words pointer
         }
 
-        itty_bit_string_list_free (mapped_file->itty_bit_string_list);
+        itty_bit_string_list_free (mapped_file->bit_string_list);
         munmap (mapped_file->mapped_data, mapped_file->file_size);
         close (mapped_file->fd);
         free (mapped_file);
@@ -530,12 +530,12 @@ itty_bit_string_map_file_next (itty_bit_string_map_file_t *mapped_file)
                 return false;
         }
 
-        itty_bit_string_list_append (mapped_file->itty_bit_string_list, itty_bit_string);
+        itty_bit_string_list_append (mapped_file->bit_string_list, itty_bit_string);
         return true;
 }
 
 itty_bit_string_list_t *
 itty_bit_string_map_file_peek_at_string_list (itty_bit_string_map_file_t *mapped_file)
 {
-        return mapped_file->itty_bit_string_list;
+        return mapped_file->bit_string_list;
 }
