@@ -41,6 +41,11 @@ void itty_bit_string_append_zeros (itty_bit_string_t *itty_bit_string,
 
 itty_bit_string_t *itty_bit_string_exclusive_nor (itty_bit_string_t *a,
                                                   itty_bit_string_t *b);
+itty_bit_string_t *itty_bit_string_exclusive_or (itty_bit_string_t *a,
+                                                 itty_bit_string_t *b);
+
+itty_bit_string_t *itty_bit_string_combine (itty_bit_string_t *a,
+                                            itty_bit_string_t *b);
 
 size_t itty_bit_string_get_pop_count (itty_bit_string_t *itty_bit_string);
 
