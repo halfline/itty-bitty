@@ -1,4 +1,7 @@
 #define _GNU_SOURCE
+
+#include "itty-bit-string.h"
+
 #include <assert.h>
 #include <limits.h>
 #include <stdio.h>
@@ -14,46 +17,26 @@
 #define WORD_SIZE_IN_BYTES (sizeof (size_t))
 #define WORD_SIZE_IN_BITS (WORD_SIZE_IN_BYTES * CHAR_BIT)
 
-typedef struct {
+struct itty_bit_string_t {
         size_t *words;
         size_t number_of_words;
         size_t pop_count;
         bool pop_count_computed;
-} itty_bit_string_t;
+};
 
-typedef struct {
+struct itty_bit_string_list_t {
         itty_bit_string_t **itty_bit_strings;
         size_t         count;
-} itty_bit_string_list_t;
+};
 
-typedef struct {
-        itty_bit_string_list_t *list;
-        size_t             current_index;
-} itty_bit_string_list_iterator_t;
-
-typedef struct {
-        itty_bit_string_t *itty_bit_string;
-        size_t        current_index;
-} itty_bit_string_iterator_t;
-
-typedef enum {
-        BIT_STRING_PRESENTATION_FORMAT_BINARY,
-        BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL
-} itty_bit_string_presentation_format_t;
-
-typedef enum {
-        BIT_STRING_SORT_ORDER_ASCENDING,
-        BIT_STRING_SORT_ORDER_DESCENDING
-} itty_bit_string_sort_order_t;
-
-typedef struct {
+struct itty_bit_string_map_file_t {
         int         fd;
         size_t      file_size;
         void       *mapped_data;
-        size_t      word_count_per_itty_bit_string;
+        size_t      word_count_per_bit_string;
         size_t      current_index;
         itty_bit_string_list_t *itty_bit_string_list;
-} itty_bit_string_map_file_t;
+};
 
 itty_bit_string_t *
 itty_bit_string_new (void)
@@ -416,7 +399,7 @@ itty_bit_string_list_sort (itty_bit_string_list_t      *list,
 
 itty_bit_string_map_file_t *
 itty_bit_string_map_file_new (const char *file_name,
-                              size_t      word_count_per_itty_bit_string)
+                              size_t      word_count_per_bit_string)
 {
         itty_bit_string_map_file_t *mapped_file = malloc (sizeof (itty_bit_string_map_file_t));
 
@@ -441,7 +424,7 @@ itty_bit_string_map_file_new (const char *file_name,
                 return NULL;
         }
 
-        mapped_file->word_count_per_itty_bit_string = word_count_per_itty_bit_string;
+        mapped_file->word_count_per_bit_string = word_count_per_bit_string;
         mapped_file->current_index = 0;
         mapped_file->itty_bit_string_list = itty_bit_string_list_new ();
 
@@ -478,7 +461,7 @@ itty_bit_string_map_file_get_next (itty_bit_string_map_file_t *mapped_file)
 
         itty_bit_string_t *itty_bit_string = itty_bit_string_new ();
         itty_bit_string->words = (size_t *) (mapped_file->mapped_data) + mapped_file->current_index;
-        itty_bit_string->number_of_words = mapped_file->word_count_per_itty_bit_string;
+        itty_bit_string->number_of_words = mapped_file->word_count_per_bit_string;
         itty_bit_string->pop_count_computed = false;
 
         mapped_file->current_index += itty_bit_string->number_of_words;
@@ -501,188 +484,4 @@ itty_bit_string_list_t *
 itty_bit_string_map_file_peek_at_string_list (itty_bit_string_map_file_t *mapped_file)
 {
         return mapped_file->itty_bit_string_list;
-}
-
-int
-main (void)
-{
-        itty_bit_string_t *a = itty_bit_string_new ();
-        itty_bit_string_t *b = itty_bit_string_new ();
-
-        itty_bit_string_append_word (a, 0b10101010);
-        itty_bit_string_append_word (a, 0b11110000);
-        itty_bit_string_append_word (a, 0b11111111);
-        itty_bit_string_append_word (a, 0b00000000);
-
-        itty_bit_string_append_word (b, 0b11001100);
-
-        printf ("Bit string a:\n");
-        char *a_binary_representation = itty_bit_string_present (a, BIT_STRING_PRESENTATION_FORMAT_BINARY);
-        if (a_binary_representation) {
-                printf ("  Binary: %s\n", a_binary_representation);
-                free (a_binary_representation);
-        }
-        char *a_hexadecimal_representation = itty_bit_string_present (a, BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL);
-        if (a_hexadecimal_representation) {
-                printf ("  Hexadecimal: %s\n", a_hexadecimal_representation);
-                free (a_hexadecimal_representation);
-        }
-
-        printf ("Bit string b:\n");
-        char *b_binary_representation = itty_bit_string_present (b, BIT_STRING_PRESENTATION_FORMAT_BINARY);
-        if (b_binary_representation) {
-                printf ("  Binary: %s\n", b_binary_representation);
-                free (b_binary_representation);
-        }
-        char *b_hexadecimal_representation = itty_bit_string_present (b, BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL);
-        if (b_hexadecimal_representation) {
-                printf ("  Hexadecimal: %s\n", b_hexadecimal_representation);
-                free (b_hexadecimal_representation);
-        }
-
-        size_t similarity = itty_bit_string_evaluate_similarity (a, b);
-        printf ("Rate of similarity: %zu\n", similarity);
-
-        int comparison = itty_bit_string_compare (a, b);
-        printf ("Pop count comparison (a - b): %d\n", comparison);
-
-        size_t number_of_itty_bit_strings = 3;
-        itty_bit_string_list_t *string_list = itty_bit_string_split (a, number_of_itty_bit_strings);
-        printf ("Splits:\n");
-
-        itty_bit_string_list_iterator_t list_iterator;
-        itty_bit_string_list_iterator_init (string_list, &list_iterator);
-
-        itty_bit_string_t *itty_bit_string;
-        size_t i = 0;
-        while (itty_bit_string_list_iterator_next (&list_iterator, &itty_bit_string)) {
-                printf ("Bit string %zu:\n", i + 1);
-                itty_bit_string_iterator_t itty_bit_string_iterator;
-                itty_bit_string_iterator_init (itty_bit_string, &itty_bit_string_iterator);
-                size_t word;
-                size_t j = 0;
-                while (itty_bit_string_iterator_next (&itty_bit_string_iterator, &word)) {
-                        printf ("  Word %zu: %zu\n", j + 1, word);
-                        j++;
-                }
-
-                char *binary_representation = itty_bit_string_present (itty_bit_string, BIT_STRING_PRESENTATION_FORMAT_BINARY);
-                if (binary_representation) {
-                        printf ("  Binary: %s\n", binary_representation);
-                        free (binary_representation);
-                }
-
-                char *hexadecimal_representation = itty_bit_string_present (itty_bit_string, BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL);
-                if (hexadecimal_representation) {
-                        printf ("  Hexadecimal: %s\n", hexadecimal_representation);
-                        free (hexadecimal_representation);
-                }
-
-                i++;
-        }
-
-        size_t num_words = 1;
-        itty_bit_string_list_t *softmax_list = itty_bit_string_list_popcount_softmax (string_list, num_words);
-        printf ("Softmax list:\n");
-
-        itty_bit_string_list_iterator_init (softmax_list, &list_iterator);
-        i = 0;
-        while (itty_bit_string_list_iterator_next (&list_iterator, &itty_bit_string)) {
-                printf ("Softmax bit string %zu:\n", i + 1);
-                itty_bit_string_iterator_t itty_bit_string_iterator;
-                itty_bit_string_iterator_init (itty_bit_string, &itty_bit_string_iterator);
-                size_t word;
-                size_t j = 0;
-                while (itty_bit_string_iterator_next (&itty_bit_string_iterator, &word)) {
-                        printf ("  Word %zu: %zu\n", j + 1, word);
-                        j++;
-                }
-
-                char *binary_representation = itty_bit_string_present (itty_bit_string, BIT_STRING_PRESENTATION_FORMAT_BINARY);
-                if (binary_representation) {
-                        printf ("  Binary: %s\n", binary_representation);
-                        free (binary_representation);
-                }
-
-                char *hexadecimal_representation = itty_bit_string_present (itty_bit_string, BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL);
-                if (hexadecimal_representation) {
-                        printf ("  Hexadecimal: %s\n", hexadecimal_representation);
-                        free (hexadecimal_representation);
-                }
-
-                i++;
-        }
-
-        printf ("Sorting softmax list by pop count...\n");
-        itty_bit_string_list_sort (softmax_list, BIT_STRING_SORT_ORDER_DESCENDING);
-
-        printf ("Sorted Softmax list:\n");
-        itty_bit_string_list_iterator_init (softmax_list, &list_iterator);
-        i = 0;
-        while (itty_bit_string_list_iterator_next (&list_iterator, &itty_bit_string)) {
-                printf ("Sorted Softmax bit string %zu:\n", i + 1);
-                itty_bit_string_iterator_t itty_bit_string_iterator;
-                itty_bit_string_iterator_init (itty_bit_string, &itty_bit_string_iterator);
-                size_t word;
-                size_t j = 0;
-                while (itty_bit_string_iterator_next (&itty_bit_string_iterator, &word)) {
-                        printf ("  Word %zu: %zu\n", j + 1, word);
-                        j++;
-                }
-
-                char *binary_representation = itty_bit_string_present (itty_bit_string, BIT_STRING_PRESENTATION_FORMAT_BINARY);
-                if (binary_representation) {
-                        printf ("  Binary: %s\n", binary_representation);
-                        free (binary_representation);
-                }
-
-                char *hexadecimal_representation = itty_bit_string_present (itty_bit_string, BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL);
-                if (hexadecimal_representation) {
-                        printf ("  Hexadecimal: %s\n", hexadecimal_representation);
-                        free (hexadecimal_representation);
-                }
-
-                i++;
-        }
-
-        itty_bit_string_list_free (softmax_list);
-        itty_bit_string_list_free (string_list);
-
-        itty_bit_string_free (a);
-        itty_bit_string_free (b);
-
-        itty_bit_string_map_file_t *mapped_file = itty_bit_string_map_file_new ("itty_bit_strings.bin", 2);
-        if (mapped_file) {
-                printf ("Reading bit strings from file:\n");
-                while (itty_bit_string_map_file_next (mapped_file)) {
-                        itty_bit_string_list_t *list = itty_bit_string_map_file_peek_at_string_list (mapped_file);
-                        itty_bit_string_list_iterator_init (list, &list_iterator);
-                        while (itty_bit_string_list_iterator_next (&list_iterator, &itty_bit_string)) {
-                                printf ("Bit string from file:\n");
-                                itty_bit_string_iterator_t itty_bit_string_iterator;
-                                itty_bit_string_iterator_init (itty_bit_string, &itty_bit_string_iterator);
-                                size_t word;
-                                size_t j = 0;
-                                while (itty_bit_string_iterator_next (&itty_bit_string_iterator, &word)) {
-                                        printf ("  Word %zu: %zu\n", j + 1, word);
-                                        j++;
-                                }
-
-                                char *binary_representation = itty_bit_string_present (itty_bit_string, BIT_STRING_PRESENTATION_FORMAT_BINARY);
-                                if (binary_representation) {
-                                        printf ("  Binary: %s\n", binary_representation);
-                                        free (binary_representation);
-                                }
-
-                                char *hexadecimal_representation = itty_bit_string_present (itty_bit_string, BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL);
-                                if (hexadecimal_representation) {
-                                        printf ("  Hexadecimal: %s\n", hexadecimal_representation);
-                                        free (hexadecimal_representation);
-                                }
-                        }
-                }
-                itty_bit_string_map_file_free (mapped_file);
-        }
-
-        return 0;
 }
