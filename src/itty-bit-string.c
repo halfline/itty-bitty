@@ -227,6 +227,27 @@ itty_bit_string_list_append (itty_bit_string_list_t *list,
                 list->max_number_of_words = bit_string->number_of_words;
 }
 
+itty_bit_string_list_t *
+itty_bit_string_list_exclusive_or (itty_bit_string_list_t *list_a,
+                                   itty_bit_string_list_t *list_b)
+{
+        if (!list_a || !list_b) {
+                return NULL;
+        }
+
+        size_t min_count = (list_a->count < list_b->count) ? list_a->count : list_b->count;
+
+        itty_bit_string_list_t *result_list = itty_bit_string_list_new ();
+
+        for (size_t i = 0; i < min_count; i++) {
+                itty_bit_string_t *result = itty_bit_string_exclusive_or (list_a->bit_strings[i],
+                                                                          list_b->bit_strings[i]);
+                itty_bit_string_list_append (result_list, result);
+        }
+
+        return result_list;
+}
+
 itty_bit_string_t *
 itty_bit_string_list_condense (itty_bit_string_list_t *list)
 {
