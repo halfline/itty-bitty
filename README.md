@@ -2,6 +2,8 @@
 
 The Itty Bitty project is an innovative exploration into neural network architectures that utilize bit string manipulations instead of traditional floating-point vectors. This project aims to investigate the feasibility and performance of bitwise operations as the fundamental building blocks for neural networks, potentially offering significant computational efficiency and resource savings.
 
+The project is an incomplete and unproven experiment. It's future is uncertain.
+
 ##  Motivation
 
 Traditional neural networks rely heavily on floating-point arithmetic to perform computations. However, floating-point operations can be computationally intensive and resource-demanding. The Itty Bitty project proposes an alternative approach, leveraging the simplicity and efficiency of bitwise operations to perform neural network computations. This method has the potential to significantly reduce computational overhead, making neural networks more efficient and accessible, especially in resource-constrained environments.
@@ -40,20 +42,29 @@ cd _build; ninja
 
 ## Running the Project
 
-To run the project, use the following command:
+To run the project, use the following commands:
 
 ```sh
-./itty_bitty <bit_string_file> <number_of_layers> <nodes_per_layer>
+# create a limited vocabulary
+echo -e "a\nb\nc\nd\ne\nf\ng\nh\ni\nj\nk\nl\nm\nn\no\np\nq\nr\ns\nt\nu\nv\nw\nx\ny\nz\n" > vocabulary.txt
+
+# No way to train the model yet, so we have no way to map tokens to bit strings yet.
+# Just use /dev/urandom, and make every 8 bytes correspond to the next word in the vocabulary
+dd if=/dev/urandom of=vocab.bin count=256 bs=1
+
+# encode an input into a bit stream of tokens
+echo hello | ./itty-bitty vocabulary.txt vocab.bin context.bin
+
+# Again, no way to train the model yet, so just pretend we have a trained one
+dd if=/dev/urandom of=model.bin count=1024 bs=1024
+
+# feed the encoded text to the model, use 2 layers and 2 nodes per layer
+./itty-bitty vocabulary.txt vocab.bin model.bin context.bin 2 2
 ```
 
-For example:
+This command will create a neural network with 2 layers and 2 nodes per layer, using the bit strings from `model.bin`
 
-```sh
-dd if=/dev/urandom count=10 of=model
-./itty_bitty model 3 4
-```
-
-This command will create a neural network with 3 layers and 4 nodes per layer, using the bit strings from `model`
+It will be a lot more useful once training is implemented and more than just feed for layers.
 
 ## Example Use Case
 

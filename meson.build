@@ -5,6 +5,7 @@ library_sources = [
         'src/itty-bit-string.c',
         'src/itty-bit-string-list.c',
         'src/itty-bit-string-map.c',
+        'src/itty-network.c',
         'src/itty-vocabulary.c',
 ]
 
