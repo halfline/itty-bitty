@@ -27,6 +27,7 @@ struct itty_bit_string_t {
 struct itty_bit_string_list_t {
         itty_bit_string_t **bit_strings;
         size_t         count;
+        size_t         max_number_of_words;
 };
 
 struct itty_bit_string_map_file_t {
@@ -83,9 +84,9 @@ itty_bit_string_t *
 itty_bit_string_exclusive_nor (itty_bit_string_t *a,
                                itty_bit_string_t *b)
 {
-        size_t max_length = a->number_of_words > b->number_of_words ? a->number_of_words : b->number_of_words;
-        size_t a_padding = max_length - a->number_of_words;
-        size_t b_padding = max_length - b->number_of_words;
+        size_t max_number_of_words = a->number_of_words > b->number_of_words ? a->number_of_words : b->number_of_words;
+        size_t a_padding = max_number_of_words - a->number_of_words;
+        size_t b_padding = max_number_of_words - b->number_of_words;
 
         if (a_padding > 0) {
                 itty_bit_string_append_zeros (a, a_padding);
@@ -96,10 +97,10 @@ itty_bit_string_exclusive_nor (itty_bit_string_t *a,
         }
 
         itty_bit_string_t *result = itty_bit_string_new ();
-        result->number_of_words = max_length;
+        result->number_of_words = max_number_of_words;
         result->words = malloc (result->number_of_words * WORD_SIZE_IN_BYTES);
 
-        for (size_t i = 0; i < max_length; i++) {
+        for (size_t i = 0; i < max_number_of_words; i++) {
                 result->words[i] = ~(a->words[i] ^ b->words[i]);
         }
 
@@ -110,9 +111,9 @@ itty_bit_string_t *
 itty_bit_string_exclusive_or (itty_bit_string_t *a,
                               itty_bit_string_t *b)
 {
-        size_t max_length = a->number_of_words > b->number_of_words ? a->number_of_words : b->number_of_words;
-        size_t a_padding = max_length - a->number_of_words;
-        size_t b_padding = max_length - b->number_of_words;
+        size_t max_number_of_words = a->number_of_words > b->number_of_words ? a->number_of_words : b->number_of_words;
+        size_t a_padding = max_number_of_words - a->number_of_words;
+        size_t b_padding = max_number_of_words - b->number_of_words;
 
         if (a_padding > 0) {
                 itty_bit_string_append_zeros(a, a_padding);
@@ -123,10 +124,10 @@ itty_bit_string_exclusive_or (itty_bit_string_t *a,
         }
 
         itty_bit_string_t *result = itty_bit_string_new();
-        result->number_of_words = max_length;
+        result->number_of_words = max_number_of_words;
         result->words = malloc(result->number_of_words * WORD_SIZE_IN_BYTES);
 
-        for (size_t i = 0; i < max_length; i++) {
+        for (size_t i = 0; i < max_number_of_words; i++) {
                 result->words[i] = a->words[i] ^ b->words[i];
         }
 
@@ -137,9 +138,9 @@ itty_bit_string_t *
 itty_bit_string_combine (itty_bit_string_t *a,
                          itty_bit_string_t *b)
 {
-        size_t max_length = a->number_of_words > b->number_of_words ? a->number_of_words : b->number_of_words;
-        size_t a_padding = max_length - a->number_of_words;
-        size_t b_padding = max_length - b->number_of_words;
+        size_t max_number_of_words = a->number_of_words > b->number_of_words ? a->number_of_words : b->number_of_words;
+        size_t a_padding = max_number_of_words - a->number_of_words;
+        size_t b_padding = max_number_of_words - b->number_of_words;
 
         if (a_padding > 0) {
                 itty_bit_string_append_zeros(a, a_padding);
@@ -150,10 +151,10 @@ itty_bit_string_combine (itty_bit_string_t *a,
         }
 
         itty_bit_string_t *result = itty_bit_string_new();
-        result->number_of_words = max_length;
+        result->number_of_words = max_number_of_words;
         result->words = malloc(result->number_of_words * WORD_SIZE_IN_BYTES);
 
-        for (size_t i = 0; i < max_length; i++) {
+        for (size_t i = 0; i < max_number_of_words; i++) {
                 result->words[i] = a->words[i] | b->words[i];
         }
 
@@ -196,6 +197,7 @@ itty_bit_string_list_new (void)
         itty_bit_string_list_t *list = malloc (sizeof (itty_bit_string_list_t));
         list->bit_strings = NULL;
         list->count = 0;
+        list->max_number_of_words = 0;
         return list;
 }
 
@@ -220,6 +222,30 @@ itty_bit_string_list_append (itty_bit_string_list_t *list,
                                     (list->count + 1) * sizeof (itty_bit_string_t *));
         list->bit_strings[list->count] = bit_string;
         list->count++;
+
+        if (bit_string->number_of_words > list->max_number_of_words)
+                list->max_number_of_words = bit_string->number_of_words;
+}
+
+itty_bit_string_t *
+itty_bit_string_list_condense (itty_bit_string_list_t *list)
+{
+        if (list->count == 0) {
+                return NULL;
+        }
+
+        itty_bit_string_t *result = itty_bit_string_new ();
+        result->number_of_words = list->max_number_of_words;
+        result->words = calloc (result->number_of_words, WORD_SIZE_IN_BYTES);
+
+        for (size_t i = 0; i < list->count; i++) {
+                itty_bit_string_t *bit_string = list->bit_strings[i];
+                for (size_t j = 0; j < bit_string->number_of_words; j++) {
+                        result->words[j] |= bit_string->words[j];
+                }
+        }
+
+        return result;
 }
 
 void
