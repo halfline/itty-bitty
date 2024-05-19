@@ -195,7 +195,32 @@ int
 itty_bit_string_compare (itty_bit_string_t *a,
                          itty_bit_string_t *b)
 {
+        if (a == b)
+                return 0;
+        if (itty_bit_string_get_number_of_words (a) < itty_bit_string_get_number_of_words (b))
+                return -1;
+        if (itty_bit_string_get_number_of_words (a) > itty_bit_string_get_number_of_words (b))
+                return 1;
+        return memcmp (a->words, b->words, a->number_of_words * WORD_SIZE_IN_BYTES);
+}
+
+int
+itty_bit_string_compare_by_pop_count (itty_bit_string_t *a,
+                                      itty_bit_string_t *b)
+{
         return (int) (itty_bit_string_get_pop_count (a) - itty_bit_string_get_pop_count (b));
+}
+
+void *
+itty_bit_string_get_words (itty_bit_string_t *bit_string)
+{
+        return bit_string->words;
+}
+
+size_t
+itty_bit_string_get_number_of_words (itty_bit_string_t *bit_string)
+{
+        return bit_string->number_of_words;
 }
 
 itty_bit_string_list_t *
@@ -360,8 +385,8 @@ itty_bit_string_list_present (itty_bit_string_list_t                *bit_string_
         char *list_representation = NULL;
         size_t max_length = 0;
 
-        bool is_display_format = (format == BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY ||
-                                  format == BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY);
+        bool is_display_format = (format == ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY ||
+                                  format == ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY);
 
         for (size_t i = 0; i < bit_string_list->count; i++) {
                 char *bit_string_representation = itty_bit_string_present (bit_string_list->bit_strings[i], format);
@@ -552,18 +577,18 @@ itty_bit_string_present (itty_bit_string_t                     *bit_string,
         size_t buffer_size = 0;
 
         switch (format) {
-                case BIT_STRING_PRESENTATION_FORMAT_BINARY:
-                case BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY:
+                case ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY:
+                case ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY:
                         buffer_size = total_bits;
 
-                        if (format == BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY)
+                        if (format == ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY)
                                 buffer_size += strlen ("0b");
                         break;
-                case BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL:
-                case BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY:
+                case ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL:
+                case ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY:
                         buffer_size = bit_string->number_of_words * (WORD_SIZE_IN_BYTES * 2 + 1);
 
-                        if (format == BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY)
+                        if (format == ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY)
                                 buffer_size += strlen ("0x");
                         break;
                 default:
@@ -576,7 +601,7 @@ itty_bit_string_present (itty_bit_string_t                     *bit_string,
         size_t output_index = 0;
         bool at_leading_zero = true;
         switch (format) {
-        case BIT_STRING_PRESENTATION_FORMAT_BINARY:
+        case ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY:
                 for (size_t i = 0; i < bit_string->number_of_words; i++) {
                         size_t word = bit_string->words[i];
                         for (size_t j = WORD_SIZE_IN_BITS; j > 0; j--) {
@@ -586,14 +611,14 @@ itty_bit_string_present (itty_bit_string_t                     *bit_string,
                 bit_string_representation[output_index] = '\0';
                 break;
 
-        case BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL:
+        case ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL:
                 bit_string_representation[output_index] = '\0';
                 for (size_t i = 0; i < bit_string->number_of_words; i++) {
                         output_index += snprintf (&bit_string_representation[output_index], buffer_size - output_index, "%016lx", bit_string->words[i]);
                 }
                 break;
 
-        case BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY:
+        case ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY:
                 strcpy (bit_string_representation, "0b");
                 output_index = 2;
 
@@ -610,7 +635,7 @@ itty_bit_string_present (itty_bit_string_t                     *bit_string,
                 bit_string_representation[output_index] = '\0';
                 break;
 
-        case BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY:
+        case ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY:
                 strcpy (bit_string_representation, "0x");
                 output_index = 2;
 
@@ -716,22 +741,23 @@ itty_bit_string_list_popcount_argmax (itty_bit_string_list_t *list,
 }
 
 int
-itty_bit_string_compare_qsort (const void *a,
-                               const void *b,
-                               void       *order)
+itty_bit_string_compare_by_pop_count_qsort (const void *a,
+                                            const void *b,
+                                            void       *order)
 {
         itty_bit_string_t *itty_bit_string_a = *(itty_bit_string_t **) a;
         itty_bit_string_t *itty_bit_string_b = *(itty_bit_string_t **) b;
         itty_bit_string_sort_order_t sort_order = *(itty_bit_string_sort_order_t *) order;
-        return (sort_order == BIT_STRING_SORT_ORDER_ASCENDING) ? itty_bit_string_compare (itty_bit_string_a, itty_bit_string_b)
-                                                               : itty_bit_string_compare (itty_bit_string_b, itty_bit_string_a);
+        return (sort_order == ITTY_BIT_STRING_SORT_ORDER_ASCENDING) ?
+                itty_bit_string_compare_by_pop_count (itty_bit_string_a, itty_bit_string_b) :
+                itty_bit_string_compare_by_pop_count (itty_bit_string_b, itty_bit_string_a);
 }
 
 void
 itty_bit_string_list_sort (itty_bit_string_list_t      *list,
                            itty_bit_string_sort_order_t order)
 {
-        qsort_r (list->bit_strings, list->count, sizeof (itty_bit_string_t *), itty_bit_string_compare_qsort, &order);
+        qsort_r (list->bit_strings, list->count, sizeof (itty_bit_string_t *), itty_bit_string_compare_by_pop_count_qsort, &order);
 }
 
 itty_bit_string_map_file_t *
@@ -739,7 +765,8 @@ itty_bit_string_map_file_new (const char *file_name)
 {
         itty_bit_string_map_file_t *mapped_file = malloc (sizeof (itty_bit_string_map_file_t));
 
-        mapped_file->fd = open (file_name, O_RDONLY);
+        mapped_file->mapped_data = MAP_FAILED;
+        mapped_file->fd = open (file_name, O_RDWR | O_CREAT, 0644);
         if (mapped_file->fd == -1) {
                 free (mapped_file);
                 return NULL;
@@ -752,14 +779,16 @@ itty_bit_string_map_file_new (const char *file_name)
                 return NULL;
         }
 
-        mapped_file->file_size = sb.st_size;
-        mapped_file->mapped_data = mmap (NULL, mapped_file->file_size, PROT_READ, MAP_PRIVATE, mapped_file->fd, 0);
-        if (mapped_file->mapped_data == MAP_FAILED) {
-                close (mapped_file->fd);
-                free (mapped_file);
-                return NULL;
-        }
+        if (sb.st_size != 0) {
+                mapped_file->file_size = sb.st_size;
+                mapped_file->mapped_data = mmap (NULL, mapped_file->file_size, PROT_READ | PROT_WRITE, MAP_SHARED, mapped_file->fd, 0);
+                if (mapped_file->mapped_data == MAP_FAILED) {
+                        close (mapped_file->fd);
+                        free (mapped_file);
+                        return NULL;
+                }
 
+        }
         mapped_file->current_index = 0;
         mapped_file->bit_string_list = itty_bit_string_list_new ();
 
@@ -803,4 +832,42 @@ itty_bit_string_map_file_next (itty_bit_string_map_file_t  *mapped_file,
         mapped_file->current_index += bit_string->number_of_words;
 
         return bit_string;
+}
+
+char *
+itty_bit_string_map_file_get_mapped_data (itty_bit_string_map_file_t *mapped_file)
+{
+        if (mapped_file->mapped_data == MAP_FAILED)
+                return NULL;
+
+        return mapped_file->mapped_data;
+}
+
+bool
+itty_bit_string_map_file_resize (itty_bit_string_map_file_t *mapped_file,
+                                 size_t                      new_size)
+{
+        if (mapped_file->file_size > 0 && mapped_file->file_size > new_size) {
+                if (mapped_file->mapped_data != MAP_FAILED)
+                    mapped_file->mapped_data = mremap (mapped_file->mapped_data, mapped_file->file_size, new_size, MREMAP_MAYMOVE);
+                else
+                    mapped_file->mapped_data = mmap (NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, mapped_file->fd, 0);
+
+                if (mapped_file->mapped_data == MAP_FAILED)
+                        return false;
+        }
+
+        if (ftruncate (mapped_file->fd, new_size) < 0)
+                return false;
+
+        if (mapped_file->file_size < new_size && new_size > 0) {
+                mremap (mapped_file->mapped_data, mapped_file->file_size, new_size, 0);
+        } else if (new_size == 0 && mapped_file->file_size != 0) {
+                munmap (mapped_file->mapped_data, mapped_file->file_size);
+                mapped_file->mapped_data = MAP_FAILED;
+        }
+
+        mapped_file->file_size = new_size;
+
+        return true;
 }
