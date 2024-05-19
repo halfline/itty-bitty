@@ -394,42 +394,42 @@ itty_bit_string_reduce_by_half (itty_bit_string_t *itty_bit_string)
 }
 
 char *
-itty_bit_string_present (itty_bit_string_t                    *itty_bit_string,
+itty_bit_string_present (itty_bit_string_t                    *bit_string,
                          itty_bit_string_presentation_format_t format)
 {
-        size_t total_bits = itty_bit_string->number_of_words * WORD_SIZE_IN_BITS;
+        size_t total_bits = bit_string->number_of_words * WORD_SIZE_IN_BITS;
         size_t buffer_size;
 
         if (format == BIT_STRING_PRESENTATION_FORMAT_BINARY) {
                 buffer_size = total_bits + 1;
         } else {
-                buffer_size = itty_bit_string->number_of_words * (WORD_SIZE_IN_BYTES * 2 + 1);
+                buffer_size = bit_string->number_of_words * (WORD_SIZE_IN_BYTES * 2 + 1);
         }
 
-        char *itty_bit_string_representation = malloc (buffer_size);
-        if (!itty_bit_string_representation) {
+        char *bit_string_representation = malloc (buffer_size);
+        if (!bit_string_representation) {
                 return NULL;
         }
 
         if (format == BIT_STRING_PRESENTATION_FORMAT_BINARY) {
-                itty_bit_string_representation[total_bits] = '\0';
-                size_t itty_bitindex = 0;
-                for (size_t i = 0; i < itty_bit_string->number_of_words; i++) {
-                        size_t word = itty_bit_string->words[i];
+                bit_string_representation[total_bits] = '\0';
+                size_t bitindex = 0;
+                for (size_t i = 0; i < bit_string->number_of_words; i++) {
+                        size_t word = bit_string->words[i];
                         for (size_t j = WORD_SIZE_IN_BITS; j > 0; j--) {
-                                itty_bit_string_representation[itty_bitindex++] = (word & (1UL << (j - 1))) ? '1' : '0';
+                                bit_string_representation[bitindex++] = (word & (1UL << (j - 1))) ? '1' : '0';
                         }
                 }
         } else {
                 size_t buffer_index = 0;
-                for (size_t i = 0; i < itty_bit_string->number_of_words; i++) {
-                        int written = snprintf (&itty_bit_string_representation[buffer_index], buffer_size - buffer_index, "%016lx ", itty_bit_string->words[i]);
+                for (size_t i = 0; i < bit_string->number_of_words; i++) {
+                        int written = snprintf (&bit_string_representation[buffer_index], buffer_size - buffer_index, "%016lx ", bit_string->words[i]);
                         buffer_index += written;
                 }
-                itty_bit_string_representation[buffer_index - 1] = '\0';
+                bit_string_representation[buffer_index - 1] = '\0';
         }
 
-        return itty_bit_string_representation;
+        return bit_string_representation;
 }
 
 itty_bit_string_list_t *
