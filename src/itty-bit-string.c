@@ -56,7 +56,6 @@ itty_bit_string_free (itty_bit_string_t *itty_bit_string)
         if (!itty_bit_string) {
                 return;
         }
-        free (itty_bit_string->words);
         free (itty_bit_string);
 }
 
