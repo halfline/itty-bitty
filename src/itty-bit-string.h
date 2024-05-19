@@ -68,6 +68,7 @@ itty_bit_string_list_t *itty_bit_string_list_exclusive_or (itty_bit_string_list_
                                                            itty_bit_string_list_t *list_b);
 
 itty_bit_string_t *itty_bit_string_list_condense (itty_bit_string_list_t *list);
+itty_bit_string_list_t *itty_bit_string_list_transpose (itty_bit_string_list_t *list);
 
 itty_bit_string_t *itty_bit_string_list_fetch (itty_bit_string_list_t *list,
                                                size_t                  index);
