@@ -498,8 +498,7 @@ itty_bit_string_list_sort (itty_bit_string_list_t      *list,
 }
 
 itty_bit_string_map_file_t *
-itty_bit_string_map_file_new (const char *file_name,
-                              size_t      word_count_per_bit_string)
+itty_bit_string_map_file_new (const char *file_name)
 {
         itty_bit_string_map_file_t *mapped_file = malloc (sizeof (itty_bit_string_map_file_t));
 
@@ -524,7 +523,6 @@ itty_bit_string_map_file_new (const char *file_name,
                 return NULL;
         }
 
-        mapped_file->word_count_per_bit_string = word_count_per_bit_string;
         mapped_file->current_index = 0;
         mapped_file->bit_string_list = itty_bit_string_list_new ();
 
@@ -552,36 +550,20 @@ itty_bit_string_map_file_free (itty_bit_string_map_file_t *mapped_file)
 }
 
 itty_bit_string_t *
-itty_bit_string_map_file_get_next (itty_bit_string_map_file_t *mapped_file)
+itty_bit_string_map_file_next (itty_bit_string_map_file_t  *mapped_file,
+                               size_t                       number_of_words)
 {
         size_t total_words = mapped_file->file_size / WORD_SIZE_IN_BYTES;
         if (mapped_file->current_index >= total_words) {
                 return NULL;
         }
 
-        itty_bit_string_t *itty_bit_string = itty_bit_string_new ();
-        itty_bit_string->words = (size_t *) (mapped_file->mapped_data) + mapped_file->current_index;
-        itty_bit_string->number_of_words = mapped_file->word_count_per_bit_string;
-        itty_bit_string->pop_count_computed = false;
+        itty_bit_string_t *bit_string = itty_bit_string_new ();
+        bit_string->words = (size_t *) (mapped_file->mapped_data) + mapped_file->current_index;
+        bit_string->number_of_words = number_of_words;
+        bit_string->pop_count_computed = false;
 
-        mapped_file->current_index += itty_bit_string->number_of_words;
-        return itty_bit_string;
-}
+        mapped_file->current_index += bit_string->number_of_words;
 
-bool
-itty_bit_string_map_file_next (itty_bit_string_map_file_t *mapped_file)
-{
-        itty_bit_string_t *itty_bit_string = itty_bit_string_map_file_get_next (mapped_file);
-        if (!itty_bit_string) {
-                return false;
-        }
-
-        itty_bit_string_list_append (mapped_file->bit_string_list, itty_bit_string);
-        return true;
-}
-
-itty_bit_string_list_t *
-itty_bit_string_map_file_peek_at_string_list (itty_bit_string_map_file_t *mapped_file)
-{
-        return mapped_file->bit_string_list;
+        return bit_string;
 }
