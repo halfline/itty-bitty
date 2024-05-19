@@ -278,18 +278,71 @@ itty_bit_string_list_condense (itty_bit_string_list_t *list)
                 return NULL;
         }
 
-        itty_bit_string_t *result = itty_bit_string_new ();
-        result->number_of_words = list->max_number_of_words;
-        result->words = calloc (result->number_of_words, WORD_SIZE_IN_BYTES);
+        size_t max_number_of_words = list->max_number_of_words;
+        itty_bit_string_t *condensed_bit_string = itty_bit_string_new ();
+        condensed_bit_string->words = calloc (max_number_of_words, sizeof (size_t));
+        condensed_bit_string->number_of_words = max_number_of_words;
 
-        for (size_t i = 0; i < list->count; i++) {
-                itty_bit_string_t *bit_string = list->bit_strings[i];
-                for (size_t j = 0; j < bit_string->number_of_words; j++) {
-                        result->words[j] ^= bit_string->words[j];
+        size_t majority_threshold = list->count / 2 + 1;
+
+        for (size_t word_index = 0; word_index < max_number_of_words; word_index++) {
+                for (size_t bit_index = 0; bit_index < WORD_SIZE_IN_BITS; bit_index++) {
+                        size_t bit_count = 0;
+                        for (size_t i = 0; i < list->count; i++) {
+                                size_t word = list->bit_strings[i]->words[word_index];
+                                if (word & ((size_t) 1 << (WORD_SIZE_IN_BITS - 1 - bit_index))) {
+                                        bit_count++;
+                                }
+                        }
+                        if (bit_count >= majority_threshold) {
+                                condensed_bit_string->words[word_index] |= ((size_t) 1 << (WORD_SIZE_IN_BITS - 1 - bit_index));
+                        }
                 }
         }
 
-        return result;
+        return condensed_bit_string;
+}
+
+itty_bit_string_list_t *
+itty_bit_string_list_transpose (itty_bit_string_list_t *list)
+{
+        if (list == NULL || list->count == 0) {
+                return NULL;
+        }
+
+        itty_bit_string_list_t *transposed_list = itty_bit_string_list_new ();
+
+        size_t number_of_words = list->max_number_of_words;
+        for (size_t i = 0; i < WORD_SIZE_IN_BITS; i++) {
+                itty_bit_string_t *new_bit_string = itty_bit_string_new();
+                new_bit_string->words = calloc (number_of_words, sizeof (size_t));
+                new_bit_string->number_of_words = number_of_words;
+                itty_bit_string_list_append (transposed_list, new_bit_string);
+        }
+
+        itty_bit_string_list_iterator_t list_iterator;
+        itty_bit_string_list_iterator_init (list, &list_iterator);
+        itty_bit_string_t *original_bit_string;
+
+        size_t current_string_index = 0;
+        while (itty_bit_string_list_iterator_next (&list_iterator, &original_bit_string)) {
+                itty_bit_string_iterator_t word_iterator;
+                itty_bit_string_iterator_init (original_bit_string, &word_iterator);
+                size_t word_index = 0;
+                size_t word;
+
+                while (itty_bit_string_iterator_next (&word_iterator, &word)) {
+                        for (size_t bit = 0; bit < WORD_SIZE_IN_BITS; bit++) {
+                                size_t bit_value = (word >> (WORD_SIZE_IN_BITS - 1 - bit)) & 1;
+                                itty_bit_string_t *transposed_bit_string = transposed_list->bit_strings[bit];
+                                transposed_bit_string->words[word_index] |= bit_value << (list->count - 1 - current_string_index);
+                        }
+                        word_index++;
+                }
+                current_string_index++;
+        }
+
+        return transposed_list;
 }
 
 size_t
