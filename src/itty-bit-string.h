@@ -11,7 +11,9 @@ typedef struct itty_bit_string_map_file_t itty_bit_string_map_file_t;
 
 typedef enum {
         BIT_STRING_PRESENTATION_FORMAT_BINARY,
-        BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL
+        BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY,
+        BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL,
+        BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY
 } itty_bit_string_presentation_format_t;
 
 typedef enum {
