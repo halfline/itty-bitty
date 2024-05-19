@@ -3,6 +3,8 @@
 #include <stddef.h>
 #include <stdbool.h>
 
+#define ITTY_BIT_STRING_WORD_SIZE_IN_BYTES (sizeof (size_t))
+
 typedef struct itty_bit_string_t itty_bit_string_t;
 typedef struct itty_bit_string_list_t itty_bit_string_list_t;
 typedef struct itty_bit_string_list_iterator_t itty_bit_string_list_iterator_t;
@@ -10,15 +12,15 @@ typedef struct itty_bit_string_iterator_t itty_bit_string_iterator_t;
 typedef struct itty_bit_string_map_file_t itty_bit_string_map_file_t;
 
 typedef enum {
-        BIT_STRING_PRESENTATION_FORMAT_BINARY,
-        BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY,
-        BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL,
-        BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY
+        ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY,
+        ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY,
+        ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL,
+        ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY
 } itty_bit_string_presentation_format_t;
 
 typedef enum {
-        BIT_STRING_SORT_ORDER_ASCENDING,
-        BIT_STRING_SORT_ORDER_DESCENDING
+        ITTY_BIT_STRING_SORT_ORDER_ASCENDING,
+        ITTY_BIT_STRING_SORT_ORDER_DESCENDING
 } itty_bit_string_sort_order_t;
 
 struct itty_bit_string_list_iterator_t {
@@ -57,6 +59,12 @@ size_t itty_bit_string_evaluate_similarity (itty_bit_string_t *a,
 
 int itty_bit_string_compare (itty_bit_string_t *a,
                              itty_bit_string_t *b);
+
+int itty_bit_string_compare_by_pop_count (itty_bit_string_t *a,
+                                          itty_bit_string_t *b);
+
+void *itty_bit_string_get_words (itty_bit_string_t *bit_string);
+size_t itty_bit_string_get_number_of_words (itty_bit_string_t *bit_string);
 
 itty_bit_string_list_t *itty_bit_string_list_new (void);
 
@@ -120,3 +128,7 @@ void itty_bit_string_map_file_free (itty_bit_string_map_file_t *mapped_file);
 
 itty_bit_string_t *itty_bit_string_map_file_next (itty_bit_string_map_file_t *mapped_file,
                                                   size_t                      number_of_words);
+char *itty_bit_string_map_file_get_mapped_data (itty_bit_string_map_file_t *mapped_file);
+
+bool itty_bit_string_map_file_resize (itty_bit_string_map_file_t *mapped_file,
+                                      size_t                      new_size);
