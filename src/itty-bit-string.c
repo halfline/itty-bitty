@@ -261,7 +261,7 @@ itty_bit_string_list_condense (itty_bit_string_list_t *list)
         for (size_t i = 0; i < list->count; i++) {
                 itty_bit_string_t *bit_string = list->bit_strings[i];
                 for (size_t j = 0; j < bit_string->number_of_words; j++) {
-                        result->words[j] |= bit_string->words[j];
+                        result->words[j] ^= bit_string->words[j];
                 }
         }
 
