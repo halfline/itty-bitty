@@ -76,6 +76,9 @@ itty_bit_string_t *itty_bit_string_list_fetch (itty_bit_string_list_t *list,
                                                size_t                  index);
 size_t itty_bit_string_list_get_max_number_of_words (itty_bit_string_list_t *list);
 
+char *itty_bit_string_list_present (itty_bit_string_list_t *bit_string_list,
+                                    itty_bit_string_presentation_format_t format);
+
 void itty_bit_string_list_iterator_init (itty_bit_string_list_t          *list,
                                          itty_bit_string_list_iterator_t *iterator);
 

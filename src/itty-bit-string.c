@@ -351,6 +351,74 @@ itty_bit_string_list_get_max_number_of_words (itty_bit_string_list_t *list)
         return list->max_number_of_words;
 }
 
+char *
+itty_bit_string_list_present (itty_bit_string_list_t                *bit_string_list,
+                              itty_bit_string_presentation_format_t  format)
+{
+        size_t buffer_size = 0;
+        size_t buffer_used = 0;
+        char *list_representation = NULL;
+        size_t max_length = 0;
+
+        bool is_display_format = (format == BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY ||
+                                  format == BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY);
+
+        for (size_t i = 0; i < bit_string_list->count; i++) {
+                char *bit_string_representation = itty_bit_string_present (bit_string_list->bit_strings[i], format);
+                if (bit_string_representation) {
+                        size_t length = strlen (bit_string_representation);
+                        if (length > max_length) {
+                                max_length = length;
+                        }
+                        free (bit_string_representation);
+                }
+        }
+
+        if (is_display_format) {
+                buffer_size = strlen ("\t[\n\t]\n") + 1;
+        } else {
+                buffer_size = 1;
+        }
+
+        for (size_t i = 0; i < bit_string_list->count; i++) {
+                char *bit_string_representation = itty_bit_string_present (bit_string_list->bit_strings[i], format);
+                if (bit_string_representation) {
+                        size_t representation_length = max_length + (is_display_format ? strlen ("\t\t\n") : 0);
+                        buffer_size += representation_length;
+                        free (bit_string_representation);
+                }
+        }
+
+        list_representation = malloc (buffer_size);
+        if (!list_representation) {
+                return NULL;
+        }
+
+        if (is_display_format) {
+                buffer_used += sprintf (&list_representation[buffer_used], "\t[\n");
+        }
+
+        for (size_t i = 0; i < bit_string_list->count; i++) {
+                char *bit_string_representation = itty_bit_string_present (bit_string_list->bit_strings[i], format);
+                if (!bit_string_representation)
+                        continue;
+
+                if (is_display_format) {
+                        buffer_used += sprintf (&list_representation[buffer_used], "\t\t%*s\n", (int) max_length, bit_string_representation);
+                } else {
+                        buffer_used += sprintf (&list_representation[buffer_used], "%s", bit_string_representation);
+                }
+
+                free (bit_string_representation);
+        }
+
+        if (is_display_format) {
+                buffer_used += sprintf (&list_representation[buffer_used], "\t]\n");
+        }
+
+        return list_representation;
+}
+
 void
 itty_bit_string_list_iterator_init (itty_bit_string_list_t          *list,
                                     itty_bit_string_list_iterator_t *iterator)
