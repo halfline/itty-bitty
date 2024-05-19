@@ -98,14 +98,9 @@ itty_bit_string_list_t *itty_bit_string_list_popcount_softmax (itty_bit_string_l
 void itty_bit_string_list_sort (itty_bit_string_list_t      *list,
                                 itty_bit_string_sort_order_t order);
 
-itty_bit_string_map_file_t *itty_bit_string_map_file_new (const char *file_name,
-                                                          size_t      word_count_per_itty_bit_string);
+itty_bit_string_map_file_t *itty_bit_string_map_file_new (const char *file_name);
 
 void itty_bit_string_map_file_free (itty_bit_string_map_file_t *mapped_file);
 
-itty_bit_string_t *itty_bit_string_map_file_get_next (itty_bit_string_map_file_t *mapped_file);
-
-bool itty_bit_string_map_file_next (itty_bit_string_map_file_t *mapped_file);
-
-itty_bit_string_list_t *itty_bit_string_map_file_peek_at_string_list (itty_bit_string_map_file_t *mapped_file);
-
+itty_bit_string_t *itty_bit_string_map_file_next (itty_bit_string_map_file_t *mapped_file,
+                                                  size_t                      number_of_words);
