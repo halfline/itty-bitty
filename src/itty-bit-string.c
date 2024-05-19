@@ -50,6 +50,14 @@ itty_bit_string_new (void)
         return itty_bit_string;
 }
 
+itty_bit_string_t *
+itty_bit_string_duplicate (itty_bit_string_t *input_bit_string)
+{
+        itty_bit_string_t *bit_string = itty_bit_string_new ();
+        *bit_string = *input_bit_string;
+        return bit_string;
+}
+
 void
 itty_bit_string_free (itty_bit_string_t *itty_bit_string)
 {
@@ -226,6 +234,12 @@ itty_bit_string_list_append (itty_bit_string_list_t *list,
                 list->max_number_of_words = bit_string->number_of_words;
 }
 
+size_t
+itty_bit_string_list_get_length (itty_bit_string_list_t *list)
+{
+        return list->count;
+}
+
 itty_bit_string_list_t *
 itty_bit_string_list_exclusive_or (itty_bit_string_list_t *list_a,
                                    itty_bit_string_list_t *list_b)
@@ -248,6 +262,16 @@ itty_bit_string_list_exclusive_or (itty_bit_string_list_t *list_a,
 }
 
 itty_bit_string_t *
+itty_bit_string_list_fetch (itty_bit_string_list_t *list,
+                            size_t                  index)
+{
+    if (list == NULL || index >= list->count)
+            return NULL;
+
+    return list->bit_strings[index];
+}
+
+itty_bit_string_t *
 itty_bit_string_list_condense (itty_bit_string_list_t *list)
 {
         if (list->count == 0) {
@@ -266,6 +290,12 @@ itty_bit_string_list_condense (itty_bit_string_list_t *list)
         }
 
         return result;
+}
+
+size_t
+itty_bit_string_list_get_max_number_of_words (itty_bit_string_list_t *list)
+{
+        return list->max_number_of_words;
 }
 
 void
@@ -476,6 +506,41 @@ itty_bit_string_list_popcount_softmax (itty_bit_string_list_t *list,
         }
 
         return softmax_list;
+}
+
+bool
+itty_bit_string_list_popcount_argmax (itty_bit_string_list_t *list,
+                                      size_t                  num_words,
+                                      size_t                 *index)
+{
+        itty_bit_string_list_iterator_t iterator;
+        itty_bit_string_t *current_bit_string;
+        size_t highest_popcount = 0;
+        size_t i = 0;
+        bool found_one = false;
+
+        itty_bit_string_list_t *softmax = itty_bit_string_list_popcount_softmax (list, num_words);
+        itty_bit_string_list_iterator_init (softmax, &iterator);
+        while (itty_bit_string_list_iterator_next (&iterator, &current_bit_string)) {
+                size_t current_popcount = itty_bit_string_get_pop_count (current_bit_string);
+
+                if (!found_one) {
+                        found_one = true;
+                        if (index)
+                                *index = i;
+                }
+
+                if (current_popcount > highest_popcount) {
+                        highest_popcount = current_popcount;
+
+                        if (index)
+                                *index = i;
+                }
+                i++;
+        }
+        itty_bit_string_list_free (softmax);
+
+        return found_one;
 }
 
 int

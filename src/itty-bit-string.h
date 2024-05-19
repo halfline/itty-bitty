@@ -30,6 +30,7 @@ struct itty_bit_string_iterator_t {
 };
 
 itty_bit_string_t *itty_bit_string_new (void);
+itty_bit_string_t *itty_bit_string_duplicate (itty_bit_string_t *bit_string);
 
 void itty_bit_string_free (itty_bit_string_t *itty_bit_string);
 
@@ -62,10 +63,15 @@ void itty_bit_string_list_free (itty_bit_string_list_t *list);
 void itty_bit_string_list_append (itty_bit_string_list_t *list,
                                   itty_bit_string_t      *itty_bit_string);
 
+size_t itty_bit_string_list_get_length (itty_bit_string_list_t *list);
 itty_bit_string_list_t *itty_bit_string_list_exclusive_or (itty_bit_string_list_t *list_a,
                                                            itty_bit_string_list_t *list_b);
 
 itty_bit_string_t *itty_bit_string_list_condense (itty_bit_string_list_t *list);
+
+itty_bit_string_t *itty_bit_string_list_fetch (itty_bit_string_list_t *list,
+                                               size_t                  index);
+size_t itty_bit_string_list_get_max_number_of_words (itty_bit_string_list_t *list);
 
 void itty_bit_string_list_iterator_init (itty_bit_string_list_t          *list,
                                          itty_bit_string_list_iterator_t *iterator);
@@ -94,6 +100,10 @@ char *itty_bit_string_present (itty_bit_string_t                    *itty_bit_st
 
 itty_bit_string_list_t *itty_bit_string_list_popcount_softmax (itty_bit_string_list_t *list,
                                                                size_t                  num_words);
+
+bool itty_bit_string_list_popcount_argmax (itty_bit_string_list_t *list,
+                                           size_t                  num_words,
+                                           size_t                 *index);
 
 void itty_bit_string_list_sort (itty_bit_string_list_t      *list,
                                 itty_bit_string_sort_order_t order);
