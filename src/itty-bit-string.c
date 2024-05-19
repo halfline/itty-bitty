@@ -477,39 +477,90 @@ itty_bit_string_reduce_by_half (itty_bit_string_t *itty_bit_string)
 }
 
 char *
-itty_bit_string_present (itty_bit_string_t                    *bit_string,
-                         itty_bit_string_presentation_format_t format)
+itty_bit_string_present (itty_bit_string_t                     *bit_string,
+                         itty_bit_string_presentation_format_t  format)
 {
         size_t total_bits = bit_string->number_of_words * WORD_SIZE_IN_BITS;
-        size_t buffer_size;
+        size_t buffer_size = 0;
 
-        if (format == BIT_STRING_PRESENTATION_FORMAT_BINARY) {
-                buffer_size = total_bits + 1;
-        } else {
-                buffer_size = bit_string->number_of_words * (WORD_SIZE_IN_BYTES * 2 + 1);
+        switch (format) {
+                case BIT_STRING_PRESENTATION_FORMAT_BINARY:
+                case BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY:
+                        buffer_size = total_bits;
+
+                        if (format == BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY)
+                                buffer_size += strlen ("0b");
+                        break;
+                case BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL:
+                case BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY:
+                        buffer_size = bit_string->number_of_words * (WORD_SIZE_IN_BYTES * 2 + 1);
+
+                        if (format == BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY)
+                                buffer_size += strlen ("0x");
+                        break;
+                default:
+                        return NULL;
         }
+        buffer_size++;
 
         char *bit_string_representation = malloc (buffer_size);
-        if (!bit_string_representation) {
-                return NULL;
-        }
 
-        if (format == BIT_STRING_PRESENTATION_FORMAT_BINARY) {
-                bit_string_representation[total_bits] = '\0';
-                size_t bitindex = 0;
+        size_t output_index = 0;
+        bool at_leading_zero = true;
+        switch (format) {
+        case BIT_STRING_PRESENTATION_FORMAT_BINARY:
                 for (size_t i = 0; i < bit_string->number_of_words; i++) {
                         size_t word = bit_string->words[i];
                         for (size_t j = WORD_SIZE_IN_BITS; j > 0; j--) {
-                                bit_string_representation[bitindex++] = (word & (1UL << (j - 1))) ? '1' : '0';
+                                bit_string_representation[output_index++] = (word & (1UL << (j - 1))) ? '1' : '0';
                         }
                 }
-        } else {
-                size_t buffer_index = 0;
+                bit_string_representation[output_index] = '\0';
+                break;
+
+        case BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL:
+                bit_string_representation[output_index] = '\0';
                 for (size_t i = 0; i < bit_string->number_of_words; i++) {
-                        int written = snprintf (&bit_string_representation[buffer_index], buffer_size - buffer_index, "%016lx ", bit_string->words[i]);
-                        buffer_index += written;
+                        output_index += snprintf (&bit_string_representation[output_index], buffer_size - output_index, "%016lx", bit_string->words[i]);
                 }
-                bit_string_representation[buffer_index - 1] = '\0';
+                break;
+
+        case BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY:
+                strcpy (bit_string_representation, "0b");
+                output_index = 2;
+
+                for (size_t i = 0; i < bit_string->number_of_words; i++) {
+                        size_t word = bit_string->words[i];
+                        for (size_t j = WORD_SIZE_IN_BITS; j > 0; j--) {
+                                char bit = (word & (1UL << (j - 1))) ? '1' : '0';
+                                if (bit == '1' || !at_leading_zero) {
+                                        bit_string_representation[output_index++] = bit;
+                                        at_leading_zero = false;
+                                }
+                        }
+                }
+                bit_string_representation[output_index] = '\0';
+                break;
+
+        case BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY:
+                strcpy (bit_string_representation, "0x");
+                output_index = 2;
+
+                for (size_t i = 0; i < bit_string->number_of_words; i++) {
+                        char word_buffer[WORD_SIZE_IN_BYTES * 2 + 1];
+                        snprintf (word_buffer, sizeof (word_buffer), "%016lx", bit_string->words[i]);
+                        for (size_t j = 0; j < strlen (word_buffer); j++) {
+                                char hex_digit = word_buffer[j];
+                                if (hex_digit != '0' || !at_leading_zero) {
+                                        bit_string_representation[output_index++] = hex_digit;
+                                        at_leading_zero = false;
+                                }
+                        }
+                        if (i < bit_string->number_of_words - 1)
+                                bit_string_representation[output_index++] = ' ';
+                }
+                bit_string_representation[output_index] = '\0';
+                break;
         }
 
         return bit_string_representation;
