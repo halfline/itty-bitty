@@ -1,21 +1,32 @@
 project ('itty-bitty', 'c', default_options : ['c_std=c11'])
+add_project_arguments('-D_GNU_SOURCE', language: 'c')
 
-source_files = [
+library_sources = [
         'src/itty-bit-string.c',
-        'src/main.c'
+        'src/itty-bit-string-list.c',
+        'src/itty-bit-string-map.c',
 ]
+
+libittybitty = library('ittybitty',
+                       sources: library_sources,
+                       include_directories: include_directories('src'))
 
 executable ('itty-bitty',
-            sources: source_files,
+            sources: 'src/main.c',
+            link_with: libittybitty,
             install: true)
 
-test_source_files = [
-        'src/tests/test-itty-bit-string.c'
+test_sources = [
+        'src/tests/test-itty-bit-string.c',
+        'src/tests/test-itty-bit-string-list.c',
+        'src/tests/test-itty-bit-string-map.c',
 ]
 
-test_executable = executable ('test-itty-bit-string',
-                              sources: test_source_files,
-                              include_directories: include_directories ('src'))
-
-test ('itty-bit-string-test', test_executable)
-
+foreach test_source : test_sources
+    test_name = test_source.split('/')[-1].split('.')[0]
+    test_executable = executable(test_name,
+                                 sources: [test_source],
+                                 include_directories: include_directories('src'),
+                                 link_with: libittybitty)
+    test(test_name + '-test', test_executable)
+endforeach
