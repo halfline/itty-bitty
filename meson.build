@@ -7,6 +7,7 @@ library_sources = [
         'src/itty-bit-string-map.c',
         'src/itty-network.c',
         'src/itty-vocabulary.c',
+        'src/itty-work-queue.c',
 ]
 
 libittybitty = library('ittybitty',
@@ -22,7 +23,8 @@ test_sources = [
         'src/tests/test-itty-bit-string.c',
         'src/tests/test-itty-bit-string-list.c',
         'src/tests/test-itty-bit-string-map.c',
-        'src/tests/test-itty-vocabulary.c'
+        'src/tests/test-itty-vocabulary.c',
+        'src/tests/test-itty-work-queue.c'
 ]
 
 foreach test_source : test_sources
