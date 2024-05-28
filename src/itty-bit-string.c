@@ -21,6 +21,8 @@ itty_bit_string_new (void)
         bit_string->number_of_words = 0;
         bit_string->pop_count = 0;
         bit_string->pop_count_computed = false;
+        bit_string->bit_length = 0;
+        bit_string->bit_length_computed = false;
         return bit_string;
 }
 
@@ -49,7 +51,8 @@ itty_bit_string_append_word (itty_bit_string_t *bit_string,
                                     (bit_string->number_of_words + 1) * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
         bit_string->words[bit_string->number_of_words] = word;
         bit_string->number_of_words++;
-        bit_string->pop_count_computed = false;  // Invalidate cached pop count
+        bit_string->pop_count_computed = false;
+        bit_string->bit_length_computed = false;
 }
 
 void
@@ -183,6 +186,25 @@ itty_bit_string_get_pop_count (itty_bit_string_t *bit_string)
 }
 
 size_t
+itty_bit_string_get_length (itty_bit_string_t *bit_string)
+{
+        if (!bit_string->bit_length_computed) {
+                bit_string->bit_length = 0;
+                for (size_t i = 0; i < bit_string->number_of_words; i++) {
+                        if (bit_string->words[i] == 0)
+                                continue;
+
+                        size_t leading_zeros = __builtin_clzll (bit_string->words[i]);
+                        size_t word_bit_length = ITTY_BIT_STRING_WORD_SIZE_IN_BITS - leading_zeros;
+                        bit_string->bit_length = ((bit_string->number_of_words - i - 1) * ITTY_BIT_STRING_WORD_SIZE_IN_BITS) + word_bit_length;
+                        break;
+                }
+                bit_string->bit_length_computed = true;
+        }
+        return bit_string->bit_length;
+}
+
+size_t
 itty_bit_string_evaluate_similarity (itty_bit_string_t *a,
                                      itty_bit_string_t *b)
 {
@@ -222,6 +244,20 @@ size_t
 itty_bit_string_get_number_of_words (itty_bit_string_t *bit_string)
 {
         return bit_string->number_of_words;
+}
+
+void
+itty_bit_string_iterator_init_at_word_offset (itty_bit_string_t          *bit_string,
+                                              itty_bit_string_iterator_t *iterator,
+                                              size_t                      word_offset)
+{
+        if (word_offset < bit_string->number_of_words) {
+                iterator->bit_string = bit_string;
+                iterator->current_index = word_offset;
+        } else {
+                iterator->bit_string = bit_string;
+                iterator->current_index = 0;
+        }
 }
 
 void
