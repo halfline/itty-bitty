@@ -73,7 +73,7 @@ itty_bit_string_map_file_next (itty_bit_string_map_file_t  *mapped_file,
                 return NULL;
         }
 
-        itty_bit_string_t *bit_string = itty_bit_string_new ();
+        itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_COPY_ON_WRITE);
         bit_string->words = (size_t *) (mapped_file->mapped_data) + mapped_file->current_index;
         bit_string->number_of_words = number_of_words;
         bit_string->pop_count_computed = false;
