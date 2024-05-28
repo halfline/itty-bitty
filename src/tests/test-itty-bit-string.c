@@ -185,6 +185,29 @@ test_itty_bit_string_reduce_by_half (void)
         itty_bit_string_free (reduced);
 }
 
+void
+test_itty_bit_string_get_length (void)
+{
+        itty_bit_string_t *bit_string_1 = itty_bit_string_new ();
+        itty_bit_string_append_word (bit_string_1, 0b1100);
+        assert (itty_bit_string_get_length (bit_string_1) == 4);
+        itty_bit_string_free (bit_string_1);
+
+        itty_bit_string_t *bit_string_2 = itty_bit_string_new ();
+        itty_bit_string_append_word (bit_string_2, 0);
+        itty_bit_string_append_word (bit_string_2, 0);
+        itty_bit_string_append_word (bit_string_2, 0b1111);
+        assert (itty_bit_string_get_length (bit_string_2) == 4);
+        itty_bit_string_free (bit_string_2);
+
+        itty_bit_string_t *bit_string_3 = itty_bit_string_new ();
+        itty_bit_string_append_word (bit_string_3, 0);
+        assert (itty_bit_string_get_length (bit_string_3) == 0);
+        itty_bit_string_free (bit_string_2);
+
+        printf ("All test cases passed!\n");
+}
+
 int
 main (void)
 {

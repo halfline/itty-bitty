@@ -49,6 +49,19 @@ itty_bit_string_list_get_length (itty_bit_string_list_t *list)
         return list->count;
 }
 
+size_t
+itty_bit_string_list_get_bit_length (itty_bit_string_list_t *list)
+{
+        size_t max_bit_length = 0;
+        for (size_t i = 0; i < list->count; i++) {
+                size_t bit_length = itty_bit_string_get_length (list->bit_strings[i]);
+                if (bit_length > max_bit_length) {
+                        max_bit_length = bit_length;
+                }
+        }
+        return max_bit_length;
+}
+
 itty_bit_string_list_t *
 itty_bit_string_list_exclusive_or (itty_bit_string_list_t *list_a,
                                    itty_bit_string_list_t *list_b)
@@ -87,27 +100,30 @@ itty_bit_string_list_condense (itty_bit_string_list_t *list)
                 return NULL;
         }
 
-        size_t max_number_of_words = list->max_number_of_words;
+        itty_bit_string_list_t *transposed_list = itty_bit_string_list_transpose (list);
+        if (!transposed_list) {
+                return NULL;
+        }
+
+        size_t max_number_of_words = transposed_list->max_number_of_words;
         itty_bit_string_t *condensed_bit_string = itty_bit_string_new ();
         condensed_bit_string->words = calloc (max_number_of_words, sizeof (size_t));
         condensed_bit_string->number_of_words = max_number_of_words;
 
         size_t majority_threshold = list->count / 2 + 1;
 
-        for (size_t word_index = 0; word_index < max_number_of_words; word_index++) {
-                for (size_t bit_index = 0; bit_index < ITTY_BIT_STRING_WORD_SIZE_IN_BITS; bit_index++) {
-                        size_t bit_count = 0;
-                        for (size_t i = 0; i < list->count; i++) {
-                                size_t word = list->bit_strings[i]->words[word_index];
-                                if (word & ((size_t) 1 << (ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1 - bit_index))) {
-                                        bit_count++;
-                                }
-                        }
-                        if (bit_count >= majority_threshold) {
-                                condensed_bit_string->words[word_index] |= ((size_t) 1 << (ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1 - bit_index));
+        for (size_t i = 0; i < transposed_list->count; i++) {
+                itty_bit_string_t *bit_string = transposed_list->bit_strings[i];
+                size_t pop_count = itty_bit_string_get_pop_count(bit_string);
+
+                if (pop_count >= majority_threshold) {
+                        for (size_t word_index = 0; word_index < bit_string->number_of_words; word_index++) {
+                                condensed_bit_string->words[word_index] |= ((size_t) 1 << (transposed_list->count - 1 - i));
                         }
                 }
         }
+
+        itty_bit_string_list_free (transposed_list);
 
         return condensed_bit_string;
 }
@@ -115,42 +131,38 @@ itty_bit_string_list_condense (itty_bit_string_list_t *list)
 itty_bit_string_list_t *
 itty_bit_string_list_transpose (itty_bit_string_list_t *list)
 {
-        if (list == NULL || list->count == 0) {
+        if (!list || list->count == 0) {
                 return NULL;
         }
 
+        size_t bit_length = itty_bit_string_list_get_bit_length (list);
+        size_t number_of_words = (bit_length + ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1) / ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+
         itty_bit_string_list_t *transposed_list = itty_bit_string_list_new ();
 
-        size_t number_of_words = list->max_number_of_words;
-        for (size_t i = 0; i < ITTY_BIT_STRING_WORD_SIZE_IN_BITS; i++) {
-                itty_bit_string_t *new_bit_string = itty_bit_string_new();
-                new_bit_string->words = calloc (number_of_words, sizeof (size_t));
-                new_bit_string->number_of_words = number_of_words;
-                itty_bit_string_list_append (transposed_list, new_bit_string);
-        }
+        for (size_t bit_position = bit_length; bit_position > 0; bit_position--) {
+                itty_bit_string_t *transposed_bit_string = itty_bit_string_new ();
+                itty_bit_string_append_zeros (transposed_bit_string, number_of_words);
 
-        itty_bit_string_list_iterator_t list_iterator;
-        itty_bit_string_list_iterator_init (list, &list_iterator);
-        itty_bit_string_t *original_bit_string;
+                itty_bit_string_list_iterator_t list_iterator;
+                itty_bit_string_list_iterator_init (list, &list_iterator);
+                itty_bit_string_t *bit_string;
+                size_t string_index = 0;
 
-        size_t current_string_index = 0;
-        while (itty_bit_string_list_iterator_next (&list_iterator, &original_bit_string)) {
-                itty_bit_string_iterator_t word_iterator;
-                itty_bit_string_iterator_init (original_bit_string, &word_iterator);
-                size_t word_index = 0;
-                size_t word;
+                while (itty_bit_string_list_iterator_next (&list_iterator, &bit_string)) {
+                        itty_bit_string_iterator_t bit_string_iterator;
+                        itty_bit_string_iterator_init_at_word_offset (bit_string, &bit_string_iterator, (bit_position - 1) / ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
 
-                while (itty_bit_string_iterator_next (&word_iterator, &word)) {
-                        for (size_t bit = 0; bit < ITTY_BIT_STRING_WORD_SIZE_IN_BITS; bit++) {
-                                size_t bit_value = (word >> (ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1 - bit)) & 1;
-                                itty_bit_string_t *transposed_bit_string = transposed_list->bit_strings[bit];
-                                transposed_bit_string->words[word_index] |= bit_value << (list->count - 1 - current_string_index);
+                        size_t word;
+                        if (itty_bit_string_iterator_next (&bit_string_iterator, &word)) {
+                                size_t bit_in_word = (bit_position - 1) % ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+                                bool bit_value = (word & (1UL << bit_in_word)) != 0;
+                                itty_bit_string_set_bit (transposed_bit_string, string_index, bit_value);
                         }
-                        word_index++;
+                        string_index++;
                 }
-                current_string_index++;
+                itty_bit_string_list_append (transposed_list, transposed_bit_string);
         }
-
         return transposed_list;
 }
 
@@ -329,6 +341,19 @@ itty_bit_string_list_sort (itty_bit_string_list_t      *list,
         qsort_r (list->bit_strings, list->count, sizeof (itty_bit_string_t *), itty_bit_string_compare_by_pop_count_qsort, &order);
 }
 
+void
+itty_bit_string_list_iterator_init_at_index (itty_bit_string_list_t          *list,
+                                             itty_bit_string_list_iterator_t *iterator,
+                                             size_t                          index)
+{
+        if (index < list->count) {
+                iterator->list = list;
+                iterator->current_index = index;
+        } else {
+                iterator->list = list;
+                iterator->current_index = 0;
+        }
+}
 
 void
 itty_bit_string_list_iterator_init (itty_bit_string_list_t          *list,

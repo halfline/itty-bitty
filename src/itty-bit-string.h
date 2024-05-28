@@ -50,6 +50,7 @@ itty_bit_string_t *itty_bit_string_mask (itty_bit_string_t *a,
                                          itty_bit_string_t *b);
 
 size_t itty_bit_string_get_pop_count (itty_bit_string_t *bit_string);
+size_t itty_bit_string_get_length (itty_bit_string_t *bit_string);
 
 size_t itty_bit_string_evaluate_similarity (itty_bit_string_t *a,
                                             itty_bit_string_t *b);
@@ -74,5 +75,9 @@ char *itty_bit_string_present (itty_bit_string_t                     *bit_string
                                itty_bit_string_presentation_format_t  format);
 void itty_bit_string_iterator_init (itty_bit_string_t          *bit_string,
                                     itty_bit_string_iterator_t *iterator);
+void itty_bit_string_iterator_init_at_word_offset (itty_bit_string_t          *bit_string,
+                                                   itty_bit_string_iterator_t *iterator,
+                                                   size_t                     word_offset);
+
 bool itty_bit_string_iterator_next (itty_bit_string_iterator_t *iterator,
                                     size_t                     *word);

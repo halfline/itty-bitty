@@ -20,6 +20,7 @@ void itty_bit_string_list_append (itty_bit_string_list_t *list,
                                   itty_bit_string_t      *bit_string);
 
 size_t itty_bit_string_list_get_length (itty_bit_string_list_t *list);
+size_t itty_bit_string_list_get_bit_length (itty_bit_string_list_t *list);
 
 itty_bit_string_list_t *itty_bit_string_list_exclusive_or (itty_bit_string_list_t *list_a,
                                                            itty_bit_string_list_t *list_b);
@@ -45,6 +46,10 @@ void itty_bit_string_list_sort (itty_bit_string_list_t      *list,
 
 void itty_bit_string_list_iterator_init (itty_bit_string_list_t          *list,
                                          itty_bit_string_list_iterator_t *iterator);
+
+void itty_bit_string_list_iterator_init_at_index (itty_bit_string_list_t          *list,
+                                                  itty_bit_string_list_iterator_t *iterator,
+                                                  size_t                          index);
 
 bool itty_bit_string_list_iterator_next (itty_bit_string_list_iterator_t  *iterator,
                                          itty_bit_string_t               **bit_string);
