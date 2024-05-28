@@ -5,6 +5,7 @@ library_sources = [
         'src/itty-bit-string.c',
         'src/itty-bit-string-list.c',
         'src/itty-bit-string-map.c',
+        'src/itty-manager.c',
         'src/itty-network.c',
         'src/itty-vocabulary.c',
         'src/itty-work-queue.c',
@@ -23,6 +24,7 @@ test_sources = [
         'src/tests/test-itty-bit-string.c',
         'src/tests/test-itty-bit-string-list.c',
         'src/tests/test-itty-bit-string-map.c',
+        'src/tests/test-itty-manager.c',
         'src/tests/test-itty-vocabulary.c',
         'src/tests/test-itty-work-queue.c'
 ]
