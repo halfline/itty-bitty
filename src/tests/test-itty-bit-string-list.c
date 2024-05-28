@@ -22,7 +22,7 @@ void
 test_itty_bit_string_list_append (void)
 {
         itty_bit_string_list_t *list = itty_bit_string_list_new ();
-        itty_bit_string_t *bit_string = itty_bit_string_new ();
+        itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         itty_bit_string_append_word (bit_string, 0b1100);
         itty_bit_string_list_append (list, bit_string);
         assert (list->count == 1);
@@ -35,8 +35,8 @@ test_itty_bit_string_list_exclusive_or (void)
 {
         itty_bit_string_list_t *list_a = itty_bit_string_list_new ();
         itty_bit_string_list_t *list_b = itty_bit_string_list_new ();
-        itty_bit_string_t *bit_string_a = itty_bit_string_new ();
-        itty_bit_string_t *bit_string_b = itty_bit_string_new ();
+        itty_bit_string_t *bit_string_a = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_t *bit_string_b = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         itty_bit_string_append_word (bit_string_a, 0b1100);
         itty_bit_string_append_word (bit_string_b, 0b1010);
         itty_bit_string_list_append (list_a, bit_string_a);
@@ -57,9 +57,9 @@ void
 test_itty_bit_string_list_condense (void)
 {
         itty_bit_string_list_t *list = itty_bit_string_list_new ();
-        itty_bit_string_t *bit_string_1 = itty_bit_string_new ();
-        itty_bit_string_t *bit_string_2 = itty_bit_string_new ();
-        itty_bit_string_t *bit_string_3 = itty_bit_string_new ();
+        itty_bit_string_t *bit_string_1 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_t *bit_string_2 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_t *bit_string_3 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         itty_bit_string_append_word (bit_string_1, 0b1100);
         itty_bit_string_append_word (bit_string_2, 0b1010);
         itty_bit_string_append_word (bit_string_3, 0b1111);
@@ -80,9 +80,9 @@ void
 test_itty_bit_string_list_sort (void)
 {
         itty_bit_string_list_t *list = itty_bit_string_list_new ();
-        itty_bit_string_t *bit_string_1 = itty_bit_string_new ();
-        itty_bit_string_t *bit_string_2 = itty_bit_string_new ();
-        itty_bit_string_t *bit_string_3 = itty_bit_string_new ();
+        itty_bit_string_t *bit_string_1 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_t *bit_string_2 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_t *bit_string_3 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         itty_bit_string_append_word (bit_string_1, 0b1100);
         itty_bit_string_append_word (bit_string_2, 0b1000);
         itty_bit_string_append_word (bit_string_3, 0b1111);
@@ -102,9 +102,9 @@ void
 test_itty_bit_string_list_transpose (void)
 {
         itty_bit_string_list_t *list = itty_bit_string_list_new ();
-        itty_bit_string_t *bit_string_1 = itty_bit_string_new ();
-        itty_bit_string_t *bit_string_2 = itty_bit_string_new ();
-        itty_bit_string_t *bit_string_3 = itty_bit_string_new ();
+        itty_bit_string_t *bit_string_1 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_t *bit_string_2 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_t *bit_string_3 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         itty_bit_string_append_word (bit_string_1, 0b1100);
         itty_bit_string_append_word (bit_string_2, 0b1010);
         itty_bit_string_append_word (bit_string_3, 0b1111);

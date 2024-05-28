@@ -106,7 +106,7 @@ itty_bit_string_list_condense (itty_bit_string_list_t *list)
         }
 
         size_t max_number_of_words = transposed_list->max_number_of_words;
-        itty_bit_string_t *condensed_bit_string = itty_bit_string_new ();
+        itty_bit_string_t *condensed_bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         condensed_bit_string->words = calloc (max_number_of_words, sizeof (size_t));
         condensed_bit_string->number_of_words = max_number_of_words;
 
@@ -141,7 +141,7 @@ itty_bit_string_list_transpose (itty_bit_string_list_t *list)
         itty_bit_string_list_t *transposed_list = itty_bit_string_list_new ();
 
         for (size_t bit_position = bit_length; bit_position > 0; bit_position--) {
-                itty_bit_string_t *transposed_bit_string = itty_bit_string_new ();
+                itty_bit_string_t *transposed_bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
                 itty_bit_string_append_zeros (transposed_bit_string, number_of_words);
 
                 itty_bit_string_list_iterator_t list_iterator;
@@ -258,7 +258,7 @@ itty_bit_string_list_popcount_softmax (itty_bit_string_list_t *list,
         size_t cumulative_ones = 0;
         itty_bit_string_list_iterator_init (list, &iterator);
         while (itty_bit_string_list_iterator_next (&iterator, &bit_string)) {
-                itty_bit_string_t *new_bit_string = itty_bit_string_new ();
+                itty_bit_string_t *new_bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
                 size_t num_ones = (itty_bit_string_get_pop_count (bit_string) * ITTY_BIT_STRING_WORD_SIZE_IN_BITS + total_popcount - 1) / total_popcount;
                 cumulative_ones += num_ones;
 

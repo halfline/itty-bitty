@@ -10,26 +10,34 @@
 typedef struct itty_bit_string_t itty_bit_string_t;
 typedef struct itty_bit_string_list_t itty_bit_string_list_t;
 typedef struct itty_bit_string_iterator_t itty_bit_string_iterator_t;
+typedef enum itty_bit_string_presentation_format_t itty_bit_string_presentation_format_t;
+typedef enum itty_bit_string_sort_order_t itty_bit_string_sort_order_t;
+typedef enum itty_bit_string_mutability_t itty_bit_string_mutability_t;
 
-typedef enum {
+enum itty_bit_string_presentation_format_t {
         ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY,
         ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY_FOR_DISPLAY,
         ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL,
         ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL_FOR_DISPLAY
-} itty_bit_string_presentation_format_t;
+};
 
-typedef enum {
+enum itty_bit_string_sort_order_t {
         ITTY_BIT_STRING_SORT_ORDER_ASCENDING,
         ITTY_BIT_STRING_SORT_ORDER_DESCENDING
-} itty_bit_string_sort_order_t;
+};
+
+enum itty_bit_string_mutability_t {
+        ITTY_BIT_STRING_MUTABILITY_READ_ONLY,
+        ITTY_BIT_STRING_MUTABILITY_READ_WRITE,
+        ITTY_BIT_STRING_MUTABILITY_COPY_ON_WRITE,
+};
 
 struct itty_bit_string_iterator_t {
         itty_bit_string_t *bit_string;
         size_t             current_index;
 };
 
-itty_bit_string_t *itty_bit_string_new (void);
-itty_bit_string_t *itty_bit_string_duplicate (itty_bit_string_t *bit_string);
+itty_bit_string_t *itty_bit_string_new (itty_bit_string_mutability_t mutability);
 
 void itty_bit_string_free (itty_bit_string_t *bit_string);
 

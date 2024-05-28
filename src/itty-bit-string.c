@@ -14,7 +14,7 @@
 #include <unistd.h>
 
 itty_bit_string_t *
-itty_bit_string_new (void)
+itty_bit_string_new (itty_bit_string_mutability_t mutability)
 {
         itty_bit_string_t *bit_string = malloc (sizeof (itty_bit_string_t));
         bit_string->words = NULL;
@@ -23,14 +23,7 @@ itty_bit_string_new (void)
         bit_string->pop_count_computed = false;
         bit_string->bit_length = 0;
         bit_string->bit_length_computed = false;
-        return bit_string;
-}
-
-itty_bit_string_t *
-itty_bit_string_duplicate (itty_bit_string_t *input_bit_string)
-{
-        itty_bit_string_t *bit_string = itty_bit_string_new ();
-        *bit_string = *input_bit_string;
+        bit_string->mutability = mutability;
         return bit_string;
 }
 
@@ -40,6 +33,9 @@ itty_bit_string_free (itty_bit_string_t *bit_string)
         if (!bit_string) {
                 return;
         }
+        if (bit_string->mutability == ITTY_BIT_STRING_MUTABILITY_READ_WRITE) {
+                free (bit_string->words);
+        }
         free (bit_string);
 }
 
@@ -47,8 +43,18 @@ void
 itty_bit_string_append_word (itty_bit_string_t *bit_string,
                              size_t             word)
 {
-        bit_string->words = realloc (bit_string->words,
-                                    (bit_string->number_of_words + 1) * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
+        assert (bit_string->mutability != ITTY_BIT_STRING_MUTABILITY_READ_ONLY);
+
+        if (bit_string->mutability == ITTY_BIT_STRING_MUTABILITY_COPY_ON_WRITE) {
+                bit_string->mutability = ITTY_BIT_STRING_MUTABILITY_READ_WRITE;
+                size_t *words = bit_string->words;
+                bit_string->words = malloc ((bit_string->number_of_words + 1) * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
+                memcpy (bit_string->words, words, (bit_string->number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES));
+
+        } else {
+                bit_string->words = realloc (bit_string->words,
+                                             (bit_string->number_of_words + 1) * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
+        }
         bit_string->words[bit_string->number_of_words] = word;
         bit_string->number_of_words++;
         bit_string->pop_count_computed = false;
@@ -59,6 +65,8 @@ void
 itty_bit_string_append_zeros (itty_bit_string_t *bit_string,
                               size_t             count)
 {
+        assert (bit_string->mutability != ITTY_BIT_STRING_MUTABILITY_READ_ONLY);
+
         for (size_t i = 0; i < count; i++) {
                 itty_bit_string_append_word (bit_string, 0);
         }
@@ -68,24 +76,28 @@ itty_bit_string_t *
 itty_bit_string_exclusive_nor (itty_bit_string_t *a,
                                itty_bit_string_t *b)
 {
-        size_t max_number_of_words = a->number_of_words > b->number_of_words ? a->number_of_words : b->number_of_words;
-        size_t a_padding = max_number_of_words - a->number_of_words;
-        size_t b_padding = max_number_of_words - b->number_of_words;
+        size_t max_number_of_words;
 
-        if (a_padding > 0) {
-                itty_bit_string_append_zeros (a, a_padding);
-        }
+        if (a->number_of_words > b->number_of_words)
+                max_number_of_words = a->number_of_words;
+        else
+                max_number_of_words = b->number_of_words;
 
-        if (b_padding > 0) {
-                itty_bit_string_append_zeros (b, b_padding);
-        }
-
-        itty_bit_string_t *result = itty_bit_string_new ();
+        itty_bit_string_t *result = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         result->number_of_words = max_number_of_words;
         result->words = malloc (result->number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
 
         for (size_t i = 0; i < max_number_of_words; i++) {
-                result->words[i] = ~(a->words[i] ^ b->words[i]);
+                size_t a_word = 0;
+                size_t b_word = 0;
+
+                if (i < a->number_of_words)
+                        a_word = a->words[i];
+
+                if (i < b->number_of_words)
+                        b_word = b->words[i];
+
+                result->words[i] = ~(a_word ^ b_word);
         }
 
         return result;
@@ -95,24 +107,28 @@ itty_bit_string_t *
 itty_bit_string_exclusive_or (itty_bit_string_t *a,
                               itty_bit_string_t *b)
 {
-        size_t max_number_of_words = a->number_of_words > b->number_of_words ? a->number_of_words : b->number_of_words;
-        size_t a_padding = max_number_of_words - a->number_of_words;
-        size_t b_padding = max_number_of_words - b->number_of_words;
+        size_t max_number_of_words;
 
-        if (a_padding > 0) {
-                itty_bit_string_append_zeros (a, a_padding);
-        }
+        if (a->number_of_words > b->number_of_words)
+                max_number_of_words = a->number_of_words;
+        else
+                max_number_of_words = b->number_of_words;
 
-        if (b_padding > 0) {
-                itty_bit_string_append_zeros (b, b_padding);
-        }
-
-        itty_bit_string_t *result = itty_bit_string_new ();
+        itty_bit_string_t *result = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         result->number_of_words = max_number_of_words;
         result->words = malloc (result->number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
 
         for (size_t i = 0; i < max_number_of_words; i++) {
-                result->words[i] = a->words[i] ^ b->words[i];
+                size_t a_word = 0;
+                size_t b_word = 0;
+
+                if (i < a->number_of_words)
+                        a_word = a->words[i];
+
+                if (i < b->number_of_words)
+                        b_word = b->words[i];
+
+                result->words[i] = a_word ^ b_word;
         }
 
         return result;
@@ -122,24 +138,28 @@ itty_bit_string_t *
 itty_bit_string_combine (itty_bit_string_t *a,
                          itty_bit_string_t *b)
 {
-        size_t max_number_of_words = a->number_of_words > b->number_of_words ? a->number_of_words : b->number_of_words;
-        size_t a_padding = max_number_of_words - a->number_of_words;
-        size_t b_padding = max_number_of_words - b->number_of_words;
+        size_t max_number_of_words;
 
-        if (a_padding > 0) {
-                itty_bit_string_append_zeros (a, a_padding);
-        }
+        if (a->number_of_words > b->number_of_words)
+                max_number_of_words = a->number_of_words;
+        else
+                max_number_of_words = b->number_of_words;
 
-        if (b_padding > 0) {
-                itty_bit_string_append_zeros (b, b_padding);
-        }
-
-        itty_bit_string_t *result = itty_bit_string_new ();
+        itty_bit_string_t *result = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         result->number_of_words = max_number_of_words;
         result->words = malloc (result->number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
 
         for (size_t i = 0; i < max_number_of_words; i++) {
-                result->words[i] = a->words[i] | b->words[i];
+                size_t a_word = 0;
+                size_t b_word = 0;
+
+                if (i < a->number_of_words)
+                        a_word = a->words[i];
+
+                if (i < b->number_of_words)
+                        b_word = b->words[i];
+
+                result->words[i] = a_word | b_word;
         }
 
         return result;
@@ -149,24 +169,28 @@ itty_bit_string_t *
 itty_bit_string_mask (itty_bit_string_t *a,
                       itty_bit_string_t *b)
 {
-        size_t max_number_of_words = a->number_of_words > b->number_of_words ? a->number_of_words : b->number_of_words;
-        size_t a_padding = max_number_of_words - a->number_of_words;
-        size_t b_padding = max_number_of_words - b->number_of_words;
+        size_t max_number_of_words;
 
-        if (a_padding > 0) {
-                itty_bit_string_append_zeros (a, a_padding);
-        }
+        if (a->number_of_words > b->number_of_words)
+                max_number_of_words = a->number_of_words;
+        else
+                max_number_of_words = b->number_of_words;
 
-        if (b_padding > 0) {
-                itty_bit_string_append_zeros (b, b_padding);
-        }
-
-        itty_bit_string_t *result = itty_bit_string_new ();
+        itty_bit_string_t *result = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         result->number_of_words = max_number_of_words;
         result->words = malloc (result->number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
 
         for (size_t i = 0; i < max_number_of_words; i++) {
-                result->words[i] = a->words[i] & b->words[i];
+                size_t a_word = 0;
+                size_t b_word = 0;
+
+                if (i < a->number_of_words)
+                        a_word = a->words[i];
+
+                if (i < b->number_of_words)
+                        b_word = b->words[i];
+
+                result->words[i] = a_word & b_word;
         }
 
         return result;
@@ -296,7 +320,7 @@ itty_bit_string_split (itty_bit_string_t *bit_string,
 
         itty_bit_string_list_t *split_list = itty_bit_string_list_new ();
         for (size_t i = 0; i < number_of_bit_strings; i++) {
-                itty_bit_string_t *split = itty_bit_string_new ();
+                itty_bit_string_t *split = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
                 for (size_t j = 0; j < words_per_split; j++) {
                         size_t word_index = i * words_per_split + j;
                         size_t word = (word_index < bit_string->number_of_words) ? bit_string->words[word_index] : 0;
@@ -313,7 +337,7 @@ itty_bit_string_concatenate (itty_bit_string_t *a,
                              itty_bit_string_t *b)
 {
         size_t total_words = a->number_of_words + b->number_of_words;
-        itty_bit_string_t *result = itty_bit_string_new ();
+        itty_bit_string_t *result = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         result->words = malloc (total_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
         if (!result->words) {
                 free (result);
@@ -324,7 +348,6 @@ itty_bit_string_concatenate (itty_bit_string_t *a,
         memcpy (result->words + a->number_of_words, b->words, b->number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
 
         result->number_of_words = total_words;
-        result->pop_count_computed = false;
 
         return result;
 }
@@ -342,15 +365,13 @@ itty_bit_string_reduce_by_half (itty_bit_string_t *bit_string)
 
         size_t half_number_of_words = bit_string->number_of_words / 2;
 
-        itty_bit_string_t *first_half = itty_bit_string_new ();
+        itty_bit_string_t *first_half = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_ONLY);
         first_half->words = bit_string->words;
         first_half->number_of_words = half_number_of_words;
-        first_half->pop_count_computed = false;
 
-        itty_bit_string_t *second_half = itty_bit_string_new ();
+        itty_bit_string_t *second_half = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_ONLY);
         second_half->words = bit_string->words + half_number_of_words;
         second_half->number_of_words = half_number_of_words;
-        second_half->pop_count_computed = false;
 
         itty_bit_string_t *reduced_bit_string = itty_bit_string_mask (first_half, second_half);
 
