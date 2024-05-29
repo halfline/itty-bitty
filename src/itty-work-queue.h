@@ -4,10 +4,11 @@
 
 typedef struct itty_work_queue_t itty_work_queue_t;
 typedef struct itty_work_t itty_work_t;
+typedef void * (* itty_work_handler_t) (void *data);
 
 struct itty_work_t
 {
-        void *(*callback) (void *user_data);
+        itty_work_handler_t callback;
         void *user_data;
         void *result;
         struct itty_work_t *next;
