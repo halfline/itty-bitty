@@ -2,6 +2,8 @@
 
 The Itty Bitty project is an innovative exploration into neural network architectures that utilize bit string manipulations instead of traditional floating-point vectors. This project aims to investigate the feasibility and performance of bitwise operations as the fundamental building blocks for neural networks, potentially offering significant computational efficiency and resource savings.
 
+The project is an incomplete and unproven experiment. It's future is uncertain.
+
 ##  Motivation
 
 Traditional neural networks rely heavily on floating-point arithmetic to perform computations. However, floating-point operations can be computationally intensive and resource-demanding. The Itty Bitty project proposes an alternative approach, leveraging the simplicity and efficiency of bitwise operations to perform neural network computations. This method has the potential to significantly reduce computational overhead, making neural networks more efficient and accessible, especially in resource-constrained environments.
