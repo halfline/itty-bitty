@@ -38,6 +38,7 @@ struct itty_bit_string_iterator_t {
 };
 
 itty_bit_string_t *itty_bit_string_new (itty_bit_string_mutability_t mutability);
+itty_bit_string_t *itty_bit_string_clone (itty_bit_string_t *bit_string);
 
 void itty_bit_string_free (itty_bit_string_t *bit_string);
 
@@ -59,6 +60,7 @@ itty_bit_string_t *itty_bit_string_mask (itty_bit_string_t *a,
 
 size_t itty_bit_string_get_pop_count (itty_bit_string_t *bit_string);
 size_t itty_bit_string_get_length (itty_bit_string_t *bit_string);
+size_t itty_bit_string_get_bit_capacity (itty_bit_string_t *bit_string);
 
 size_t itty_bit_string_evaluate_similarity (itty_bit_string_t *a,
                                             itty_bit_string_t *b);

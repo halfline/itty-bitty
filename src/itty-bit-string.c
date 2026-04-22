@@ -27,6 +27,35 @@ itty_bit_string_new (itty_bit_string_mutability_t mutability)
         return bit_string;
 }
 
+itty_bit_string_t *
+itty_bit_string_clone (itty_bit_string_t *bit_string)
+{
+        itty_bit_string_t *clone = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+
+        if (!clone)
+                return NULL;
+
+        clone->number_of_words = bit_string->number_of_words;
+        clone->pop_count = bit_string->pop_count;
+        clone->pop_count_computed = bit_string->pop_count_computed;
+        clone->bit_length = bit_string->bit_length;
+        clone->bit_length_computed = bit_string->bit_length_computed;
+
+        if (clone->number_of_words == 0)
+                return clone;
+
+        clone->words = malloc (clone->number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
+        if (!clone->words) {
+                free (clone);
+                return NULL;
+        }
+
+        memcpy (clone->words,
+                bit_string->words,
+                clone->number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
+        return clone;
+}
+
 void
 itty_bit_string_free (itty_bit_string_t *bit_string)
 {
@@ -268,6 +297,12 @@ size_t
 itty_bit_string_get_number_of_words (itty_bit_string_t *bit_string)
 {
         return bit_string->number_of_words;
+}
+
+size_t
+itty_bit_string_get_bit_capacity (itty_bit_string_t *bit_string)
+{
+        return itty_bit_string_get_number_of_words (bit_string) * ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
 }
 
 void

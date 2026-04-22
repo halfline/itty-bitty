@@ -15,6 +15,19 @@ struct itty_bit_string_t {
         unsigned long bit_length_computed : 1;
 };
 
+static inline bool
+itty_bit_string_get_bit (itty_bit_string_t *bit_string,
+                         size_t             bit_index)
+{
+        size_t word_index = bit_index / ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+        size_t bit_position = bit_index % ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+
+        if (word_index >= bit_string->number_of_words)
+                return false;
+
+        return (bit_string->words[word_index] & (1UL << bit_position)) != 0;
+}
+
 static inline void
 itty_bit_string_set_bit (itty_bit_string_t *bit_string,
                          size_t             bit_index,
