@@ -100,30 +100,68 @@ itty_bit_string_list_condense (itty_bit_string_list_t *list)
                 return NULL;
         }
 
-        itty_bit_string_list_t *transposed_list = itty_bit_string_list_transpose (list);
-        if (!transposed_list) {
-                return NULL;
-        }
-
-        size_t max_number_of_words = transposed_list->max_number_of_words;
+        size_t bit_length = itty_bit_string_list_get_bit_length (list);
+        size_t number_of_words = (bit_length + ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1) / ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
         itty_bit_string_t *condensed_bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
-        condensed_bit_string->words = calloc (max_number_of_words, sizeof (size_t));
-        condensed_bit_string->number_of_words = max_number_of_words;
+        condensed_bit_string->words = calloc (number_of_words, sizeof (size_t));
+        condensed_bit_string->number_of_words = number_of_words;
 
         size_t majority_threshold = list->count / 2 + 1;
+        for (size_t bit_index = 0; bit_index < bit_length; bit_index++) {
+                size_t one_votes = 0;
 
-        for (size_t i = 0; i < transposed_list->count; i++) {
-                itty_bit_string_t *bit_string = transposed_list->bit_strings[i];
-                size_t pop_count = itty_bit_string_get_pop_count(bit_string);
-
-                if (pop_count >= majority_threshold) {
-                        for (size_t word_index = 0; word_index < bit_string->number_of_words; word_index++) {
-                                condensed_bit_string->words[word_index] |= ((size_t) 1 << (transposed_list->count - 1 - i));
-                        }
+                for (size_t string_index = 0; string_index < list->count; string_index++) {
+                        if (itty_bit_string_get_bit (list->bit_strings[string_index], bit_index))
+                                one_votes++;
                 }
+
+                if (one_votes >= majority_threshold)
+                        itty_bit_string_set_bit (condensed_bit_string, bit_index, true);
         }
 
-        itty_bit_string_list_free (transposed_list);
+        return condensed_bit_string;
+}
+
+itty_bit_string_t *
+itty_bit_string_list_weighted_condense (itty_bit_string_list_t *list,
+                                        size_t const           *votes,
+                                        size_t                  vote_count)
+{
+        if (!list || list->count == 0 || !votes || vote_count != list->count)
+                return NULL;
+
+        size_t bit_length = itty_bit_string_list_get_bit_length (list);
+        size_t number_of_words = (bit_length + ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1) / ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+        itty_bit_string_t *condensed_bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        if (!condensed_bit_string)
+                return NULL;
+
+        condensed_bit_string->words = calloc (number_of_words, sizeof (size_t));
+        if (number_of_words > 0 && !condensed_bit_string->words) {
+                itty_bit_string_free (condensed_bit_string);
+                return NULL;
+        }
+        condensed_bit_string->number_of_words = number_of_words;
+
+        __uint128_t total_votes = 0;
+        for (size_t i = 0; i < vote_count; i++)
+                total_votes += votes[i];
+
+        if (total_votes == 0)
+                return condensed_bit_string;
+
+        __uint128_t majority_threshold = total_votes / 2 + 1;
+        for (size_t bit_index = 0; bit_index < bit_length; bit_index++) {
+                __uint128_t one_votes = 0;
+
+                for (size_t string_index = 0; string_index < list->count; string_index++) {
+                        if (itty_bit_string_get_bit (list->bit_strings[string_index], bit_index))
+                                one_votes += votes[string_index];
+                }
+
+                if (one_votes >= majority_threshold)
+                        itty_bit_string_set_bit (condensed_bit_string, bit_index, true);
+        }
 
         return condensed_bit_string;
 }
@@ -136,7 +174,7 @@ itty_bit_string_list_transpose (itty_bit_string_list_t *list)
         }
 
         size_t bit_length = itty_bit_string_list_get_bit_length (list);
-        size_t number_of_words = (bit_length + ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1) / ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+        size_t number_of_words = (list->count + ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1) / ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
 
         itty_bit_string_list_t *transposed_list = itty_bit_string_list_new ();
 

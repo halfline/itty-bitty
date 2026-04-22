@@ -77,6 +77,25 @@ test_itty_bit_string_list_condense (void)
 }
 
 void
+test_itty_bit_string_list_condense_more_inputs_than_bits (void)
+{
+        itty_bit_string_list_t *list = itty_bit_string_list_new ();
+
+        for (size_t i = 0; i < 65; i++) {
+                itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+                itty_bit_string_append_word (bit_string, i < 33 ? 0b1 : 0b0);
+                itty_bit_string_list_append (list, bit_string);
+        }
+
+        itty_bit_string_t *condensed = itty_bit_string_list_condense (list);
+        assert (condensed != NULL);
+        assert (condensed->number_of_words == 1);
+        assert (condensed->words[0] == 0b1);
+
+        itty_bit_string_free (condensed);
+        itty_bit_string_list_free (list);
+}
+
 test_itty_bit_string_list_sort (void)
 {
         itty_bit_string_list_t *list = itty_bit_string_list_new ();
