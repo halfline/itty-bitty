@@ -6,6 +6,13 @@
 #include <stdatomic.h>
 
 static void *
+itty_pipeline_run_operation (void *data)
+{
+        itty_pipeline_operation_t *operation = data;
+        return operation->handler (operation->data);
+}
+
+static void *
 itty_fence_operation (void *data)
 {
         itty_pipeline_fence_t *fence = (itty_pipeline_fence_t *) data;
@@ -118,22 +125,28 @@ itty_pipeline_process (itty_pipeline_t *pipeline)
 {
         size_t i;
         itty_pipeline_operation_t *operation;
+        itty_task_group_t *pending_work = itty_manager_create_task_group (pipeline->manager);
 
         for (i = 0; i < pipeline->elements_count; i++) {
                 operation = (itty_pipeline_operation_t *) pipeline->elements[i];
 
-                itty_work_t *work = malloc (sizeof(itty_work_t));
-                work->callback  = (itty_work_handler_t) operation->handler;
-                work->user_data = operation->data;
-                work->next      = NULL;
-
-                itty_manager_enqueue_work (operation->manager, work);
-
                 if (operation->id == pipeline->fence_operation_id) {
+                        itty_manager_wait_for_task_group (pending_work);
+                        itty_manager_free_task_group (pending_work);
+                        pending_work = itty_manager_create_task_group (pipeline->manager);
+
                         itty_pipeline_fence_t *fence = (itty_pipeline_fence_t *) operation->data;
+                        itty_fence_operation (fence);
                         itty_pipeline_fence_wait (fence);
+                        continue;
                 }
+
+                if (!pending_work || !itty_manager_task_group_submit (pending_work, itty_pipeline_run_operation, operation))
+                        operation->handler (operation->data);
         }
+
+        itty_manager_wait_for_task_group (pending_work);
+        itty_manager_free_task_group (pending_work);
 }
 
 bool
@@ -158,4 +171,3 @@ itty_pipeline_fence_wait (itty_pipeline_fence_t *fence)
 
         itty_manager_wait_for_condition(fence->pipeline->manager, fence->condition);
 }
-
