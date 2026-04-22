@@ -63,4 +63,3 @@ void itty_bit_string_list_iterator_init_at_index (itty_bit_string_list_t        
 
 bool itty_bit_string_list_iterator_next (itty_bit_string_list_iterator_t  *iterator,
                                          itty_bit_string_t               **bit_string);
-
