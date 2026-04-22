@@ -15,7 +15,9 @@ itty_work_queue_thread (void *data)
                         break;
                 }
 
-                work->callback (work->user_data);
+                work->result = work->callback (work->user_data);
+                if (work->free_after_run)
+                        free (work);
         }
         return NULL;
 }
@@ -91,4 +93,3 @@ itty_work_queue_dequeue (itty_work_queue_t *queue)
         pthread_mutex_unlock (&queue->mutex);
         return work;
 }
-

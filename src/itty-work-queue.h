@@ -1,5 +1,6 @@
 #pragma once
 
+#include <stdbool.h>
 #include <pthread.h>
 
 typedef struct itty_work_queue_t itty_work_queue_t;
@@ -12,6 +13,7 @@ struct itty_work_t
         void *user_data;
         void *result;
         struct itty_work_t *next;
+        bool free_after_run;
 };
 
 itty_work_queue_t *itty_work_queue_new (void);
@@ -19,4 +21,3 @@ void itty_work_queue_free (itty_work_queue_t *queue);
 void itty_work_queue_enqueue (itty_work_queue_t *queue,
                               itty_work_t       *work);
 itty_work_t *itty_work_queue_dequeue (itty_work_queue_t *queue);
-

@@ -3,14 +3,22 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <assert.h>
+#include <stdatomic.h>
+#include <unistd.h>
+
+typedef struct {
+        int input;
+        int result;
+        atomic_bool completed;
+} test_data_t;
 
 void *
 test_callback (void *user_data)
 {
-        int *data = (int *) user_data;
-        int *result = malloc (sizeof (int));
-        *result = *data * 2;
-        return result;
+        test_data_t *data = user_data;
+        data->result = data->input * 2;
+        atomic_store (&data->completed, true);
+        return NULL;
 }
 
 void
@@ -19,30 +27,26 @@ test_itty_work_queue (void)
         itty_work_queue_t *queue = itty_work_queue_new ();
         assert (queue != NULL);
 
-        int data1 = 1, data2 = 2, data3 = 3;
-        itty_work_t work1 = { test_callback, &data1, NULL, NULL };
-        itty_work_t work2 = { test_callback, &data2, NULL, NULL };
-        itty_work_t work3 = { test_callback, &data3, NULL, NULL };
+        test_data_t data1 = { 1, 0, ATOMIC_VAR_INIT (false) };
+        test_data_t data2 = { 2, 0, ATOMIC_VAR_INIT (false) };
+        test_data_t data3 = { 3, 0, ATOMIC_VAR_INIT (false) };
+        itty_work_t work1 = { test_callback, &data1, NULL, NULL, false };
+        itty_work_t work2 = { test_callback, &data2, NULL, NULL, false };
+        itty_work_t work3 = { test_callback, &data3, NULL, NULL, false };
 
         itty_work_queue_enqueue (queue, &work1);
         itty_work_queue_enqueue (queue, &work2);
         itty_work_queue_enqueue (queue, &work3);
 
-        itty_work_t *dequeued_work;
-        dequeued_work = itty_work_queue_dequeue (queue);
-        assert (dequeued_work == &work1);
-        dequeued_work->result = dequeued_work->callback (dequeued_work->user_data);
-        assert (*(int *) dequeued_work->result == 2);
+        while (!atomic_load (&data1.completed) ||
+               !atomic_load (&data2.completed) ||
+               !atomic_load (&data3.completed)) {
+                usleep (20);
+        }
 
-        dequeued_work = itty_work_queue_dequeue (queue);
-        assert (dequeued_work == &work2);
-        dequeued_work->result = dequeued_work->callback (dequeued_work->user_data);
-        assert (*(int *) dequeued_work->result == 4);
-
-        dequeued_work = itty_work_queue_dequeue (queue);
-        assert (dequeued_work == &work3);
-        dequeued_work->result = dequeued_work->callback (dequeued_work->user_data);
-        assert (*(int *) dequeued_work->result == 6);
+        assert (data1.result == 2);
+        assert (data2.result == 4);
+        assert (data3.result == 6);
 
         itty_work_queue_free (queue);
 
@@ -55,4 +59,3 @@ main (void)
         test_itty_work_queue ();
         return 0;
 }
-
