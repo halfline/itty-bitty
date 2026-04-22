@@ -80,7 +80,11 @@ itty_bit_string_list_t *itty_bit_string_split (itty_bit_string_t *bit_string,
 itty_bit_string_t *itty_bit_string_concatenate (itty_bit_string_t *a,
                                                 itty_bit_string_t *b);
 itty_bit_string_t *itty_bit_string_double (itty_bit_string_t *bit_string);
+itty_bit_string_t *itty_bit_string_double_with_rotated_half (itty_bit_string_t *bit_string,
+                                                             size_t             rotation);
 itty_bit_string_t *itty_bit_string_reduce_by_half (itty_bit_string_t *bit_string);
+itty_bit_string_t *itty_bit_string_reduce_rotated_by_half (itty_bit_string_t *bit_string,
+                                                           size_t             rotation);
 char *itty_bit_string_present (itty_bit_string_t                     *bit_string,
                                itty_bit_string_presentation_format_t  format);
 void itty_bit_string_iterator_init (itty_bit_string_t          *bit_string,

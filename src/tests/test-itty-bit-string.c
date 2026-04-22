@@ -154,6 +154,103 @@ test_itty_bit_string_double (void)
 }
 
 void
+test_itty_bit_string_double_empty (void)
+{
+        itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_t *doubled = itty_bit_string_double (bit_string);
+        assert (doubled != NULL);
+        assert (itty_bit_string_get_number_of_words (doubled) == 0);
+        char *representation = itty_bit_string_present (doubled, ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY);
+        assert (strcmp (representation, "") == 0);
+        free (representation);
+        itty_bit_string_free (bit_string);
+        itty_bit_string_free (doubled);
+}
+
+void
+test_itty_bit_string_double_with_rotated_half (void)
+{
+        itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_append_word (bit_string, 0b1001);
+
+        itty_bit_string_t *doubled = itty_bit_string_double_with_rotated_half (bit_string, 1);
+        assert (doubled != NULL);
+        assert (itty_bit_string_get_number_of_words (doubled) == 2);
+        assert (doubled->words[0] == 0b1001);
+        assert (doubled->words[1] == 0b10010);
+
+        itty_bit_string_free (bit_string);
+        itty_bit_string_free (doubled);
+}
+
+void
+test_itty_bit_string_double_with_rotated_half_wraps (void)
+{
+        itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_append_word (bit_string, 1UL << (ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1));
+
+        itty_bit_string_t *doubled = itty_bit_string_double_with_rotated_half (bit_string, 1);
+        assert (doubled != NULL);
+        assert (itty_bit_string_get_number_of_words (doubled) == 2);
+        assert (doubled->words[0] == (1UL << (ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1)));
+        assert (doubled->words[1] == 1);
+
+        itty_bit_string_free (bit_string);
+        itty_bit_string_free (doubled);
+}
+
+void
+test_itty_bit_string_double_with_rotated_half_reduces_to_activation_gate (void)
+{
+        itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_append_word (bit_string, 0b1101);
+
+        itty_bit_string_t *doubled = itty_bit_string_double_with_rotated_half (bit_string, 1);
+        itty_bit_string_t *reduced = itty_bit_string_reduce_by_half (doubled);
+        assert (reduced != NULL);
+        assert (itty_bit_string_get_number_of_words (reduced) == 1);
+        assert (reduced->words[0] == 0b1000);
+
+        itty_bit_string_free (bit_string);
+        itty_bit_string_free (doubled);
+        itty_bit_string_free (reduced);
+}
+
+void
+test_itty_bit_string_reduce_rotated_by_half (void)
+{
+        itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_append_word (bit_string, 0b1101);
+
+        itty_bit_string_t *doubled = itty_bit_string_double_with_rotated_half (bit_string, 1);
+        itty_bit_string_t *reduced = itty_bit_string_reduce_rotated_by_half (doubled, 1);
+        assert (reduced != NULL);
+        assert (itty_bit_string_get_number_of_words (reduced) == 1);
+        assert (reduced->words[0] == 0b1101);
+
+        itty_bit_string_free (bit_string);
+        itty_bit_string_free (doubled);
+        itty_bit_string_free (reduced);
+}
+
+void
+test_itty_bit_string_reduce_rotated_by_half_wraps (void)
+{
+        itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_append_word (bit_string, 1UL << (ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1));
+
+        itty_bit_string_t *doubled = itty_bit_string_double_with_rotated_half (bit_string, 1);
+        itty_bit_string_t *reduced = itty_bit_string_reduce_rotated_by_half (doubled, 1);
+        assert (reduced != NULL);
+        assert (itty_bit_string_get_number_of_words (reduced) == 1);
+        assert (reduced->words[0] == (1UL << (ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1)));
+
+        itty_bit_string_free (bit_string);
+        itty_bit_string_free (doubled);
+        itty_bit_string_free (reduced);
+}
+
+void
 test_itty_bit_string_reduce_by_half (void)
 {
         itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
@@ -220,6 +317,12 @@ main (void)
         test_itty_bit_string_evaluate_similarity ();
         test_itty_bit_string_compare_by_pop_count ();
         test_itty_bit_string_double ();
+        test_itty_bit_string_double_empty ();
+        test_itty_bit_string_double_with_rotated_half ();
+        test_itty_bit_string_double_with_rotated_half_wraps ();
+        test_itty_bit_string_double_with_rotated_half_reduces_to_activation_gate ();
+        test_itty_bit_string_reduce_rotated_by_half ();
+        test_itty_bit_string_reduce_rotated_by_half_wraps ();
         test_itty_bit_string_reduce_by_half ();
         test_itty_bit_string_get_length ();
         test_itty_bit_string_get_bit_capacity ();

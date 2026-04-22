@@ -373,14 +373,16 @@ itty_bit_string_concatenate (itty_bit_string_t *a,
 {
         size_t total_words = a->number_of_words + b->number_of_words;
         itty_bit_string_t *result = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
-        result->words = malloc (total_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
-        if (!result->words) {
-                free (result);
-                return NULL;
-        }
+        if (total_words > 0) {
+                result->words = malloc (total_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
+                if (!result->words) {
+                        free (result);
+                        return NULL;
+                }
 
-        memcpy (result->words, a->words, a->number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
-        memcpy (result->words + a->number_of_words, b->words, b->number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
+                memcpy (result->words, a->words, a->number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
+                memcpy (result->words + a->number_of_words, b->words, b->number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
+        }
 
         result->number_of_words = total_words;
 
@@ -391,6 +393,69 @@ itty_bit_string_t *
 itty_bit_string_double (itty_bit_string_t *bit_string)
 {
         return itty_bit_string_concatenate (bit_string, bit_string);
+}
+
+static itty_bit_string_t *
+itty_bit_string_rotate_left (itty_bit_string_t *bit_string,
+                             size_t             rotation)
+{
+        size_t bit_capacity = itty_bit_string_get_bit_capacity (bit_string);
+        itty_bit_string_t *rotated = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        rotated->number_of_words = bit_string->number_of_words;
+
+        if (rotated->number_of_words == 0)
+                return rotated;
+
+        rotated->words = calloc (rotated->number_of_words, ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
+        rotation %= bit_capacity;
+
+        for (size_t bit_index = 0; bit_index < bit_capacity; bit_index++) {
+                if (!itty_bit_string_get_bit (bit_string, bit_index))
+                        continue;
+
+                size_t rotated_bit_index = (bit_index + rotation) % bit_capacity;
+                itty_bit_string_set_bit (rotated, rotated_bit_index, true);
+        }
+
+        return rotated;
+}
+
+static itty_bit_string_t *
+itty_bit_string_rotate_right (itty_bit_string_t *bit_string,
+                              size_t             rotation)
+{
+        size_t bit_capacity = itty_bit_string_get_bit_capacity (bit_string);
+        itty_bit_string_t *rotated = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        rotated->number_of_words = bit_string->number_of_words;
+
+        if (rotated->number_of_words == 0)
+                return rotated;
+
+        rotated->words = calloc (rotated->number_of_words, ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
+        rotation %= bit_capacity;
+
+        for (size_t bit_index = 0; bit_index < bit_capacity; bit_index++) {
+                if (!itty_bit_string_get_bit (bit_string, bit_index))
+                        continue;
+
+                size_t rotated_bit_index = (bit_index + bit_capacity - rotation) % bit_capacity;
+                itty_bit_string_set_bit (rotated, rotated_bit_index, true);
+        }
+
+        return rotated;
+}
+
+itty_bit_string_t *
+itty_bit_string_double_with_rotated_half (itty_bit_string_t *bit_string,
+                                          size_t             rotation)
+{
+        itty_bit_string_t *rotated = itty_bit_string_rotate_left (bit_string,
+                                                                  rotation);
+        itty_bit_string_t *doubled = itty_bit_string_concatenate (bit_string,
+                                                                  rotated);
+        itty_bit_string_free (rotated);
+
+        return doubled;
 }
 
 itty_bit_string_t *
@@ -415,6 +480,37 @@ itty_bit_string_reduce_by_half (itty_bit_string_t *bit_string)
 
         itty_bit_string_free (first_half);
         itty_bit_string_free (second_half);
+
+        return reduced_bit_string;
+}
+
+itty_bit_string_t *
+itty_bit_string_reduce_rotated_by_half (itty_bit_string_t *bit_string,
+                                        size_t             rotation)
+{
+        assert (bit_string->number_of_words % 2 == 0);
+
+        size_t half_number_of_words = bit_string->number_of_words / 2;
+
+        itty_bit_string_t *first_half = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_ONLY);
+        first_half->words = bit_string->words;
+        first_half->number_of_words = half_number_of_words;
+
+        itty_bit_string_t *second_half = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_ONLY);
+        second_half->words = bit_string->words + half_number_of_words;
+        second_half->number_of_words = half_number_of_words;
+
+        itty_bit_string_t *unrotated_second_half = itty_bit_string_rotate_right (second_half,
+                                                                                 rotation);
+        itty_bit_string_t *reduced_bit_string = itty_bit_string_mask (first_half,
+                                                                      unrotated_second_half);
+
+        first_half->words = NULL;
+        second_half->words = NULL;
+
+        itty_bit_string_free (first_half);
+        itty_bit_string_free (second_half);
+        itty_bit_string_free (unrotated_second_half);
 
         return reduced_bit_string;
 }
