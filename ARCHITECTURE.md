@@ -5182,6 +5182,28 @@ the extra A replay step is a no-op,
 and the route-key selector keeps both route assignments and both positive gaps.
 ```
 
+The focused chain was then extended one more step to `A -> B -> A -> B`:
+
+```text
+replay_b_flips = 8
+after_replay2_a_forced_dist = 0
+after_replay2_b_forced_dist = 27
+after_replay2_b_forced_def  = 57
+after_replay2_a_selected_route = 2
+after_replay2_a_selected_gap   = 1
+after_replay2_b_selected_route = 0
+after_replay2_b_selected_gap   = 1
+```
+
+So in the focused route-key diagnostic:
+
+```text
+A keeps route 2 with positive gap
+B keeps route 0 with positive gap
+A remains solved
+and the second B replay step improves B further (28/60 -> 27/57)
+```
+
 This changes the selector conclusion materially:
 
 ```text
@@ -5197,4 +5219,71 @@ But it is the strongest multi-example routing result so far:
 frozen decoder storage works
 associative selector routing works
 the focused A -> B -> A replay check stays stable
+```
+
+Latest focused diagnostic update: add C to route-key selector
+-------------------------------------------------------------
+
+The next stress test kept the same route-key selector setup and introduced a
+third example `C` with its own probe and target, while keeping the `A/B`
+decoder state and route assignments fixed.
+
+Focused `A/B/C` result:
+
+```text
+A route = 2
+B route = 0
+C route = 1
+
+before C training:
+        A selected route = 2, gap = 1
+        B selected route = 0, gap = 1
+        C selected route = 1, gap = 1
+
+after C training:
+        A selected route = 2, gap = 1
+        B selected route = 0, gap = 1
+        C selected route = 1, gap = 1
+```
+
+Decoder effects:
+
+```text
+B after A->B->A->B:
+        forced distance = 27
+        forced deficit  = 57
+
+C before training:
+        forced distance = 15
+        forced deficit  = 0
+
+C training:
+        replay_c_flips = 0
+
+C after training:
+        forced distance = 15
+        forced deficit  = 0
+```
+
+So the current `C` result is:
+
+```text
+the route-key selector can allocate a third route cleanly
+without collapsing the existing A/B assignments or gaps;
+but this particular C case does not yet improve decoder storage.
+```
+
+That is still useful because it separates two questions:
+
+```text
+route allocation / addressing for C: yes
+route-local decoder improvement for C: not yet in this focused case
+```
+
+So the route-key branch now supports the stronger claim:
+
+```text
+associative route addressing scales past the first two examples
+in the focused diagnostic,
+but decoder training for newly claimed routes is still example-dependent.
 ```
