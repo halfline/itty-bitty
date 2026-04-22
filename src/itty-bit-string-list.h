@@ -29,6 +29,9 @@ itty_bit_string_t *itty_bit_string_list_fetch (itty_bit_string_list_t *list,
                                                size_t                  index);
 
 itty_bit_string_t *itty_bit_string_list_condense (itty_bit_string_list_t *list);
+itty_bit_string_t *itty_bit_string_list_weighted_condense (itty_bit_string_list_t *list,
+                                                           size_t const           *votes,
+                                                           size_t                  vote_count);
 
 itty_bit_string_list_t *itty_bit_string_list_transpose (itty_bit_string_list_t *list);
 
@@ -36,8 +39,15 @@ size_t itty_bit_string_list_get_max_number_of_words (itty_bit_string_list_t *lis
 
 char *itty_bit_string_list_present (itty_bit_string_list_t                *bit_string_list,
                                     itty_bit_string_presentation_format_t  format);
-itty_bit_string_list_t *itty_bit_string_list_popcount_softmax (itty_bit_string_list_t *list,
-                                                               size_t                  num_words);
+bool itty_popcount_allocate_votes (size_t const *scores,
+                                   size_t        score_count,
+                                   size_t        total_votes,
+                                   size_t       *votes);
+bool itty_bit_string_list_allocate_popcount_votes (itty_bit_string_list_t *list,
+                                                   size_t                  total_votes,
+                                                   size_t                 *votes);
+itty_bit_string_list_t *itty_bit_string_list_make_popcount_vote_masks (itty_bit_string_list_t *list,
+                                                                       size_t                  num_words);
 bool itty_bit_string_list_popcount_argmax (itty_bit_string_list_t *list,
                                            size_t                  num_words,
                                            size_t                 *index);

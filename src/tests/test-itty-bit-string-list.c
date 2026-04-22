@@ -96,6 +96,40 @@ test_itty_bit_string_list_condense_more_inputs_than_bits (void)
         itty_bit_string_list_free (list);
 }
 
+void
+test_itty_bit_string_list_weighted_condense (void)
+{
+        itty_bit_string_list_t *list = itty_bit_string_list_new ();
+        itty_bit_string_t *bit_string_1 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_t *bit_string_2 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_t *bit_string_3 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_append_word (bit_string_1, 0b1010);
+        itty_bit_string_append_word (bit_string_2, 0b1100);
+        itty_bit_string_append_word (bit_string_3, 0b0011);
+        itty_bit_string_list_append (list, bit_string_1);
+        itty_bit_string_list_append (list, bit_string_2);
+        itty_bit_string_list_append (list, bit_string_3);
+
+        size_t votes[3] = { 1, 5, 1 };
+        itty_bit_string_t *condensed = itty_bit_string_list_weighted_condense (list, votes, 3);
+        assert (condensed != NULL);
+        assert (condensed->number_of_words == 1);
+        assert (condensed->words[0] == 0b1100);
+        itty_bit_string_free (condensed);
+
+        size_t zero_votes[3] = { 0, 0, 0 };
+        condensed = itty_bit_string_list_weighted_condense (list, zero_votes, 3);
+        assert (condensed != NULL);
+        assert (condensed->number_of_words == 1);
+        assert (condensed->words[0] == 0);
+        itty_bit_string_free (condensed);
+
+        assert (itty_bit_string_list_weighted_condense (list, votes, 2) == NULL);
+
+        itty_bit_string_list_free (list);
+}
+
+void
 test_itty_bit_string_list_sort (void)
 {
         itty_bit_string_list_t *list = itty_bit_string_list_new ();
@@ -114,6 +148,64 @@ test_itty_bit_string_list_sort (void)
         assert (list->bit_strings[0] == bit_string_2);
         assert (list->bit_strings[1] == bit_string_1);
         assert (list->bit_strings[2] == bit_string_3);
+        itty_bit_string_list_free (list);
+}
+
+void
+test_itty_popcount_allocate_votes (void)
+{
+        size_t scores[3] = { 1, 1, 1 };
+        size_t votes[3] = { 0, 0, 0 };
+
+        assert (itty_popcount_allocate_votes (scores, 3, 8, votes));
+        assert (votes[0] == 3);
+        assert (votes[1] == 3);
+        assert (votes[2] == 2);
+        assert (votes[0] + votes[1] + votes[2] == 8);
+
+        size_t weighted_scores[3] = { 70, 20, 10 };
+        assert (itty_popcount_allocate_votes (weighted_scores, 3, 10, votes));
+        assert (votes[0] == 7);
+        assert (votes[1] == 2);
+        assert (votes[2] == 1);
+        assert (votes[0] + votes[1] + votes[2] == 10);
+
+        size_t zero_scores[3] = { 0, 0, 0 };
+        assert (itty_popcount_allocate_votes (zero_scores, 3, 10, votes));
+        assert (votes[0] == 0);
+        assert (votes[1] == 0);
+        assert (votes[2] == 0);
+}
+
+void
+test_itty_bit_string_list_make_popcount_vote_masks (void)
+{
+        itty_bit_string_list_t *list = itty_bit_string_list_new ();
+        itty_bit_string_t *bit_string_1 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_t *bit_string_2 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_t *bit_string_3 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        itty_bit_string_append_word (bit_string_1, 0b1);
+        itty_bit_string_append_word (bit_string_2, 0b1);
+        itty_bit_string_append_word (bit_string_3, 0b1);
+        itty_bit_string_list_append (list, bit_string_1);
+        itty_bit_string_list_append (list, bit_string_2);
+        itty_bit_string_list_append (list, bit_string_3);
+
+        itty_bit_string_list_t *vote_masks = itty_bit_string_list_make_popcount_vote_masks (list, 1);
+        assert (vote_masks != NULL);
+        assert (vote_masks->count == 3);
+
+        size_t total_votes = 0;
+        for (size_t i = 0; i < vote_masks->count; i++) {
+                total_votes += itty_bit_string_get_pop_count (vote_masks->bit_strings[i]);
+        }
+
+        assert (total_votes == ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
+        assert (itty_bit_string_get_pop_count (vote_masks->bit_strings[0]) == 22);
+        assert (itty_bit_string_get_pop_count (vote_masks->bit_strings[1]) == 21);
+        assert (itty_bit_string_get_pop_count (vote_masks->bit_strings[2]) == 21);
+
+        itty_bit_string_list_free (vote_masks);
         itty_bit_string_list_free (list);
 }
 
@@ -156,6 +248,27 @@ test_itty_bit_string_list_transpose (void)
         itty_bit_string_list_free (list);
 }
 
+void
+test_itty_bit_string_list_transpose_more_inputs_than_bits (void)
+{
+        itty_bit_string_list_t *list = itty_bit_string_list_new ();
+
+        for (size_t i = 0; i < 65; i++) {
+                itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+                itty_bit_string_append_word (bit_string, 0b1);
+                itty_bit_string_list_append (list, bit_string);
+        }
+
+        itty_bit_string_list_t *transposed_list = itty_bit_string_list_transpose (list);
+        assert (transposed_list != NULL);
+        assert (transposed_list->count == 1);
+        assert (transposed_list->bit_strings[0]->number_of_words == 2);
+        assert (itty_bit_string_get_pop_count (transposed_list->bit_strings[0]) == 65);
+
+        itty_bit_string_list_free (transposed_list);
+        itty_bit_string_list_free (list);
+}
+
 int
 main (void)
 {
@@ -163,10 +276,14 @@ main (void)
         test_itty_bit_string_list_append ();
         test_itty_bit_string_list_exclusive_or ();
         test_itty_bit_string_list_transpose ();
+        test_itty_bit_string_list_transpose_more_inputs_than_bits ();
         test_itty_bit_string_list_condense ();
+        test_itty_bit_string_list_condense_more_inputs_than_bits ();
+        test_itty_bit_string_list_weighted_condense ();
         test_itty_bit_string_list_sort ();
+        test_itty_popcount_allocate_votes ();
+        test_itty_bit_string_list_make_popcount_vote_masks ();
 
         printf ("All itty-bit-string-list tests passed.\n");
         return 0;
 }
-

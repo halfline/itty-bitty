@@ -6,6 +6,11 @@
 #include <stdlib.h>
 #include <string.h>
 
+typedef struct {
+        size_t     index;
+        __uint128_t remainder;
+} itty_popcount_vote_remainder_t;
+
 itty_bit_string_list_t *
 itty_bit_string_list_new (void)
 {
@@ -278,50 +283,157 @@ itty_bit_string_list_present (itty_bit_string_list_t                *bit_string_
         return list_representation;
 }
 
-itty_bit_string_list_t *
-itty_bit_string_list_popcount_softmax (itty_bit_string_list_t *list,
-                                       size_t                  num_words)
+static int
+compare_vote_remainders_descending (const void *a,
+                                    const void *b)
 {
-        itty_bit_string_list_t *softmax_list = itty_bit_string_list_new ();
+        const itty_popcount_vote_remainder_t *remainder_a = a;
+        const itty_popcount_vote_remainder_t *remainder_b = b;
 
-        size_t total_popcount = 0;
-        itty_bit_string_list_iterator_t iterator;
-        itty_bit_string_list_iterator_init (list, &iterator);
-        itty_bit_string_t *bit_string;
+        if (remainder_a->remainder > remainder_b->remainder)
+                return -1;
+        if (remainder_a->remainder < remainder_b->remainder)
+                return 1;
+        if (remainder_a->index < remainder_b->index)
+                return -1;
+        if (remainder_a->index > remainder_b->index)
+                return 1;
+        return 0;
+}
 
-        while (itty_bit_string_list_iterator_next (&iterator, &bit_string)) {
-                total_popcount += itty_bit_string_get_pop_count (bit_string);
+bool
+itty_popcount_allocate_votes (size_t const *scores,
+                              size_t        score_count,
+                              size_t        total_votes,
+                              size_t       *votes)
+{
+        if (score_count == 0)
+                return true;
+
+        if (!scores || !votes)
+                return false;
+
+        __uint128_t total_score = 0;
+        for (size_t i = 0; i < score_count; i++) {
+                votes[i] = 0;
+                total_score += scores[i];
         }
 
-        size_t cumulative_ones = 0;
-        itty_bit_string_list_iterator_init (list, &iterator);
-        while (itty_bit_string_list_iterator_next (&iterator, &bit_string)) {
-                itty_bit_string_t *new_bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
-                size_t num_ones = (itty_bit_string_get_pop_count (bit_string) * ITTY_BIT_STRING_WORD_SIZE_IN_BITS + total_popcount - 1) / total_popcount;
-                cumulative_ones += num_ones;
+        if (total_score == 0 || total_votes == 0)
+                return true;
 
-                size_t remaining_ones = num_ones;
-                for (size_t i = 0; i < num_words; i++) {
-                        size_t word = 0;
-                        if (remaining_ones > 0) {
-                                size_t ones_in_word = remaining_ones > ITTY_BIT_STRING_WORD_SIZE_IN_BITS ? ITTY_BIT_STRING_WORD_SIZE_IN_BITS : remaining_ones;
-                                word = (1UL << ones_in_word) - 1;
-                                remaining_ones -= ones_in_word;
-                        }
-                        itty_bit_string_append_word (new_bit_string, word);
+        itty_popcount_vote_remainder_t *remainders = calloc (score_count, sizeof (itty_popcount_vote_remainder_t));
+        if (!remainders)
+                return false;
+
+        size_t allocated_votes = 0;
+        for (size_t i = 0; i < score_count; i++) {
+                __uint128_t scaled_score = (__uint128_t) scores[i] * total_votes;
+                votes[i] = (size_t) (scaled_score / total_score);
+                remainders[i] = (itty_popcount_vote_remainder_t) {
+                        i,
+                        scaled_score % total_score
+                };
+                allocated_votes += votes[i];
+        }
+
+        qsort (remainders, score_count, sizeof (itty_popcount_vote_remainder_t), compare_vote_remainders_descending);
+
+        size_t remaining_votes = total_votes - allocated_votes;
+        for (size_t i = 0; i < remaining_votes; i++)
+                votes[remainders[i].index]++;
+
+        free (remainders);
+
+        return true;
+}
+
+bool
+itty_bit_string_list_allocate_popcount_votes (itty_bit_string_list_t *list,
+                                              size_t                  total_votes,
+                                              size_t                 *votes)
+{
+        if (!list || !votes)
+                return false;
+
+        if (list->count == 0)
+                return true;
+
+        size_t *scores = calloc (list->count, sizeof (size_t));
+        if (!scores)
+                return false;
+
+        for (size_t i = 0; i < list->count; i++)
+                scores[i] = itty_bit_string_get_pop_count (list->bit_strings[i]);
+
+        bool allocated = itty_popcount_allocate_votes (scores, list->count, total_votes, votes);
+        free (scores);
+
+        return allocated;
+}
+
+static itty_bit_string_t *
+itty_bit_string_new_vote_mask (size_t number_of_words,
+                               size_t number_of_votes)
+{
+        itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        if (!bit_string)
+                return NULL;
+
+        for (size_t i = 0; i < number_of_words; i++) {
+                size_t ones_in_word = number_of_votes > ITTY_BIT_STRING_WORD_SIZE_IN_BITS ?
+                        ITTY_BIT_STRING_WORD_SIZE_IN_BITS : number_of_votes;
+                size_t word = 0;
+
+                if (ones_in_word == ITTY_BIT_STRING_WORD_SIZE_IN_BITS)
+                        word = ~0UL;
+                else if (ones_in_word > 0)
+                        word = (1UL << ones_in_word) - 1;
+
+                itty_bit_string_append_word (bit_string, word);
+                number_of_votes -= ones_in_word;
+        }
+
+        return bit_string;
+}
+
+itty_bit_string_list_t *
+itty_bit_string_list_make_popcount_vote_masks (itty_bit_string_list_t *list,
+                                               size_t                  num_words)
+{
+        if (!list)
+                return NULL;
+
+        itty_bit_string_list_t *vote_masks = itty_bit_string_list_new ();
+        if (!vote_masks)
+                return NULL;
+
+        size_t *votes = calloc (list->count, sizeof (size_t));
+        if (!votes) {
+                itty_bit_string_list_free (vote_masks);
+                return NULL;
+        }
+
+        size_t total_votes = ITTY_BIT_STRING_WORD_SIZE_IN_BITS * num_words;
+        if (!itty_bit_string_list_allocate_popcount_votes (list, total_votes, votes)) {
+                free (votes);
+                itty_bit_string_list_free (vote_masks);
+                return NULL;
+        }
+
+        for (size_t i = 0; i < list->count; i++) {
+                itty_bit_string_t *vote_mask = itty_bit_string_new_vote_mask (num_words, votes[i]);
+                if (!vote_mask) {
+                        free (votes);
+                        itty_bit_string_list_free (vote_masks);
+                        return NULL;
                 }
-
-                itty_bit_string_list_append (softmax_list, new_bit_string);
+                itty_bit_string_list_append (vote_masks, vote_mask);
         }
 
-        size_t total_bits = ITTY_BIT_STRING_WORD_SIZE_IN_BITS * num_words;
-        if (cumulative_ones != total_bits && softmax_list->count > 0) {
-                size_t excess_ones = cumulative_ones - total_bits;
-                size_t last_word_index = num_words - 1;
-                softmax_list->bit_strings[softmax_list->count - 1]->words[last_word_index] >>= excess_ones;
-        }
+        free (votes);
 
-        return softmax_list;
+        return vote_masks;
 }
 
 bool
