@@ -48,9 +48,9 @@ test_itty_manager (void)
             {3, NULL, ATOMIC_VAR_INIT (false)}
         };
 
-        itty_work_t work1 = { test_callback, &test_items[0], NULL, NULL };
-        itty_work_t work2 = { test_callback, &test_items[1], NULL, NULL };
-        itty_work_t work3 = { test_callback, &test_items[2], NULL, NULL };
+        itty_work_t work1 = { test_callback, &test_items[0], NULL, NULL, false };
+        itty_work_t work2 = { test_callback, &test_items[1], NULL, NULL, false };
+        itty_work_t work3 = { test_callback, &test_items[2], NULL, NULL, false };
 
         itty_manager_enqueue_work (manager, &work1);
         itty_manager_enqueue_work (manager, &work2);
@@ -71,10 +71,95 @@ test_itty_manager (void)
         printf ("All tests passed!\n");
 }
 
+void *
+multiply_callback (void *user_data)
+{
+        int *value = user_data;
+        int *result = malloc (sizeof (int));
+        *result = *value * 3;
+        return result;
+}
+
+void
+test_itty_manager_tasks (void)
+{
+        itty_manager_t *manager = itty_manager_new ();
+        assert (manager != NULL);
+        assert (itty_manager_get_queue_count (manager) > 0);
+
+        int value = 7;
+        itty_task_t *task = itty_manager_submit (manager, multiply_callback, &value);
+        assert (task != NULL);
+        itty_manager_wait_for_task (manager, task);
+        assert (itty_manager_task_is_complete (task));
+
+        int *result = itty_manager_task_get_result (task);
+        assert (result != NULL);
+        assert (*result == 21);
+        free (result);
+        itty_manager_free_task (task);
+
+        itty_manager_free (manager);
+}
+
+void
+test_itty_manager_task_wait_allows_immediate_free (void)
+{
+        itty_manager_t *manager = itty_manager_new ();
+        assert (manager != NULL);
+
+        for (size_t i = 0; i < 1000; i++) {
+                int value = (int) i;
+                itty_task_t *task = itty_manager_submit (manager, multiply_callback, &value);
+                assert (task != NULL);
+
+                itty_manager_wait_for_task (manager, task);
+                int *result = itty_manager_task_get_result (task);
+                assert (result != NULL);
+                assert (*result == value * 3);
+                free (result);
+                itty_manager_free_task (task);
+        }
+
+        itty_manager_free (manager);
+}
+
+void
+test_itty_manager_task_groups (void)
+{
+        itty_manager_t *manager = itty_manager_new ();
+        assert (manager != NULL);
+
+        itty_task_group_t *group = itty_manager_create_task_group (manager);
+        assert (group != NULL);
+
+        int values[4] = { 1, 2, 3, 4 };
+        for (size_t i = 0; i < 4; i++) {
+                assert (itty_manager_task_group_submit (group, multiply_callback, &values[i]) != NULL);
+        }
+
+        itty_manager_wait_for_task_group (group);
+        assert (itty_manager_task_group_get_size (group) == 4);
+
+        for (size_t i = 0; i < 4; i++) {
+                itty_task_t *task = itty_manager_task_group_get_task (group, i);
+                int *result = itty_manager_task_get_result (task);
+                assert (result != NULL);
+                assert (*result == values[i] * 3);
+                free (result);
+        }
+
+        itty_manager_free_task_group (group);
+        itty_manager_wait_for_all (manager);
+        itty_manager_free (manager);
+}
+
 int
 main (void)
 {
         test_itty_manager ();
+        test_itty_manager_tasks ();
+        test_itty_manager_task_wait_allows_immediate_free ();
+        test_itty_manager_task_groups ();
         return 0;
 }
-
