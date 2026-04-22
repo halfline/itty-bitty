@@ -13,8 +13,15 @@ itty_bit_string_map_file_t *
 itty_bit_string_map_file_new (const char *file_name)
 {
         itty_bit_string_map_file_t *mapped_file = malloc (sizeof (itty_bit_string_map_file_t));
+        if (!mapped_file) {
+                return NULL;
+        }
 
         mapped_file->mapped_data = MAP_FAILED;
+        mapped_file->file_size = 0;
+        mapped_file->current_index = 0;
+        mapped_file->word_count_per_bit_string = 0;
+        mapped_file->bit_string_list = NULL;
         mapped_file->fd = open (file_name, O_RDWR | O_CREAT, 0644);
         if (mapped_file->fd == -1) {
                 free (mapped_file);
@@ -28,8 +35,8 @@ itty_bit_string_map_file_new (const char *file_name)
                 return NULL;
         }
 
+        mapped_file->file_size = sb.st_size;
         if (sb.st_size != 0) {
-                mapped_file->file_size = sb.st_size;
                 mapped_file->mapped_data = mmap (NULL, mapped_file->file_size, PROT_READ | PROT_WRITE, MAP_SHARED, mapped_file->fd, 0);
                 if (mapped_file->mapped_data == MAP_FAILED) {
                         close (mapped_file->fd);
@@ -38,8 +45,14 @@ itty_bit_string_map_file_new (const char *file_name)
                 }
 
         }
-        mapped_file->current_index = 0;
         mapped_file->bit_string_list = itty_bit_string_list_new ();
+        if (!mapped_file->bit_string_list) {
+                if (mapped_file->mapped_data != MAP_FAILED)
+                        munmap (mapped_file->mapped_data, mapped_file->file_size);
+                close (mapped_file->fd);
+                free (mapped_file);
+                return NULL;
+        }
 
         return mapped_file;
 }
@@ -59,7 +72,8 @@ itty_bit_string_map_file_free (itty_bit_string_map_file_t *mapped_file)
         }
 
         itty_bit_string_list_free (mapped_file->bit_string_list);
-        munmap (mapped_file->mapped_data, mapped_file->file_size);
+        if (mapped_file->mapped_data != MAP_FAILED && mapped_file->file_size > 0)
+                munmap (mapped_file->mapped_data, mapped_file->file_size);
         close (mapped_file->fd);
         free (mapped_file);
 }
@@ -68,12 +82,20 @@ itty_bit_string_t *
 itty_bit_string_map_file_next (itty_bit_string_map_file_t  *mapped_file,
                                size_t                       number_of_words)
 {
+        if (number_of_words == 0 || mapped_file->mapped_data == MAP_FAILED) {
+                return NULL;
+        }
+
         size_t total_words = mapped_file->file_size / ITTY_BIT_STRING_WORD_SIZE_IN_BYTES;
-        if (mapped_file->current_index >= total_words) {
+        if (mapped_file->current_index > total_words ||
+            number_of_words > total_words - mapped_file->current_index) {
                 return NULL;
         }
 
         itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_COPY_ON_WRITE);
+        if (!bit_string) {
+                return NULL;
+        }
         bit_string->words = (size_t *) (mapped_file->mapped_data) + mapped_file->current_index;
         bit_string->number_of_words = number_of_words;
         bit_string->pop_count_computed = false;
@@ -96,28 +118,26 @@ bool
 itty_bit_string_map_file_resize (itty_bit_string_map_file_t *mapped_file,
                                  size_t                      new_size)
 {
-        if (mapped_file->file_size > 0 && mapped_file->file_size > new_size) {
-                if (mapped_file->mapped_data != MAP_FAILED)
-                    mapped_file->mapped_data = mremap (mapped_file->mapped_data, mapped_file->file_size, new_size, MREMAP_MAYMOVE);
-                else
-                    mapped_file->mapped_data = mmap (NULL, new_size, PROT_READ | PROT_WRITE, MAP_SHARED, mapped_file->fd, 0);
-
-                if (mapped_file->mapped_data == MAP_FAILED)
-                        return false;
+        if (new_size == mapped_file->file_size) {
+                return true;
         }
 
         if (ftruncate (mapped_file->fd, new_size) < 0)
                 return false;
 
-        if (mapped_file->file_size < new_size && new_size > 0) {
-                mremap (mapped_file->mapped_data, mapped_file->file_size, new_size, 0);
-        } else if (new_size == 0 && mapped_file->file_size != 0) {
+        if (mapped_file->mapped_data != MAP_FAILED && mapped_file->file_size > 0) {
                 munmap (mapped_file->mapped_data, mapped_file->file_size);
                 mapped_file->mapped_data = MAP_FAILED;
         }
 
         mapped_file->file_size = new_size;
+        mapped_file->current_index = 0;
+
+        if (new_size > 0) {
+                mapped_file->mapped_data = mmap (NULL, mapped_file->file_size, PROT_READ | PROT_WRITE, MAP_SHARED, mapped_file->fd, 0);
+                if (mapped_file->mapped_data == MAP_FAILED)
+                        return false;
+        }
 
         return true;
 }
-
