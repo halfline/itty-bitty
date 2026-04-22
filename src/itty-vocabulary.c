@@ -109,6 +109,83 @@ itty_vocabulary_translate_to_text (itty_vocabulary_t *vocabulary,
         return NULL;
 }
 
+static itty_bit_string_t *
+fold_activation_to_vocabulary_width (itty_bit_string_t *activation,
+                                     size_t             vocabulary_words)
+{
+        size_t activation_words = itty_bit_string_get_number_of_words (activation);
+
+        if (vocabulary_words == 0)
+                return NULL;
+
+        itty_bit_string_t *current_activation = activation;
+        while (activation_words > vocabulary_words) {
+                if (activation_words % 2 != 0 || activation_words / 2 < vocabulary_words) {
+                        if (current_activation != activation)
+                                itty_bit_string_free (current_activation);
+                        return NULL;
+                }
+
+                itty_bit_string_t *reduced_activation = itty_bit_string_reduce_by_half (current_activation);
+                if (current_activation != activation)
+                        itty_bit_string_free (current_activation);
+                current_activation = reduced_activation;
+                activation_words = itty_bit_string_get_number_of_words (current_activation);
+        }
+
+        return current_activation;
+}
+
+bool
+itty_vocabulary_decode_nearest (itty_vocabulary_t *vocabulary,
+                                itty_bit_string_t *activation,
+                                char             **text,
+                                size_t            *distance)
+{
+        if (text)
+                *text = NULL;
+
+        if (!vocabulary || !activation || vocabulary->count == 0)
+                return false;
+
+        itty_bit_string_t *first_bit_string = itty_bit_string_list_fetch (vocabulary->bit_strings, 0);
+        size_t vocabulary_words = itty_bit_string_get_number_of_words (first_bit_string);
+        itty_bit_string_t *folded_activation = fold_activation_to_vocabulary_width (activation,
+                                                                                    vocabulary_words);
+        if (!folded_activation)
+                return false;
+
+        size_t best_index = 0;
+        size_t best_distance = 0;
+        bool found_one = false;
+        for (size_t i = 0; i < vocabulary->count; i++) {
+                itty_bit_string_t *current_bit_string = itty_bit_string_list_fetch (vocabulary->bit_strings, i);
+                itty_bit_string_t *difference = itty_bit_string_exclusive_or (folded_activation,
+                                                                              current_bit_string);
+                size_t current_distance = itty_bit_string_get_pop_count (difference);
+                itty_bit_string_free (difference);
+
+                if (!found_one || current_distance < best_distance) {
+                        found_one = true;
+                        best_index = i;
+                        best_distance = current_distance;
+                }
+        }
+
+        if (folded_activation != activation)
+                itty_bit_string_free (folded_activation);
+
+        if (!found_one)
+                return false;
+
+        if (text)
+                *text = strdup (vocabulary->texts[best_index]);
+        if (distance)
+                *distance = best_distance;
+
+        return true;
+}
+
 bool
 itty_vocabulary_write_to_file (itty_vocabulary_t *vocabulary,
                                const char        *input_text,
@@ -122,7 +199,15 @@ itty_vocabulary_write_to_file (itty_vocabulary_t *vocabulary,
                 return false;
         }
 
-        itty_bit_string_map_file_resize (output_map_file, max_size);
+        if (!itty_bit_string_map_file_resize (output_map_file, max_size)) {
+                itty_bit_string_map_file_free (output_map_file);
+                return false;
+        }
+
+        if (max_size == 0) {
+                itty_bit_string_map_file_free (output_map_file);
+                return true;
+        }
 
         void *mapped_data = itty_bit_string_map_file_get_mapped_data (output_map_file);
         if (mapped_data == NULL) {
@@ -133,25 +218,40 @@ itty_vocabulary_write_to_file (itty_vocabulary_t *vocabulary,
         size_t offset = 0;
         const char *position = input_text;
         while (*position) {
+                size_t best_index = vocabulary->count;
+                size_t best_len = 0;
+
                 for (size_t i = 0; i < vocabulary->count; i++) {
                         size_t len = strlen (vocabulary->texts[i]);
-                        if (strncmp (position, vocabulary->texts[i], len) == 0) {
-                                itty_bit_string_t *bit_string = itty_vocabulary_translate_to_bit_string (vocabulary, vocabulary->texts[i]);
-                                if (bit_string) {
-                                        void *words = itty_bit_string_get_words (bit_string);
-                                        size_t number_of_words = itty_bit_string_get_number_of_words (bit_string);
-                                        memcpy (((char *) mapped_data) + offset, words, number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
-                                        offset += number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES;
-                                }
-                                position += len;
-                                break;
+                        if (len > best_len && strncmp (position, vocabulary->texts[i], len) == 0) {
+                                best_index = i;
+                                best_len = len;
                         }
                 }
+
+                if (best_index == vocabulary->count) {
+                        itty_bit_string_map_file_free (output_map_file);
+                        return false;
+                }
+
+                itty_bit_string_t *bit_string = itty_bit_string_list_fetch (vocabulary->bit_strings, best_index);
+                if (!bit_string) {
+                        itty_bit_string_map_file_free (output_map_file);
+                        return false;
+                }
+
+                void *words = itty_bit_string_get_words (bit_string);
+                size_t number_of_words = itty_bit_string_get_number_of_words (bit_string);
+                memcpy (((char *) mapped_data) + offset, words, number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
+                offset += number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES;
+                position += best_len;
         }
 
-        itty_bit_string_map_file_resize (output_map_file, offset);
+        if (!itty_bit_string_map_file_resize (output_map_file, offset)) {
+                itty_bit_string_map_file_free (output_map_file);
+                return false;
+        }
         itty_bit_string_map_file_free (output_map_file);
 
         return true;
 }
-
