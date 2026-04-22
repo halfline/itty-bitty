@@ -2,6 +2,8 @@
 #include "itty-bit-string.h"
 #include "itty-bit-string-list.h"
 #include "itty-bit-string-map.h"
+#include "itty-inference.h"
+#include "itty-manager.h"
 #include "itty-network.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,16 +21,36 @@ generate_context (const char *vocabulary_text_file,
         }
 
         char *input_text = NULL;
+        size_t input_text_size = 0;
+        char *line = NULL;
         size_t len = 0;
         ssize_t read;
-        size_t input_text_size = 0;
 
-        while ((read = getline (&input_text, &len, stdin)) != -1) {
+        while ((read = getline (&line, &len, stdin)) != -1) {
+                char *new_input_text = realloc (input_text, input_text_size + read + 1);
+                if (!new_input_text) {
+                        fprintf (stderr, "Failed to read input text\n");
+                        free (line);
+                        free (input_text);
+                        itty_vocabulary_free (vocabulary);
+                        exit (EXIT_FAILURE);
+                }
+                input_text = new_input_text;
+                memcpy (input_text + input_text_size, line, read);
                 input_text_size += read;
+                input_text[input_text_size] = '\0';
         }
+        free (line);
 
-        if (input_text) {
+        if (input_text_size > 0 && input_text[input_text_size - 1] == '\n') {
                 input_text[input_text_size - 1] = '\0';
+        } else if (!input_text) {
+                input_text = strdup ("");
+                if (!input_text) {
+                        fprintf (stderr, "Failed to read input text\n");
+                        itty_vocabulary_free (vocabulary);
+                        exit (EXIT_FAILURE);
+                }
         }
 
         if (!itty_vocabulary_write_to_file (vocabulary, input_text, context_output_file)) {
@@ -85,6 +107,11 @@ run_inference (const char *vocabulary_text_file,
         }
 
         itty_network_t *network = itty_network_new ();
+        itty_manager_t *manager = itty_manager_new ();
+        if (!manager) {
+                fprintf (stderr, "Failed to create work manager\n");
+                exit (EXIT_FAILURE);
+        }
 
         for (size_t i = 0; i < number_of_layers; i++) {
                 itty_bit_string_list_t *bit_string_list;
@@ -104,7 +131,7 @@ run_inference (const char *vocabulary_text_file,
                                 itty_bit_string_list_append (bit_string_list, bit_string);
                         }
 
-                        itty_network_node_t *node = itty_network_node_new (bit_string_list);
+                        itty_network_node_t *node = itty_network_feed_node_new (bit_string_list);
                         itty_network_layer_append (layer, node);
                         number_of_nodes++;
                 }
@@ -112,11 +139,21 @@ run_inference (const char *vocabulary_text_file,
                 itty_network_append (network, layer);
         }
 
-        size_t index;
-        itty_bit_string_list_t *output_list = itty_network_feed (network, input_list);
-        itty_bit_string_list_popcount_argmax (output_list, itty_bit_string_list_get_max_number_of_words (output_list), &index);
+        itty_inference_result_t *result = itty_inference_run (network,
+                                                              input_list,
+                                                              vocabulary,
+                                                              manager);
+        if (!result) {
+                fprintf (stderr, "Failed to run inference\n");
+                exit (EXIT_FAILURE);
+        }
+
+        printf ("Output: %s\n", itty_inference_result_get_text (result));
+        printf ("Output distance: %zu\n", itty_inference_result_get_distance (result));
 
         printf ("Output bit strings:\n");
+        size_t index = itty_inference_result_get_selected_index (result);
+        itty_bit_string_list_t *output_list = itty_inference_result_get_outputs (result);
         itty_bit_string_list_iterator_t iterator;
         itty_bit_string_list_iterator_init (output_list, &iterator);
         itty_bit_string_t *current_bit_string;
@@ -132,11 +169,12 @@ run_inference (const char *vocabulary_text_file,
                 i++;
         }
 
-        itty_bit_string_list_free (output_list);
+        itty_inference_result_free (result);
         itty_bit_string_list_free (input_list);
         itty_bit_string_map_file_free (model_map_file);
         itty_bit_string_map_file_free (context_map_file);
         itty_network_free (network);
+        itty_manager_free (manager);
         itty_vocabulary_free (vocabulary);
 }
 
@@ -166,4 +204,3 @@ main (int    argc,
         fprintf (stderr, "Usage: %s <vocabulary_text_file> <vocabulary_bit_string_file> <context_output_file> | <vocabulary_text_file> <vocabulary_bit_string_file> <inference_model_file> <context_file> <number_of_layers> <nodes_per_layer>\n", argv[0]);
         return EXIT_FAILURE;
 }
-
