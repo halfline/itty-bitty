@@ -18397,6 +18397,108 @@ run_gray_payload_probe_a_only_combined_bundle_final_suite (void)
         return 0;
 }
 
+static int
+run_gray_payload_probe_d_only_combined_bundle_final_suite (void)
+{
+        itty_bit_string_list_t *input_d = create_input_with_count (1, ~create_mixed_word ());
+        itty_bit_string_t *target_d = create_bit_string (~create_half_populated_word ());
+        itty_feed_model_t *model = itty_feed_model_new (2, 8, 1, 1);
+        itty_feed_model_train_options_t options = {
+                .max_flips = 8,
+                .budget_policy = ITTY_FEED_MODEL_TRAIN_BUDGET_POLICY_LARGEST_ERROR_FIRST,
+                .backward_fold = ITTY_FEED_MODEL_BACKWARD_FOLD_SEGMENT_CONDENSE,
+                .backward_node_target = ITTY_FEED_MODEL_BACKWARD_NODE_TARGET_SAME,
+        };
+        itty_feed_model_decoder_objective_t before_d = { 0 };
+        itty_feed_model_decoder_objective_t after_d = { 0 };
+        size_t route_d = 1;
+        size_t accepted_steps = 0;
+        size_t accepted_penultimate_bundles = 0;
+        size_t accepted_final_singles = 0;
+        size_t current_offset = 0;
+        itty_feed_model_decoder_objective_t current = { 0 };
+        itty_feed_model_mask_flip_trace_t bundle_traces[8] = { 0 };
+        size_t bundle_trace_count = 0;
+        bool found_bundle = false;
+        itty_feed_model_decoder_objective_t best_bundle = { 0 };
+
+        itty_feed_model_set_decoder (model, ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                    input_d,
+                                                                    target_d,
+                                                                    route_d,
+                                                                    &before_d));
+        assert (train_gray_owner_with_offset_search (model,
+                                                     input_d,
+                                                     target_d,
+                                                     route_d,
+                                                     &options,
+                                                     16,
+                                                     2,
+                                                     &accepted_final_singles,
+                                                     &current));
+        accepted_steps = accepted_final_singles;
+
+        assert (find_best_gray_offset_for_route (model,
+                                                 input_d,
+                                                 target_d,
+                                                 route_d,
+                                                 &current_offset,
+                                                 &current));
+        itty_feed_model_set_gray_offset_override (model, route_d, true, current_offset);
+
+        while (accepted_steps < 256 && current.selected_distance > 0) {
+                assert (itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (model,
+                                                                                           input_d,
+                                                                                           target_d,
+                                                                                           route_d,
+                                                                                           5,
+                                                                                           8,
+                                                                                           &found_bundle,
+                                                                                           bundle_traces,
+                                                                                           8,
+                                                                                           &bundle_trace_count,
+                                                                                           &best_bundle));
+                if (!found_bundle ||
+                    !route_objective_improves_on_committed (&best_bundle, &current))
+                        break;
+
+                for (size_t trace_index = 0; trace_index < bundle_trace_count; trace_index++)
+                        assert (itty_feed_model_apply_penultimate_layer_mask_flip_trace (model,
+                                                                                         &bundle_traces[trace_index]));
+
+                current = best_bundle;
+                accepted_penultimate_bundles++;
+                accepted_steps++;
+        }
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                    input_d,
+                                                                    target_d,
+                                                                    route_d,
+                                                                    &after_d));
+
+        printf ("---gray_probe_d_only_combined_before %zu/%zu/%zu\n",
+                before_d.selected_distance,
+                before_d.false_negative_vote_deficit,
+                before_d.false_positive_vote_excess);
+        printf ("---gray_probe_d_only_combined_after %zu/%zu/%zu\n",
+                after_d.selected_distance,
+                after_d.false_negative_vote_deficit,
+                after_d.false_positive_vote_excess);
+        printf ("---gray_probe_d_only_combined_steps %zu\n", accepted_steps);
+        printf ("---gray_probe_d_only_combined_penultimate_bundles %zu\n", accepted_penultimate_bundles);
+        printf ("---gray_probe_d_only_combined_final_singles %zu\n", accepted_final_singles);
+
+        itty_feed_model_free (model);
+        itty_bit_string_free (target_d);
+        itty_bit_string_list_free (input_d);
+
+        printf ("Focused gray payload D-only combined probe passed.\n");
+        return 0;
+}
+
 int
 main (int   argc,
       char *argv[])
@@ -18475,6 +18577,8 @@ main (int   argc,
                 return run_gray_payload_probe_c_only_combined_bundle_final_suite ();
         if (argc > 1 && strcmp (argv[1], "--focus-gray-payload-probe-a-only-combined") == 0)
                 return run_gray_payload_probe_a_only_combined_bundle_final_suite ();
+        if (argc > 1 && strcmp (argv[1], "--focus-gray-payload-probe-d-only-combined") == 0)
+                return run_gray_payload_probe_d_only_combined_bundle_final_suite ();
 
         test_itty_feed_model_train_one_learns_single_mask ();
         test_itty_feed_model_train_one_with_budget_moves_toward_target ();
