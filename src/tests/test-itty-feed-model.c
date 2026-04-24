@@ -475,6 +475,10 @@ train_gray_owner_with_offset_search (itty_feed_model_t                     *mode
                         return false;
 
                 accepted_total += accepted_phase;
+                for (size_t accepted_index = 0; accepted_index < accepted_phase; accepted_index++) {
+                        fputc ('.', stdout);
+                        fflush (stdout);
+                }
                 current = converged;
 
                 if (!find_best_gray_offset_for_route (model,
@@ -497,6 +501,88 @@ train_gray_owner_with_offset_search (itty_feed_model_t                     *mode
 
         if (accepted_passes)
                 *accepted_passes = accepted_total;
+        if (final_objective)
+                *final_objective = current;
+        return true;
+}
+
+static bool
+train_gray_owner_with_pinned_penultimate_bundles (itty_feed_model_t                     *model,
+                                                  itty_bit_string_list_t                *input,
+                                                  itty_bit_string_t                     *target,
+                                                  size_t                                 route,
+                                                  itty_feed_model_train_options_t const *options,
+                                                  size_t                                 max_passes_per_phase,
+                                                  size_t                                 max_retunes,
+                                                  size_t                                 max_bundle_steps,
+                                                  size_t                                *accepted_final_singles,
+                                                  size_t                                *accepted_penultimate_bundles,
+                                                  itty_feed_model_decoder_objective_t   *final_objective)
+{
+        size_t current_offset = 0;
+        size_t final_count = 0;
+        size_t bundle_count = 0;
+        itty_feed_model_decoder_objective_t current = { 0 };
+        itty_feed_model_mask_flip_trace_t bundle_traces[8] = { 0 };
+        size_t bundle_trace_count = 0;
+        bool found_bundle = false;
+        itty_feed_model_decoder_objective_t best_bundle = { 0 };
+
+        if (!train_gray_owner_with_offset_search (model,
+                                                  input,
+                                                  target,
+                                                  route,
+                                                  options,
+                                                  max_passes_per_phase,
+                                                  max_retunes,
+                                                  &final_count,
+                                                  &current))
+                return false;
+
+        if (!find_best_gray_offset_for_route (model,
+                                              input,
+                                              target,
+                                              route,
+                                              &current_offset,
+                                              &current))
+                return false;
+
+        itty_feed_model_set_gray_offset_override (model, route, true, current_offset);
+
+        while (bundle_count < max_bundle_steps && current.selected_distance > 0) {
+                if (!itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (model,
+                                                                                        input,
+                                                                                        target,
+                                                                                        route,
+                                                                                        5,
+                                                                                        8,
+                                                                                        &found_bundle,
+                                                                                        bundle_traces,
+                                                                                        8,
+                                                                                        &bundle_trace_count,
+                                                                                        &best_bundle))
+                        return false;
+
+                if (!found_bundle ||
+                    !route_objective_improves_on_committed (&best_bundle, &current))
+                        break;
+
+                for (size_t trace_index = 0; trace_index < bundle_trace_count; trace_index++) {
+                        if (!itty_feed_model_apply_penultimate_layer_mask_flip_trace (model,
+                                                                                      &bundle_traces[trace_index]))
+                                return false;
+                }
+
+                current = best_bundle;
+                bundle_count++;
+                fputc ('.', stdout);
+                fflush (stdout);
+        }
+
+        if (accepted_final_singles)
+                *accepted_final_singles = final_count;
+        if (accepted_penultimate_bundles)
+                *accepted_penultimate_bundles = bundle_count;
         if (final_objective)
                 *final_objective = current;
         return true;
@@ -18123,49 +18209,18 @@ run_gray_payload_probe_b_only_combined_bundle_final_suite (void)
                                                                     target_b,
                                                                     route_b,
                                                                     &before_b));
-        assert (train_gray_owner_with_offset_search (model,
-                                                     input_b,
-                                                     target_b,
-                                                     route_b,
-                                                     &options,
-                                                     16,
-                                                     2,
-                                                     &accepted_final_singles,
-                                                     &current));
-        accepted_steps = accepted_final_singles;
-
-        assert (find_best_gray_offset_for_route (model,
-                                                 input_b,
-                                                 target_b,
-                                                 route_b,
-                                                 &current_offset,
-                                                 &current));
-        itty_feed_model_set_gray_offset_override (model, route_b, true, current_offset);
-
-        while (accepted_steps < 256 && current.selected_distance > 0) {
-                assert (itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (model,
-                                                                                           input_b,
-                                                                                           target_b,
-                                                                                           route_b,
-                                                                                           5,
-                                                                                           8,
-                                                                                           &found_bundle,
-                                                                                           bundle_traces,
-                                                                                           8,
-                                                                                           &bundle_trace_count,
-                                                                                           &best_bundle));
-                if (!found_bundle ||
-                    !route_objective_improves_on_committed (&best_bundle, &current))
-                        break;
-
-                for (size_t trace_index = 0; trace_index < bundle_trace_count; trace_index++)
-                        assert (itty_feed_model_apply_penultimate_layer_mask_flip_trace (model,
-                                                                                         &bundle_traces[trace_index]));
-
-                current = best_bundle;
-                accepted_penultimate_bundles++;
-                accepted_steps++;
-        }
+        assert (train_gray_owner_with_pinned_penultimate_bundles (model,
+                                                                  input_b,
+                                                                  target_b,
+                                                                  route_b,
+                                                                  &options,
+                                                                  16,
+                                                                  2,
+                                                                  256,
+                                                                  &accepted_final_singles,
+                                                                  &accepted_penultimate_bundles,
+                                                                  &current));
+        accepted_steps = accepted_final_singles + accepted_penultimate_bundles;
 
         assert (itty_feed_model_measure_decoder_objective_for_node (model,
                                                                     input_b,
@@ -18211,12 +18266,7 @@ run_gray_payload_probe_c_only_combined_bundle_final_suite (void)
         size_t accepted_steps = 0;
         size_t accepted_penultimate_bundles = 0;
         size_t accepted_final_singles = 0;
-        size_t current_offset = 0;
         itty_feed_model_decoder_objective_t current = { 0 };
-        itty_feed_model_mask_flip_trace_t bundle_traces[8] = { 0 };
-        size_t bundle_trace_count = 0;
-        bool found_bundle = false;
-        itty_feed_model_decoder_objective_t best_bundle = { 0 };
 
         itty_feed_model_set_decoder (model, ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
 
@@ -18225,49 +18275,18 @@ run_gray_payload_probe_c_only_combined_bundle_final_suite (void)
                                                                     target_c,
                                                                     route_c,
                                                                     &before_c));
-        assert (train_gray_owner_with_offset_search (model,
-                                                     input_c,
-                                                     target_c,
-                                                     route_c,
-                                                     &options,
-                                                     16,
-                                                     2,
-                                                     &accepted_final_singles,
-                                                     &current));
-        accepted_steps = accepted_final_singles;
-
-        assert (find_best_gray_offset_for_route (model,
-                                                 input_c,
-                                                 target_c,
-                                                 route_c,
-                                                 &current_offset,
-                                                 &current));
-        itty_feed_model_set_gray_offset_override (model, route_c, true, current_offset);
-
-        while (accepted_steps < 256 && current.selected_distance > 0) {
-                assert (itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (model,
-                                                                                           input_c,
-                                                                                           target_c,
-                                                                                           route_c,
-                                                                                           5,
-                                                                                           8,
-                                                                                           &found_bundle,
-                                                                                           bundle_traces,
-                                                                                           8,
-                                                                                           &bundle_trace_count,
-                                                                                           &best_bundle));
-                if (!found_bundle ||
-                    !route_objective_improves_on_committed (&best_bundle, &current))
-                        break;
-
-                for (size_t trace_index = 0; trace_index < bundle_trace_count; trace_index++)
-                        assert (itty_feed_model_apply_penultimate_layer_mask_flip_trace (model,
-                                                                                         &bundle_traces[trace_index]));
-
-                current = best_bundle;
-                accepted_penultimate_bundles++;
-                accepted_steps++;
-        }
+        assert (train_gray_owner_with_pinned_penultimate_bundles (model,
+                                                                  input_c,
+                                                                  target_c,
+                                                                  route_c,
+                                                                  &options,
+                                                                  16,
+                                                                  2,
+                                                                  256,
+                                                                  &accepted_final_singles,
+                                                                  &accepted_penultimate_bundles,
+                                                                  &current));
+        accepted_steps = accepted_final_singles + accepted_penultimate_bundles;
 
         assert (itty_feed_model_measure_decoder_objective_for_node (model,
                                                                     input_c,
@@ -18313,12 +18332,7 @@ run_gray_payload_probe_a_only_combined_bundle_final_suite (void)
         size_t accepted_steps = 0;
         size_t accepted_penultimate_bundles = 0;
         size_t accepted_final_singles = 0;
-        size_t current_offset = 0;
         itty_feed_model_decoder_objective_t current = { 0 };
-        itty_feed_model_mask_flip_trace_t bundle_traces[8] = { 0 };
-        size_t bundle_trace_count = 0;
-        bool found_bundle = false;
-        itty_feed_model_decoder_objective_t best_bundle = { 0 };
 
         itty_feed_model_set_decoder (model, ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
 
@@ -18327,49 +18341,18 @@ run_gray_payload_probe_a_only_combined_bundle_final_suite (void)
                                                                     target_a,
                                                                     route_a,
                                                                     &before_a));
-        assert (train_gray_owner_with_offset_search (model,
-                                                     input_a,
-                                                     target_a,
-                                                     route_a,
-                                                     &options,
-                                                     16,
-                                                     2,
-                                                     &accepted_final_singles,
-                                                     &current));
-        accepted_steps = accepted_final_singles;
-
-        assert (find_best_gray_offset_for_route (model,
-                                                 input_a,
-                                                 target_a,
-                                                 route_a,
-                                                 &current_offset,
-                                                 &current));
-        itty_feed_model_set_gray_offset_override (model, route_a, true, current_offset);
-
-        while (accepted_steps < 256 && current.selected_distance > 0) {
-                assert (itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (model,
-                                                                                           input_a,
-                                                                                           target_a,
-                                                                                           route_a,
-                                                                                           5,
-                                                                                           8,
-                                                                                           &found_bundle,
-                                                                                           bundle_traces,
-                                                                                           8,
-                                                                                           &bundle_trace_count,
-                                                                                           &best_bundle));
-                if (!found_bundle ||
-                    !route_objective_improves_on_committed (&best_bundle, &current))
-                        break;
-
-                for (size_t trace_index = 0; trace_index < bundle_trace_count; trace_index++)
-                        assert (itty_feed_model_apply_penultimate_layer_mask_flip_trace (model,
-                                                                                         &bundle_traces[trace_index]));
-
-                current = best_bundle;
-                accepted_penultimate_bundles++;
-                accepted_steps++;
-        }
+        assert (train_gray_owner_with_pinned_penultimate_bundles (model,
+                                                                  input_a,
+                                                                  target_a,
+                                                                  route_a,
+                                                                  &options,
+                                                                  16,
+                                                                  2,
+                                                                  256,
+                                                                  &accepted_final_singles,
+                                                                  &accepted_penultimate_bundles,
+                                                                  &current));
+        accepted_steps = accepted_final_singles + accepted_penultimate_bundles;
 
         assert (itty_feed_model_measure_decoder_objective_for_node (model,
                                                                     input_a,
@@ -18415,12 +18398,7 @@ run_gray_payload_probe_d_only_combined_bundle_final_suite (void)
         size_t accepted_steps = 0;
         size_t accepted_penultimate_bundles = 0;
         size_t accepted_final_singles = 0;
-        size_t current_offset = 0;
         itty_feed_model_decoder_objective_t current = { 0 };
-        itty_feed_model_mask_flip_trace_t bundle_traces[8] = { 0 };
-        size_t bundle_trace_count = 0;
-        bool found_bundle = false;
-        itty_feed_model_decoder_objective_t best_bundle = { 0 };
 
         itty_feed_model_set_decoder (model, ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
 
@@ -18429,49 +18407,18 @@ run_gray_payload_probe_d_only_combined_bundle_final_suite (void)
                                                                     target_d,
                                                                     route_d,
                                                                     &before_d));
-        assert (train_gray_owner_with_offset_search (model,
-                                                     input_d,
-                                                     target_d,
-                                                     route_d,
-                                                     &options,
-                                                     16,
-                                                     2,
-                                                     &accepted_final_singles,
-                                                     &current));
-        accepted_steps = accepted_final_singles;
-
-        assert (find_best_gray_offset_for_route (model,
-                                                 input_d,
-                                                 target_d,
-                                                 route_d,
-                                                 &current_offset,
-                                                 &current));
-        itty_feed_model_set_gray_offset_override (model, route_d, true, current_offset);
-
-        while (accepted_steps < 256 && current.selected_distance > 0) {
-                assert (itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (model,
-                                                                                           input_d,
-                                                                                           target_d,
-                                                                                           route_d,
-                                                                                           5,
-                                                                                           8,
-                                                                                           &found_bundle,
-                                                                                           bundle_traces,
-                                                                                           8,
-                                                                                           &bundle_trace_count,
-                                                                                           &best_bundle));
-                if (!found_bundle ||
-                    !route_objective_improves_on_committed (&best_bundle, &current))
-                        break;
-
-                for (size_t trace_index = 0; trace_index < bundle_trace_count; trace_index++)
-                        assert (itty_feed_model_apply_penultimate_layer_mask_flip_trace (model,
-                                                                                         &bundle_traces[trace_index]));
-
-                current = best_bundle;
-                accepted_penultimate_bundles++;
-                accepted_steps++;
-        }
+        assert (train_gray_owner_with_pinned_penultimate_bundles (model,
+                                                                  input_d,
+                                                                  target_d,
+                                                                  route_d,
+                                                                  &options,
+                                                                  16,
+                                                                  2,
+                                                                  256,
+                                                                  &accepted_final_singles,
+                                                                  &accepted_penultimate_bundles,
+                                                                  &current));
+        accepted_steps = accepted_final_singles + accepted_penultimate_bundles;
 
         assert (itty_feed_model_measure_decoder_objective_for_node (model,
                                                                     input_d,
@@ -18496,6 +18443,117 @@ run_gray_payload_probe_d_only_combined_bundle_final_suite (void)
         itty_bit_string_list_free (input_d);
 
         printf ("Focused gray payload D-only combined probe passed.\n");
+        return 0;
+}
+
+static int
+run_gray_payload_probe_multi_owner_combined_suite (void)
+{
+        itty_bit_string_list_t *input_a = create_input_with_count (1, 0);
+        itty_bit_string_list_t *input_b = create_input_with_count (1, 1);
+        itty_bit_string_list_t *input_c = create_input_with_count (1, create_half_populated_word ());
+        itty_bit_string_list_t *input_d = create_input_with_count (1, ~create_mixed_word ());
+        itty_bit_string_t *target_a = create_bit_string ((size_t) 1 << 3);
+        itty_bit_string_t *target_b = create_bit_string (create_half_populated_word ());
+        itty_bit_string_t *target_c = create_bit_string (create_half_populated_word () ^ ((size_t) 1 << 5));
+        itty_bit_string_t *target_d = create_bit_string (~create_half_populated_word ());
+        itty_feed_model_t *model = itty_feed_model_new (2, 8, 1, 1);
+        itty_feed_model_train_options_t options = {
+                .max_flips = 8,
+                .budget_policy = ITTY_FEED_MODEL_TRAIN_BUDGET_POLICY_LARGEST_ERROR_FIRST,
+                .backward_fold = ITTY_FEED_MODEL_BACKWARD_FOLD_SEGMENT_CONDENSE,
+                .backward_node_target = ITTY_FEED_MODEL_BACKWARD_NODE_TARGET_SAME,
+        };
+        itty_bit_string_list_t *inputs[4] = { input_a, input_b, input_c, input_d };
+        itty_bit_string_t *targets[4] = { target_a, target_b, target_c, target_d };
+        size_t routes[4] = { 2, 0, 5, 1 };
+        size_t training_order[4] = { 0, 1, 2, 3 };
+        itty_feed_model_decoder_objective_t before[4] = { 0 };
+        itty_feed_model_decoder_objective_t after[4] = { 0 };
+        size_t final_singles[4] = { 0 };
+        size_t penultimate_bundles[4] = { 0 };
+
+        itty_feed_model_set_decoder (model, ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
+
+        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                            inputs[owner_index],
+                                                                            targets[owner_index],
+                                                                            routes[owner_index],
+                                                                            &before[owner_index]));
+        }
+
+        for (size_t order_index = 0; order_index < 4; order_index++) {
+                size_t owner_index = training_order[order_index];
+                assert (train_gray_owner_with_pinned_penultimate_bundles (model,
+                                                                          inputs[owner_index],
+                                                                          targets[owner_index],
+                                                                          routes[owner_index],
+                                                                          &options,
+                                                                          16,
+                                                                          2,
+                                                                          256,
+                                                                          &final_singles[owner_index],
+                                                                          &penultimate_bundles[owner_index],
+                                                                          NULL));
+        }
+
+        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                            inputs[owner_index],
+                                                                            targets[owner_index],
+                                                                            routes[owner_index],
+                                                                            &after[owner_index]));
+        }
+
+        printf ("---gray_probe_multi_before_A %zu/%zu/%zu\n",
+                before[0].selected_distance,
+                before[0].false_negative_vote_deficit,
+                before[0].false_positive_vote_excess);
+        printf ("---gray_probe_multi_before_B %zu/%zu/%zu\n",
+                before[1].selected_distance,
+                before[1].false_negative_vote_deficit,
+                before[1].false_positive_vote_excess);
+        printf ("---gray_probe_multi_before_C %zu/%zu/%zu\n",
+                before[2].selected_distance,
+                before[2].false_negative_vote_deficit,
+                before[2].false_positive_vote_excess);
+        printf ("---gray_probe_multi_before_D %zu/%zu/%zu\n",
+                before[3].selected_distance,
+                before[3].false_negative_vote_deficit,
+                before[3].false_positive_vote_excess);
+        printf ("---gray_probe_multi_after_A %zu/%zu/%zu\n",
+                after[0].selected_distance,
+                after[0].false_negative_vote_deficit,
+                after[0].false_positive_vote_excess);
+        printf ("---gray_probe_multi_after_B %zu/%zu/%zu\n",
+                after[1].selected_distance,
+                after[1].false_negative_vote_deficit,
+                after[1].false_positive_vote_excess);
+        printf ("---gray_probe_multi_after_C %zu/%zu/%zu\n",
+                after[2].selected_distance,
+                after[2].false_negative_vote_deficit,
+                after[2].false_positive_vote_excess);
+        printf ("---gray_probe_multi_after_D %zu/%zu/%zu\n",
+                after[3].selected_distance,
+                after[3].false_negative_vote_deficit,
+                after[3].false_positive_vote_excess);
+        printf ("---gray_probe_multi_final_singles A=%zu B=%zu C=%zu D=%zu\n",
+                final_singles[0], final_singles[1], final_singles[2], final_singles[3]);
+        printf ("---gray_probe_multi_penultimate_bundles A=%zu B=%zu C=%zu D=%zu\n",
+                penultimate_bundles[0], penultimate_bundles[1], penultimate_bundles[2], penultimate_bundles[3]);
+
+        itty_feed_model_free (model);
+        itty_bit_string_free (target_a);
+        itty_bit_string_free (target_b);
+        itty_bit_string_free (target_c);
+        itty_bit_string_free (target_d);
+        itty_bit_string_list_free (input_a);
+        itty_bit_string_list_free (input_b);
+        itty_bit_string_list_free (input_c);
+        itty_bit_string_list_free (input_d);
+
+        printf ("Focused gray payload multi-owner combined probe passed.\n");
         return 0;
 }
 
@@ -18579,6 +18637,8 @@ main (int   argc,
                 return run_gray_payload_probe_a_only_combined_bundle_final_suite ();
         if (argc > 1 && strcmp (argv[1], "--focus-gray-payload-probe-d-only-combined") == 0)
                 return run_gray_payload_probe_d_only_combined_bundle_final_suite ();
+        if (argc > 1 && strcmp (argv[1], "--focus-gray-payload-probe-multi-owner-combined") == 0)
+                return run_gray_payload_probe_multi_owner_combined_suite ();
 
         test_itty_feed_model_train_one_learns_single_mask ();
         test_itty_feed_model_train_one_with_budget_moves_toward_target ();
