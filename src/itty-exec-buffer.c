@@ -193,7 +193,6 @@ invalidate_slice_cache (itty_exec_buffer_t       *exec_buffer,
                 return;
 
         descriptor->bit_string->pop_count_computed = false;
-        descriptor->bit_string->bit_length_computed = false;
 }
 
 static size_t

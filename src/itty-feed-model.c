@@ -4,6 +4,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <stdint.h>
 
 typedef struct {
         size_t bit_index;
@@ -96,13 +97,6 @@ typedef struct {
         size_t                                capacity;
 } itty_feed_model_replay_taboo_map_t;
 
-typedef struct {
-        size_t node_index;
-        size_t input_index;
-        size_t bit_index;
-        bool   value_after;
-} itty_feed_model_mask_flip_trace_t;
-
 static size_t itty_feed_model_count_selected_segment_votes (itty_bit_string_list_t *outputs,
                                                             size_t                  selected_node,
                                                             size_t                  decoded_bit,
@@ -155,6 +149,9 @@ static size_t itty_feed_model_count_mask_flip_trace_overlap (itty_feed_model_mas
                                                              itty_feed_model_mask_flip_trace_t const *b_traces,
                                                              size_t                                   b_count,
                                                              bool                                     require_same_direction);
+static void itty_feed_model_set_mask_trace_value (itty_feed_model_t const                 *model,
+                                                  itty_bit_string_list_t                  *masks,
+                                                  itty_feed_model_mask_flip_trace_t const *trace);
 
 typedef enum {
         ITTY_FEED_MODEL_PROJECTED_REPAIR_STRICT_DISTANCE,
@@ -211,18 +208,27 @@ typedef struct {
 
 struct itty_feed_model_t {
         itty_bit_string_list_t ***masks_by_layer_node;
+        itty_bit_string_list_t  **input_route_adapters;
         itty_bit_string_t      ***residual_enable_by_layer_node;
         itty_bit_string_t      ***residual_mask_by_layer_node;
         size_t                    number_of_layers;
         size_t                    nodes_per_layer;
         size_t                    inputs_per_node;
         size_t                    vocabulary_words;
+        size_t                    within_node_condense_threshold_override;
+        bool                      residual_merge_enabled;
+        bool                      input_route_adapter_enabled;
+        bool                     *gray_offset_override_enabled_by_route;
+        size_t                   *gray_offset_override_payload_start_by_route;
         size_t                   *rotations_by_layer;
         itty_feed_model_decoder_t decoder;
 };
 
 static itty_bit_string_t *itty_feed_model_run_node_condensed (itty_bit_string_list_t *input,
                                                               itty_bit_string_list_t *masks);
+static itty_bit_string_t *itty_feed_model_run_node_condensed_with_threshold (itty_bit_string_list_t *input,
+                                                                             itty_bit_string_list_t *masks,
+                                                                             size_t                  threshold_override);
 static itty_bit_string_t *itty_feed_model_expand_condensed_output (itty_bit_string_t *condensed_output,
                                                                    size_t             rotation);
 static bool itty_feed_model_count_segment_votes_for_layer (itty_feed_model_t  *model,
@@ -253,6 +259,10 @@ static bool itty_feed_model_evaluate_decoder_objective (itty_feed_model_t       
                                                         itty_bit_string_list_t              *outputs,
                                                         itty_bit_string_t                   *target,
                                                         itty_feed_model_decoder_objective_t *objective);
+static itty_bit_string_list_t *itty_feed_model_run_outputs (itty_feed_model_t      *model,
+                                                            itty_bit_string_list_t *input);
+static bool itty_feed_model_decoder_objective_is_better (itty_feed_model_decoder_objective_t const *candidate,
+                                                         itty_feed_model_decoder_objective_t const *baseline);
 static bool itty_feed_model_evaluate_suffix_decoder_objective (itty_feed_model_t                   *model,
                                                                itty_bit_string_list_t              *layer_outputs,
                                                                size_t                               layer_index,
@@ -290,6 +300,20 @@ static bool itty_feed_model_output_transform_swaps_bit (itty_feed_model_output_t
                                                         size_t                             bit_capacity);
 static void itty_feed_model_apply_output_transform (itty_bit_string_list_t            *outputs,
                                                     itty_feed_model_output_transform_t transform);
+static bool itty_feed_model_decoder_uses_segment_style (itty_feed_model_decoder_t decoder);
+static bool itty_feed_model_decoder_uses_direct_duplicated_target (itty_feed_model_decoder_t decoder);
+static size_t itty_feed_model_margin_preserving_vote_for_bit_string (itty_bit_string_t *bit_string);
+static bool itty_feed_model_fold_activation_with_segment_weighted_condense (itty_bit_string_t  *activation,
+                                                                            itty_bit_string_t  *target,
+                                                                            itty_bit_string_t **folded_activation);
+static itty_bit_string_list_t *itty_feed_model_apply_input_route_adapter (itty_feed_model_t      *model,
+                                                                          itty_bit_string_list_t *input,
+                                                                          size_t                  route_index);
+static bool itty_feed_model_decoder_uses_segment_style (itty_feed_model_decoder_t decoder);
+static size_t itty_feed_model_margin_preserving_vote_for_bit_string (itty_bit_string_t *bit_string);
+static bool itty_feed_model_fold_activation_with_segment_weighted_condense (itty_bit_string_t  *activation,
+                                                                            itty_bit_string_t  *target,
+                                                                            itty_bit_string_t **folded_activation);
 
 static int
 compare_training_candidates_descending (const void *a,
@@ -307,6 +331,280 @@ compare_training_candidates_descending (const void *a,
         if (candidate_a->bit_index > candidate_b->bit_index)
                 return 1;
         return 0;
+}
+
+static bool
+itty_feed_model_decoder_uses_segment_style (itty_feed_model_decoder_t decoder)
+{
+        return decoder == ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE ||
+               decoder == ITTY_FEED_MODEL_DECODER_SEGMENT_WEIGHTED_CONDENSE;
+}
+
+static bool
+itty_feed_model_decoder_uses_direct_duplicated_target (itty_feed_model_decoder_t decoder)
+{
+        return decoder == ITTY_FEED_MODEL_DECODER_DIRECT_DUPLICATED_TARGET;
+}
+
+static bool
+itty_feed_model_decoder_uses_direct_padded_target (itty_feed_model_decoder_t decoder)
+{
+        return decoder == ITTY_FEED_MODEL_DECODER_DIRECT_PADDED_TARGET;
+}
+
+static bool
+itty_feed_model_decoder_uses_direct_gray_offset_target (itty_feed_model_decoder_t decoder)
+{
+        return decoder == ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET;
+}
+
+static bool
+itty_feed_model_decoder_uses_direct_activation_target (itty_feed_model_decoder_t decoder)
+{
+        return itty_feed_model_decoder_uses_direct_duplicated_target (decoder) ||
+               itty_feed_model_decoder_uses_direct_padded_target (decoder) ||
+               itty_feed_model_decoder_uses_direct_gray_offset_target (decoder);
+}
+
+static size_t
+itty_feed_model_gray_code (size_t value)
+{
+        return value ^ (value >> 1);
+}
+
+static size_t
+itty_feed_model_gray_offset_payload_start (size_t activation_bit_capacity,
+                                           size_t payload_bit_capacity,
+                                           size_t selected_index)
+{
+        size_t prefix_bits = 8;
+        size_t min_start = prefix_bits;
+        size_t max_start;
+
+        if (activation_bit_capacity <= payload_bit_capacity ||
+            activation_bit_capacity <= prefix_bits)
+                return 0;
+
+        max_start = activation_bit_capacity - payload_bit_capacity;
+        if (max_start <= min_start)
+                return min_start;
+
+        return min_start + ((selected_index * (max_start - min_start)) / 7);
+}
+
+static size_t
+itty_feed_model_gray_offset_distance_for_start (itty_bit_string_t *activation,
+                                                itty_bit_string_t *target,
+                                                size_t             payload_start)
+{
+        size_t activation_bit_capacity = itty_bit_string_get_bit_capacity (activation);
+        size_t payload_bit_capacity = itty_bit_string_get_bit_capacity (target);
+        size_t gray_offset = itty_feed_model_gray_code (payload_start & 0xff);
+        size_t distance = 0;
+
+        for (size_t bit_index = 0; bit_index < activation_bit_capacity; bit_index++) {
+                bool target_bit = false;
+
+                if (bit_index < 8) {
+                        target_bit = ((gray_offset >> bit_index) & 1U) != 0;
+                } else if (bit_index >= payload_start &&
+                           bit_index < payload_start + payload_bit_capacity) {
+                        target_bit = itty_bit_string_get_bit (target,
+                                                              bit_index - payload_start);
+                }
+
+                if (itty_bit_string_get_bit (activation, bit_index) != target_bit)
+                        distance++;
+        }
+
+        return distance;
+}
+
+static size_t
+itty_feed_model_find_best_gray_offset_payload_start (itty_bit_string_t *activation,
+                                                     itty_bit_string_t *target,
+                                                     size_t             selected_index)
+{
+        size_t activation_bit_capacity = itty_bit_string_get_bit_capacity (activation);
+        size_t payload_bit_capacity = itty_bit_string_get_bit_capacity (target);
+        size_t min_start = 8;
+        size_t max_start;
+        size_t best_start;
+        size_t best_distance;
+
+        if (activation_bit_capacity <= payload_bit_capacity ||
+            activation_bit_capacity <= min_start)
+                return 0;
+
+        max_start = activation_bit_capacity - payload_bit_capacity;
+        if (max_start <= min_start)
+                return min_start;
+
+        best_start = itty_feed_model_gray_offset_payload_start (activation_bit_capacity,
+                                                                payload_bit_capacity,
+                                                                selected_index);
+        best_distance = itty_feed_model_gray_offset_distance_for_start (activation,
+                                                                        target,
+                                                                        best_start);
+
+        for (size_t payload_start = min_start; payload_start <= max_start; payload_start++) {
+                size_t distance =
+                        itty_feed_model_gray_offset_distance_for_start (activation,
+                                                                        target,
+                                                                        payload_start);
+
+                if (distance < best_distance ||
+                    (distance == best_distance &&
+                     payload_start < best_start)) {
+                        best_start = payload_start;
+                        best_distance = distance;
+                }
+        }
+
+        return best_start;
+}
+
+static itty_bit_string_t *
+itty_feed_model_build_gray_offset_target (itty_bit_string_t *activation,
+                                          itty_bit_string_t *target,
+                                          size_t             selected_index,
+                                          bool               override_enabled,
+                                          size_t             override_payload_start)
+{
+        size_t activation_words = itty_bit_string_get_number_of_words (activation);
+        size_t activation_bit_capacity = itty_bit_string_get_bit_capacity (activation);
+        size_t payload_bit_capacity = itty_bit_string_get_bit_capacity (target);
+        size_t payload_start = override_enabled ?
+                               override_payload_start :
+                               itty_feed_model_find_best_gray_offset_payload_start (activation,
+                                                                                    target,
+                                                                                    selected_index);
+        size_t gray_offset = itty_feed_model_gray_code (payload_start & 0xff);
+        itty_bit_string_t *decoder_target =
+                itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+
+        if (!decoder_target)
+                return NULL;
+
+        for (size_t word_index = 0; word_index < activation_words; word_index++)
+                itty_bit_string_append_word (decoder_target, 0);
+
+        if (itty_bit_string_get_number_of_words (decoder_target) != activation_words) {
+                itty_bit_string_free (decoder_target);
+                return NULL;
+        }
+
+        for (size_t bit_index = 0; bit_index < activation_bit_capacity; bit_index++)
+                itty_bit_string_set_bit (decoder_target, bit_index, (bit_index % 2) != 0);
+
+        for (size_t bit_index = 0; bit_index < 8 && bit_index < activation_bit_capacity; bit_index++)
+                itty_bit_string_set_bit (decoder_target,
+                                         bit_index,
+                                         ((gray_offset >> bit_index) & 1U) != 0);
+
+        for (size_t bit_index = 0;
+             bit_index < payload_bit_capacity &&
+             payload_start + bit_index < activation_bit_capacity;
+             bit_index++) {
+                itty_bit_string_set_bit (decoder_target,
+                                         payload_start + bit_index,
+                                         itty_bit_string_get_bit (target, bit_index));
+        }
+
+        return decoder_target;
+}
+
+static size_t
+itty_feed_model_gray_offset_payload_start_for_activation (itty_feed_model_t *model,
+                                                          itty_bit_string_t *activation,
+                                                          itty_bit_string_t *target,
+                                                          size_t             selected_index)
+{
+        if (selected_index < model->nodes_per_layer &&
+            model->gray_offset_override_enabled_by_route &&
+            model->gray_offset_override_enabled_by_route[selected_index])
+                return model->gray_offset_override_payload_start_by_route[selected_index];
+
+        return itty_feed_model_find_best_gray_offset_payload_start (activation,
+                                                                    target,
+                                                                    selected_index);
+}
+
+static itty_bit_string_t *
+itty_feed_model_extract_gray_payload_window (itty_feed_model_t *model,
+                                             itty_bit_string_t *activation,
+                                             itty_bit_string_t *target,
+                                             size_t             selected_index)
+{
+        size_t payload_bit_capacity = itty_bit_string_get_bit_capacity (target);
+        size_t payload_words = itty_bit_string_get_number_of_words (target);
+        size_t payload_start =
+                itty_feed_model_gray_offset_payload_start_for_activation (model,
+                                                                          activation,
+                                                                          target,
+                                                                          selected_index);
+        itty_bit_string_t *window =
+                itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+
+        if (!window)
+                return NULL;
+
+        itty_bit_string_append_zeros (window, payload_words);
+
+        for (size_t bit_index = 0; bit_index < payload_bit_capacity; bit_index++) {
+                bool value = itty_bit_string_get_bit (activation, payload_start + bit_index);
+                itty_bit_string_set_bit (window, bit_index, value);
+        }
+
+        return window;
+}
+
+static size_t
+itty_feed_model_margin_preserving_vote_for_bit_string (itty_bit_string_t *bit_string)
+{
+        return itty_bit_string_get_pop_count (bit_string) + 1;
+}
+
+static itty_bit_string_t *
+itty_feed_model_condense_with_threshold (itty_bit_string_list_t *list,
+                                         size_t                  threshold)
+{
+        if (!list || list->count == 0)
+                return NULL;
+
+        size_t bit_length = itty_bit_string_list_get_bit_length (list);
+        size_t number_of_words = (bit_length + ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1) /
+                                 ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+        itty_bit_string_t *condensed_bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+
+        if (!condensed_bit_string)
+                return NULL;
+
+        condensed_bit_string->words = calloc (number_of_words, sizeof (size_t));
+        if (number_of_words > 0 && !condensed_bit_string->words) {
+                itty_bit_string_free (condensed_bit_string);
+                return NULL;
+        }
+        condensed_bit_string->number_of_words = number_of_words;
+
+        if (threshold == 0)
+                threshold = list->count / 2 + 1;
+        if (threshold > list->count)
+                threshold = list->count;
+
+        for (size_t bit_index = 0; bit_index < bit_length; bit_index++) {
+                size_t one_votes = 0;
+
+                for (size_t string_index = 0; string_index < list->count; string_index++) {
+                        if (itty_bit_string_get_bit (list->bit_strings[string_index], bit_index))
+                                one_votes++;
+                }
+
+                if (one_votes >= threshold)
+                        itty_bit_string_set_bit (condensed_bit_string, bit_index, true);
+        }
+
+        return condensed_bit_string;
 }
 
 static void
@@ -832,9 +1130,7 @@ itty_feed_model_bit_string_clone (itty_bit_string_t *bit_string)
                 memcpy (copy->words, bit_string->words, copy->number_of_words * ITTY_BIT_STRING_WORD_SIZE_IN_BYTES);
         }
         copy->pop_count = bit_string->pop_count;
-        copy->bit_length = bit_string->bit_length;
         copy->pop_count_computed = bit_string->pop_count_computed;
-        copy->bit_length_computed = bit_string->bit_length_computed;
         return copy;
 }
 
@@ -865,7 +1161,6 @@ itty_feed_model_bit_string_complement_clone (itty_bit_string_t *bit_string)
                 copy->words[word_index] = ~copy->words[word_index];
 
         copy->pop_count_computed = false;
-        copy->bit_length_computed = false;
         return copy;
 }
 
@@ -910,7 +1205,6 @@ itty_feed_model_flip_mask_bit (itty_bit_string_t *mask,
 {
         itty_bit_string_set_bit (mask, bit_index, !itty_bit_string_get_bit (mask, bit_index));
         mask->pop_count_computed = false;
-        mask->bit_length_computed = false;
 }
 
 static bool
@@ -964,9 +1258,7 @@ itty_feed_model_apply_output_transform (itty_bit_string_list_t            *outpu
                 }
 
                 left->pop_count_computed = false;
-                left->bit_length_computed = false;
                 right->pop_count_computed = false;
-                right->bit_length_computed = false;
         }
 }
 
@@ -979,7 +1271,6 @@ itty_feed_model_set_mutable_bit (itty_bit_string_t *bit_string,
                                  bit_index,
                                  value);
         bit_string->pop_count_computed = false;
-        bit_string->bit_length_computed = false;
 }
 
 static size_t
@@ -1015,22 +1306,85 @@ itty_feed_model_expand_target_for_layer (itty_bit_string_t *target,
 }
 
 static itty_bit_string_t *
+itty_feed_model_prepare_decoder_target_for_activation (itty_feed_model_t *model,
+                                                       itty_bit_string_t *activation,
+                                                       itty_bit_string_t *target,
+                                                       size_t             selected_index)
+{
+        if (!model || !activation || !target)
+                return NULL;
+
+        if (!itty_feed_model_decoder_uses_direct_activation_target (model->decoder))
+                return itty_feed_model_bit_string_clone (target);
+
+        if (itty_feed_model_decoder_uses_direct_gray_offset_target (model->decoder))
+                return itty_feed_model_bit_string_clone (target);
+
+        itty_bit_string_t *decoder_target = itty_feed_model_bit_string_clone (target);
+        if (!decoder_target)
+                return NULL;
+
+        if (itty_feed_model_decoder_uses_direct_duplicated_target (model->decoder)) {
+                while (itty_bit_string_get_number_of_words (decoder_target) <
+                       itty_bit_string_get_number_of_words (activation)) {
+                        itty_bit_string_t *next = itty_bit_string_double (decoder_target);
+                        itty_bit_string_free (decoder_target);
+                        decoder_target = next;
+                        if (!decoder_target)
+                                return NULL;
+                }
+        } else {
+                size_t target_words = itty_bit_string_get_number_of_words (decoder_target);
+                size_t activation_words = itty_bit_string_get_number_of_words (activation);
+
+                if (target_words < activation_words)
+                        itty_bit_string_append_zeros (decoder_target, activation_words - target_words);
+        }
+
+        if (itty_bit_string_get_number_of_words (decoder_target) !=
+            itty_bit_string_get_number_of_words (activation)) {
+                itty_bit_string_free (decoder_target);
+                return NULL;
+        }
+
+        return decoder_target;
+}
+
+static itty_bit_string_t *
 itty_feed_model_run_node (itty_bit_string_list_t *input,
                           itty_bit_string_list_t *masks,
                           size_t                  node_index,
                           itty_bit_string_t      *residual_enable,
                           itty_bit_string_t      *residual_mask,
-                          size_t                  rotation)
+                          size_t                  rotation,
+                          itty_feed_model_decoder_t decoder,
+                          size_t                  within_node_threshold_override,
+                          bool                    residual_merge_enabled)
 {
         itty_bit_string_list_t *modulated_inputs = itty_bit_string_list_exclusive_or (input,
                                                                                       masks);
-        itty_bit_string_t *condensed_output = itty_bit_string_list_condense (modulated_inputs);
+        itty_bit_string_t *condensed_output;
+        if (decoder == ITTY_FEED_MODEL_DECODER_SEGMENT_WEIGHTED_CONDENSE) {
+                size_t votes[64] = { 0 };
+                size_t vote_count = modulated_inputs ? modulated_inputs->count : 0;
+                if (vote_count > sizeof votes / sizeof votes[0])
+                        vote_count = sizeof votes / sizeof votes[0];
+                for (size_t i = 0; i < vote_count; i++)
+                        votes[i] = itty_feed_model_margin_preserving_vote_for_bit_string (modulated_inputs->bit_strings[i]);
+                condensed_output = itty_bit_string_list_weighted_condense (modulated_inputs,
+                                                                           votes,
+                                                                           vote_count);
+        } else {
+                condensed_output = itty_feed_model_condense_with_threshold (modulated_inputs,
+                                                                            within_node_threshold_override);
+        }
         itty_bit_string_list_free (modulated_inputs);
 
         if (!condensed_output)
                 condensed_output = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
 
-        if (residual_enable &&
+        if (residual_merge_enabled &&
+            residual_enable &&
             residual_mask &&
             itty_bit_string_get_pop_count (residual_enable) > 0 &&
             input->count > 0) {
@@ -1066,6 +1420,25 @@ itty_feed_model_expand_condensed_output (itty_bit_string_t *condensed_output,
 }
 
 static itty_bit_string_list_t *
+itty_feed_model_apply_input_route_adapter (itty_feed_model_t      *model,
+                                           itty_bit_string_list_t *input,
+                                           size_t                  route_index)
+{
+        if (!model ||
+            !input ||
+            !model->input_route_adapter_enabled ||
+            route_index >= model->nodes_per_layer)
+                return input;
+
+        itty_bit_string_list_t *adapter = model->input_route_adapters[route_index];
+        if (!adapter)
+                return input;
+
+        itty_bit_string_list_t *adapted = itty_bit_string_list_exclusive_or (input, adapter);
+        return adapted ? adapted : input;
+}
+
+static itty_bit_string_list_t *
 itty_feed_model_run_layer (itty_feed_model_t      *model,
                            size_t                  layer_index,
                            itty_bit_string_list_t *input)
@@ -1073,13 +1446,22 @@ itty_feed_model_run_layer (itty_feed_model_t      *model,
         itty_bit_string_list_t *outputs = itty_bit_string_list_new ();
 
         for (size_t node_index = 0; node_index < model->nodes_per_layer; node_index++) {
-                itty_bit_string_t *output = itty_feed_model_run_node (input,
+                itty_bit_string_list_t *node_input = input;
+                if (layer_index == 0)
+                        node_input = itty_feed_model_apply_input_route_adapter (model, input, node_index);
+
+                itty_bit_string_t *output = itty_feed_model_run_node (node_input,
                                                                       model->masks_by_layer_node[layer_index][node_index],
                                                                       node_index,
                                                                       model->residual_enable_by_layer_node[layer_index][node_index],
                                                                       model->residual_mask_by_layer_node[layer_index][node_index],
-                                                                      model->rotations_by_layer[layer_index]);
+                                                                      model->rotations_by_layer[layer_index],
+                                                                      model->decoder,
+                                                                      model->within_node_condense_threshold_override,
+                                                                      model->residual_merge_enabled);
                 itty_bit_string_list_append (outputs, output);
+                if (node_input != input)
+                        itty_bit_string_list_free (node_input);
         }
 
         return outputs;
@@ -1102,6 +1484,15 @@ itty_feed_model_run_to_layer_input (itty_feed_model_t      *model,
         }
 
         return current_input;
+}
+
+static itty_bit_string_list_t *
+itty_feed_model_run_outputs (itty_feed_model_t      *model,
+                             itty_bit_string_list_t *input)
+{
+        return itty_feed_model_run_to_layer_input (model,
+                                                   input,
+                                                   model->number_of_layers);
 }
 
 static bool
@@ -1379,7 +1770,84 @@ itty_feed_model_fold_activation_with_segment_condense (itty_bit_string_t  *activ
         }
 
         condensed_activation->pop_count_computed = false;
-        condensed_activation->bit_length_computed = false;
+        *folded_activation = condensed_activation;
+        return true;
+}
+
+static bool
+itty_feed_model_fold_activation_with_segment_weighted_condense (itty_bit_string_t  *activation,
+                                                                itty_bit_string_t  *target,
+                                                                itty_bit_string_t **folded_activation)
+{
+        size_t target_words = itty_bit_string_get_number_of_words (target);
+        size_t activation_words = itty_bit_string_get_number_of_words (activation);
+        size_t target_bit_capacity = target_words * ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+        size_t activation_bit_capacity = activation_words * ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+
+        if (target_words == 0)
+                return false;
+
+        if (activation_words == 0) {
+                itty_bit_string_t *zero_activation = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+                itty_bit_string_append_zeros (zero_activation, target_words);
+                *folded_activation = zero_activation;
+                return true;
+        }
+
+        if (activation_words == target_words) {
+                *folded_activation = activation;
+                return true;
+        }
+
+        if (activation_words < target_words ||
+            activation_words % target_words != 0)
+                return false;
+
+        size_t segment_count = activation_words / target_words;
+        size_t *votes = calloc (segment_count, sizeof (size_t));
+        itty_bit_string_t *condensed_activation = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        if (!votes || !condensed_activation) {
+                free (votes);
+                if (condensed_activation)
+                        itty_bit_string_free (condensed_activation);
+                return false;
+        }
+
+        itty_bit_string_append_zeros (condensed_activation, target_words);
+
+        __uint128_t total_votes = 0;
+        for (size_t segment_index = 0; segment_index < segment_count; segment_index++) {
+                size_t vote = 1;
+                size_t segment_base = segment_index * target_bit_capacity;
+
+                for (size_t bit_index = 0; bit_index < target_bit_capacity; bit_index++) {
+                        size_t activation_bit_index = segment_base + bit_index;
+                        if (activation_bit_index < activation_bit_capacity &&
+                            itty_bit_string_get_bit (activation, activation_bit_index))
+                                vote++;
+                }
+
+                votes[segment_index] = vote;
+                total_votes += vote;
+        }
+
+        __uint128_t threshold = total_votes / 2 + 1;
+        for (size_t target_bit_index = 0; target_bit_index < target_bit_capacity; target_bit_index++) {
+                __uint128_t one_votes = 0;
+
+                for (size_t segment_index = 0; segment_index < segment_count; segment_index++) {
+                        size_t activation_bit_index = segment_index * target_bit_capacity + target_bit_index;
+                        if (activation_bit_index < activation_bit_capacity &&
+                            itty_bit_string_get_bit (activation, activation_bit_index))
+                                one_votes += votes[segment_index];
+                }
+
+                if (one_votes >= threshold)
+                        itty_bit_string_set_bit (condensed_activation, target_bit_index, true);
+        }
+
+        free (votes);
+        condensed_activation->pop_count_computed = false;
         *folded_activation = condensed_activation;
         return true;
 }
@@ -1388,12 +1856,30 @@ static bool
 itty_feed_model_fold_activation_to_target_width (itty_feed_model_t   *model,
                                                  itty_bit_string_t   *activation,
                                                  itty_bit_string_t   *target,
+                                                 size_t               selected_index,
                                                  itty_bit_string_t  **folded_activation)
 {
+        if (itty_feed_model_decoder_uses_direct_gray_offset_target (model->decoder)) {
+                *folded_activation = itty_feed_model_extract_gray_payload_window (model,
+                                                                                  activation,
+                                                                                  target,
+                                                                                  selected_index);
+                return *folded_activation != NULL;
+        }
+
+        if (itty_feed_model_decoder_uses_direct_activation_target (model->decoder)) {
+                *folded_activation = activation;
+                return true;
+        }
+
         if (model->decoder == ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE)
                 return itty_feed_model_fold_activation_with_segment_condense (activation,
                                                                               target,
                                                                               folded_activation);
+        if (model->decoder == ITTY_FEED_MODEL_DECODER_SEGMENT_WEIGHTED_CONDENSE)
+                return itty_feed_model_fold_activation_with_segment_weighted_condense (activation,
+                                                                                       target,
+                                                                                       folded_activation);
 
         return itty_feed_model_fold_activation_with_repeated_and (activation,
                                                                   target,
@@ -1413,21 +1899,32 @@ itty_feed_model_evaluate_output (itty_feed_model_t                  *model,
 
         itty_bit_string_t *activation = itty_bit_string_list_fetch (outputs,
                                                                     selected_index);
+        itty_bit_string_t *decoder_target =
+                itty_feed_model_prepare_decoder_target_for_activation (model,
+                                                                       activation,
+                                                                       target,
+                                                                       selected_index);
         itty_bit_string_t *folded_activation = NULL;
-        if (!itty_feed_model_fold_activation_to_target_width (model,
+        if (!decoder_target ||
+            !itty_feed_model_fold_activation_to_target_width (model,
                                                               activation,
-                                                              target,
-                                                              &folded_activation))
+                                                              decoder_target,
+                                                              selected_index,
+                                                              &folded_activation)) {
+                if (decoder_target)
+                        itty_bit_string_free (decoder_target);
                 return false;
+        }
 
         itty_bit_string_t *difference = itty_bit_string_exclusive_or (folded_activation,
-                                                                      target);
+                                                                      decoder_target);
         evaluation->distance = itty_bit_string_get_pop_count (difference);
         evaluation->selected_index = selected_index;
         evaluation->folded_activation = folded_activation == activation ?
                                         itty_feed_model_bit_string_clone (folded_activation) :
                                         folded_activation;
         itty_bit_string_free (difference);
+        itty_bit_string_free (decoder_target);
 
         return true;
 }
@@ -1492,10 +1989,35 @@ itty_feed_model_count_decoder_ancestor_state (itty_feed_model_t *model,
                         zero_ancestors++;
         }
 
-        if (model->decoder == ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE) {
+        if (itty_feed_model_decoder_uses_segment_style (model->decoder)) {
                 size_t ones = ancestor_count - zero_ancestors;
                 size_t threshold = ancestor_count / 2 + 1;
                 size_t max_ones_for_zero = threshold == 0 ? 0 : threshold - 1;
+
+                if (model->decoder == ITTY_FEED_MODEL_DECODER_SEGMENT_WEIGHTED_CONDENSE) {
+                        __uint128_t weighted_ones = 0;
+                        __uint128_t total_votes = 0;
+
+                        for (size_t output_bit_index = target_bit_index, segment_index = 0;
+                             output_bit_index < activation_bit_capacity;
+                             output_bit_index += target_bit_capacity, segment_index++) {
+                                size_t vote = 1;
+                                size_t segment_base = segment_index * target_bit_capacity;
+                                for (size_t bit_index = 0; bit_index < target_bit_capacity; bit_index++) {
+                                        size_t weighted_bit_index = segment_base + bit_index;
+                                        if (weighted_bit_index < activation_bit_capacity &&
+                                            itty_bit_string_get_bit (activation, weighted_bit_index))
+                                                vote++;
+                                }
+                                total_votes += vote;
+                                if (itty_bit_string_get_bit (activation, output_bit_index))
+                                        weighted_ones += vote;
+                        }
+
+                        ones = (size_t) weighted_ones;
+                        threshold = (size_t) (total_votes / 2 + 1);
+                        max_ones_for_zero = threshold == 0 ? 0 : threshold - 1;
+                }
 
                 if (target_bit && !folded_bit && ones < threshold)
                         *blocker_bits = threshold - ones;
@@ -1620,6 +2142,15 @@ itty_feed_model_evaluate_decoder_objective (itty_feed_model_t                   
 
         itty_bit_string_t *selected_activation = itty_bit_string_list_fetch (outputs,
                                                                              evaluation.selected_index);
+        itty_bit_string_t *decoder_target =
+                itty_feed_model_prepare_decoder_target_for_activation (model,
+                                                                       selected_activation,
+                                                                       target,
+                                                                       evaluation.selected_index);
+        if (!decoder_target) {
+                itty_bit_string_free (evaluation.folded_activation);
+                return false;
+        }
 
         *objective = (itty_feed_model_decoder_objective_t) {
                 .selected_distance = evaluation.distance,
@@ -1632,7 +2163,7 @@ itty_feed_model_evaluate_decoder_objective (itty_feed_model_t                   
         itty_feed_model_decoder_objective_measure_selected_margins (model,
                                                                     selected_activation,
                                                                     evaluation.folded_activation,
-                                                                    target,
+                                                                    decoder_target,
                                                                     objective);
 
         size_t nearest_wrong_distance = (size_t) -1;
@@ -1643,12 +2174,13 @@ itty_feed_model_evaluate_decoder_objective (itty_feed_model_t                   
 
                 if (!itty_feed_model_fold_activation_to_target_width (model,
                                                                       activation,
-                                                                      target,
+                                                                      decoder_target,
+                                                                      node_index,
                                                                       &folded_activation))
                         continue;
 
                 itty_bit_string_t *difference = itty_bit_string_exclusive_or (folded_activation,
-                                                                              target);
+                                                                              decoder_target);
                 size_t distance = itty_bit_string_get_pop_count (difference);
                 itty_bit_string_free (difference);
                 if (folded_activation != activation)
@@ -1664,6 +2196,7 @@ itty_feed_model_evaluate_decoder_objective (itty_feed_model_t                   
         }
 
         itty_bit_string_free (evaluation.folded_activation);
+        itty_bit_string_free (decoder_target);
         (void) model;
 
         if (nearest_wrong_distance != (size_t) -1 &&
@@ -1685,19 +2218,29 @@ itty_feed_model_evaluate_decoder_objective_for_node (itty_feed_model_t          
 
         itty_bit_string_t *selected_activation = itty_bit_string_list_fetch (outputs,
                                                                              selected_index);
+        itty_bit_string_t *decoder_target =
+                itty_feed_model_prepare_decoder_target_for_activation (model,
+                                                                       selected_activation,
+                                                                       target,
+                                                                       selected_index);
         itty_bit_string_t *folded_activation = NULL;
-        if (!itty_feed_model_fold_activation_to_target_width (model,
+        if (!decoder_target ||
+            !itty_feed_model_fold_activation_to_target_width (model,
                                                               selected_activation,
-                                                              target,
-                                                              &folded_activation))
+                                                              decoder_target,
+                                                              selected_index,
+                                                              &folded_activation)) {
+                if (decoder_target)
+                        itty_bit_string_free (decoder_target);
                 return false;
+        }
 
         itty_bit_string_t *difference = itty_bit_string_exclusive_or (folded_activation,
-                                                                      target);
+                                                                      decoder_target);
         size_t distance = itty_bit_string_get_pop_count (difference);
         itty_bit_string_free (difference);
 
-        size_t target_bit_capacity = itty_bit_string_get_number_of_words (target) *
+        size_t target_bit_capacity = itty_bit_string_get_number_of_words (decoder_target) *
                                      ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
 
         *objective = (itty_feed_model_decoder_objective_t) {
@@ -1711,7 +2254,7 @@ itty_feed_model_evaluate_decoder_objective_for_node (itty_feed_model_t          
         for (size_t target_bit_index = 0; target_bit_index < target_bit_capacity; target_bit_index++) {
                 bool folded_bit = itty_bit_string_get_bit (folded_activation,
                                                            target_bit_index);
-                bool target_bit = itty_bit_string_get_bit (target,
+                bool target_bit = itty_bit_string_get_bit (decoder_target,
                                                            target_bit_index);
                 size_t blocker_bits = 0;
                 size_t safety_bits = 0;
@@ -1720,7 +2263,7 @@ itty_feed_model_evaluate_decoder_objective_for_node (itty_feed_model_t          
 
                 itty_feed_model_count_decoder_ancestor_state (model,
                                                               selected_activation,
-                                                              target,
+                                                              decoder_target,
                                                               target_bit_index,
                                                               target_bit,
                                                               folded_bit,
@@ -1751,12 +2294,13 @@ itty_feed_model_evaluate_decoder_objective_for_node (itty_feed_model_t          
 
                 if (!itty_feed_model_fold_activation_to_target_width (model,
                                                                       activation,
-                                                                      target,
+                                                                      decoder_target,
+                                                                      node_index,
                                                                       &node_folded_activation))
                         continue;
 
                 itty_bit_string_t *node_difference = itty_bit_string_exclusive_or (node_folded_activation,
-                                                                                   target);
+                                                                                   decoder_target);
                 size_t node_distance = itty_bit_string_get_pop_count (node_difference);
                 itty_bit_string_free (node_difference);
                 if (node_folded_activation != activation)
@@ -1775,6 +2319,7 @@ itty_feed_model_evaluate_decoder_objective_for_node (itty_feed_model_t          
 
         if (folded_activation != selected_activation)
                 itty_bit_string_free (folded_activation);
+        itty_bit_string_free (decoder_target);
         (void) model;
 
         if (nearest_wrong_distance != (size_t) -1 &&
@@ -1791,16 +2336,26 @@ itty_feed_model_evaluate_decoder_objective_for_activation (itty_feed_model_t    
                                                            size_t                               node_index,
                                                            itty_feed_model_decoder_objective_t *objective)
 {
+        itty_bit_string_t *decoder_target =
+                itty_feed_model_prepare_decoder_target_for_activation (model,
+                                                                       activation,
+                                                                       target,
+                                                                       node_index);
         itty_bit_string_t *folded_activation = NULL;
 
-        if (!itty_feed_model_fold_activation_to_target_width (model,
+        if (!decoder_target ||
+            !itty_feed_model_fold_activation_to_target_width (model,
                                                               activation,
-                                                              target,
-                                                              &folded_activation))
+                                                              decoder_target,
+                                                              node_index,
+                                                              &folded_activation)) {
+                if (decoder_target)
+                        itty_bit_string_free (decoder_target);
                 return false;
+        }
 
         itty_bit_string_t *difference = itty_bit_string_exclusive_or (folded_activation,
-                                                                      target);
+                                                                      decoder_target);
         size_t distance = itty_bit_string_get_pop_count (difference);
         itty_bit_string_free (difference);
 
@@ -1815,10 +2370,11 @@ itty_feed_model_evaluate_decoder_objective_for_activation (itty_feed_model_t    
         itty_feed_model_decoder_objective_measure_selected_margins (model,
                                                                     activation,
                                                                     folded_activation,
-                                                                    target,
+                                                                    decoder_target,
                                                                     objective);
         if (folded_activation != activation)
                 itty_bit_string_free (folded_activation);
+        itty_bit_string_free (decoder_target);
 
         return true;
 }
@@ -1952,7 +2508,6 @@ itty_feed_model_clone_bit_string_lane_range (itty_bit_string_t *source,
                 itty_bit_string_set_bit (clone, bit_index, false);
         }
         clone->pop_count_computed = false;
-        clone->bit_length_computed = false;
         return clone;
 }
 
@@ -2166,6 +2721,29 @@ itty_feed_model_decoder_objective_is_better (itty_feed_model_decoder_objective_t
         if (candidate->false_positive_vote_excess < current->false_positive_vote_excess)
                 return true;
         if (candidate->false_positive_vote_excess > current->false_positive_vote_excess)
+                return false;
+        if (candidate->target_one_margin > current->target_one_margin)
+                return true;
+        if (candidate->target_one_margin < current->target_one_margin)
+                return false;
+        return candidate->target_zero_safety > current->target_zero_safety;
+}
+
+static bool
+itty_feed_model_route_local_balanced_objective_is_better (itty_feed_model_decoder_objective_t const *candidate,
+                                                          itty_feed_model_decoder_objective_t const *current)
+{
+        if (candidate->selected_distance < current->selected_distance)
+                return true;
+        if (candidate->selected_distance > current->selected_distance)
+                return false;
+        if (candidate->false_positive_vote_excess < current->false_positive_vote_excess)
+                return true;
+        if (candidate->false_positive_vote_excess > current->false_positive_vote_excess)
+                return false;
+        if (candidate->false_negative_vote_deficit < current->false_negative_vote_deficit)
+                return true;
+        if (candidate->false_negative_vote_deficit > current->false_negative_vote_deficit)
                 return false;
         if (candidate->target_one_margin > current->target_one_margin)
                 return true;
@@ -2661,6 +3239,408 @@ itty_feed_model_apply_final_output_clear_set (itty_feed_model_t *model,
 }
 
 static bool
+itty_feed_model_collect_selected_node_clear_set (itty_feed_model_t       *model,
+                                                 size_t                   layer_index,
+                                                 itty_bit_string_t       *target,
+                                                 itty_bit_string_t       *selected_condensed,
+                                                 size_t const            *decoded_bits,
+                                                 size_t                   decoded_bit_count,
+                                                 size_t                  *output_bits,
+                                                 size_t                  *output_bit_count)
+{
+        size_t target_bit_capacity;
+        size_t condensed_bit_capacity;
+        size_t output_bit_capacity;
+        size_t clear_count = 0;
+
+        if (!model || !target || !selected_condensed || !output_bits || !output_bit_count)
+                return false;
+
+        target_bit_capacity = itty_bit_string_get_number_of_words (target) *
+                              ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+        condensed_bit_capacity = itty_bit_string_get_bit_capacity (selected_condensed);
+        output_bit_capacity = condensed_bit_capacity * 2;
+
+        for (size_t decoded_index = 0; decoded_index < decoded_bit_count; decoded_index++) {
+                size_t decoded_bit = decoded_bits[decoded_index];
+                size_t votes_needed = 0;
+                size_t available_votes = 0;
+                size_t available_output_bits[ITTY_FEED_MODEL_RESTORE_CLEAR_TRACE_LIMIT] = { 0 };
+
+                if (decoded_bit >= target_bit_capacity)
+                        return false;
+                if (itty_bit_string_get_bit (target, decoded_bit))
+                        return false;
+                if (!itty_feed_model_get_segment_condense_vote_need (model,
+                                                                    decoded_bit,
+                                                                    false,
+                                                                    selected_condensed,
+                                                                    &votes_needed))
+                        return false;
+
+                for (size_t output_bit_index = decoded_bit;
+                     output_bit_index < output_bit_capacity;
+                     output_bit_index += target_bit_capacity) {
+                        size_t condensed_bit_index = itty_feed_model_trace_output_bit_to_condensed (model,
+                                                                                                    layer_index,
+                                                                                                    output_bit_index);
+                        if (!itty_bit_string_get_bit (selected_condensed, condensed_bit_index))
+                                continue;
+                        if (available_votes < ITTY_FEED_MODEL_RESTORE_CLEAR_TRACE_LIMIT)
+                                available_output_bits[available_votes++] = output_bit_index;
+                }
+
+                if (available_votes < votes_needed)
+                        return false;
+
+                for (size_t vote_index = 0; vote_index < votes_needed; vote_index++)
+                        output_bits[clear_count++] = available_output_bits[vote_index];
+        }
+
+        *output_bit_count = clear_count;
+        return clear_count > 0;
+}
+
+static void
+itty_feed_model_measure_output_selection (itty_bit_string_list_t *outputs,
+                                          size_t                 *selected_index,
+                                          size_t                 *selection_gap)
+{
+        size_t best_index = 0;
+        size_t best_popcount = 0;
+        size_t runner_up = 0;
+
+        for (size_t node_index = 0; node_index < outputs->count; node_index++) {
+                size_t popcount = itty_bit_string_get_pop_count (itty_bit_string_list_fetch (outputs, node_index));
+
+                if (node_index == 0 || popcount > best_popcount) {
+                        runner_up = best_popcount;
+                        best_popcount = popcount;
+                        best_index = node_index;
+                } else if (popcount > runner_up) {
+                        runner_up = popcount;
+                }
+        }
+
+        if (selected_index)
+                *selected_index = best_index;
+        if (selection_gap)
+                *selection_gap = best_popcount - runner_up;
+}
+
+static bool
+itty_feed_model_measure_or_train_selected_node_direct_clear_set (itty_feed_model_t                             *model,
+                                                                 itty_bit_string_list_t                        *input,
+                                                                 itty_bit_string_t                             *target,
+                                                                 size_t const                                  *decoded_bits,
+                                                                 size_t                                         decoded_bit_count,
+                                                                 size_t                                         compare_node_a,
+                                                                 size_t                                         compare_node_b,
+                                                                 itty_feed_model_train_options_t const         *options,
+                                                                 bool                                           train_selected_node,
+                                                                 itty_feed_model_selected_clear_set_summary_t *summary)
+{
+        size_t final_layer;
+        itty_bit_string_list_t *final_layer_input = NULL;
+        itty_bit_string_list_t *final_outputs = NULL;
+        itty_bit_string_list_t *candidate_outputs = NULL;
+        itty_bit_string_t *selected_condensed = NULL;
+        itty_bit_string_t *candidate_condensed = NULL;
+        itty_feed_model_output_evaluation_t evaluation = { 0 };
+        size_t output_bits[ITTY_FEED_MODEL_RESTORE_CLEAR_TRACE_LIMIT] = { 0 };
+        size_t output_bit_count = 0;
+        bool ok = false;
+
+        if (summary)
+                *summary = (itty_feed_model_selected_clear_set_summary_t) { 0 };
+        if (!model ||
+            !input ||
+            !target ||
+            !decoded_bits ||
+            decoded_bit_count == 0 ||
+            !summary ||
+            model->number_of_layers == 0 ||
+            compare_node_a >= model->nodes_per_layer ||
+            compare_node_b >= model->nodes_per_layer ||
+            (train_selected_node && !options))
+                return false;
+
+        final_layer = model->number_of_layers - 1;
+        final_layer_input = itty_feed_model_run_to_layer_input (model, input, final_layer);
+        final_outputs = itty_feed_model_run_layer (model, final_layer, final_layer_input);
+        ok = final_outputs &&
+             itty_feed_model_evaluate_output (model, final_outputs, target, &evaluation);
+        if (!ok)
+                goto done;
+
+        summary->selected_node_before = evaluation.selected_index;
+        summary->compare_node_a = compare_node_a;
+        summary->compare_node_a_popcount_before =
+                itty_bit_string_get_pop_count (itty_bit_string_list_fetch (final_outputs, compare_node_a));
+        summary->compare_node_b = compare_node_b;
+        summary->compare_node_b_popcount_before =
+                itty_bit_string_get_pop_count (itty_bit_string_list_fetch (final_outputs, compare_node_b));
+        selected_condensed = itty_feed_model_run_node_condensed (final_layer_input,
+                                                                 model->masks_by_layer_node[final_layer][evaluation.selected_index]);
+        if (!selected_condensed)
+                goto done;
+        if (!itty_feed_model_collect_selected_node_clear_set (model,
+                                                              final_layer,
+                                                              target,
+                                                              selected_condensed,
+                                                              decoded_bits,
+                                                              decoded_bit_count,
+                                                              output_bits,
+                                                              &output_bit_count))
+                goto done;
+
+        summary->clear_vote_count = output_bit_count;
+        candidate_outputs = itty_feed_model_bit_string_list_clone (final_outputs);
+        if (!candidate_outputs)
+                goto done;
+
+        for (size_t output_index = 0; output_index < output_bit_count; output_index++) {
+                itty_bit_string_set_bit (itty_bit_string_list_fetch (candidate_outputs, evaluation.selected_index),
+                                         output_bits[output_index],
+                                         false);
+        }
+
+        if (train_selected_node) {
+                itty_feed_model_train_stats_t stats = { 0 };
+
+                candidate_condensed = itty_feed_model_bit_string_clone_to_words (selected_condensed,
+                                                                                 itty_bit_string_get_number_of_words (selected_condensed));
+                if (!candidate_condensed)
+                        goto done;
+                summary->changed = itty_feed_model_apply_final_output_clear_set (model,
+                                                                                 final_layer,
+                                                                                 candidate_condensed,
+                                                                                 output_bits,
+                                                                                 output_bit_count);
+                if (!summary->changed)
+                        goto done;
+                if (!itty_feed_model_train_layer_one_node (model->masks_by_layer_node[final_layer][evaluation.selected_index],
+                                                           final_layer_input,
+                                                           candidate_condensed,
+                                                           options,
+                                                           &stats))
+                        goto done;
+                summary->total_flips = stats.flips;
+                itty_bit_string_list_free (candidate_outputs);
+                candidate_outputs = itty_feed_model_run_layer (model, final_layer, final_layer_input);
+                if (!candidate_outputs)
+                        goto done;
+        } else {
+                summary->changed = true;
+        }
+
+        itty_feed_model_measure_output_selection (candidate_outputs,
+                                                  &summary->selected_node_after,
+                                                  &summary->selection_margin_after);
+        summary->compare_node_a_popcount_after =
+                itty_bit_string_get_pop_count (itty_bit_string_list_fetch (candidate_outputs, summary->compare_node_a));
+        summary->compare_node_b_popcount_after =
+                itty_bit_string_get_pop_count (itty_bit_string_list_fetch (candidate_outputs, summary->compare_node_b));
+        if (!itty_feed_model_evaluate_decoder_objective_for_node (model,
+                                                                  candidate_outputs,
+                                                                  target,
+                                                                  summary->selected_node_after,
+                                                                  &summary->selected_objective_after))
+                goto done;
+
+        ok = true;
+
+done:
+        if (candidate_condensed)
+                itty_bit_string_free (candidate_condensed);
+        if (selected_condensed)
+                itty_bit_string_free (selected_condensed);
+        if (candidate_outputs)
+                itty_bit_string_list_free (candidate_outputs);
+        if (final_outputs)
+                itty_bit_string_list_free (final_outputs);
+        if (final_layer_input != input)
+                itty_bit_string_list_free (final_layer_input);
+        itty_bit_string_free (evaluation.folded_activation);
+        return ok;
+}
+
+bool
+itty_feed_model_measure_selected_node_direct_clear_set (itty_feed_model_t                             *model,
+                                                        itty_bit_string_list_t                        *input,
+                                                        itty_bit_string_t                             *target,
+                                                        size_t const                                  *decoded_bits,
+                                                        size_t                                         decoded_bit_count,
+                                                        size_t                                         compare_node_a,
+                                                        size_t                                         compare_node_b,
+                                                        itty_feed_model_selected_clear_set_summary_t *summary)
+{
+        return itty_feed_model_measure_or_train_selected_node_direct_clear_set (model,
+                                                                                input,
+                                                                                target,
+                                                                                decoded_bits,
+                                                                                decoded_bit_count,
+                                                                                compare_node_a,
+                                                                                compare_node_b,
+                                                                                NULL,
+                                                                                false,
+                                                                                summary);
+}
+
+bool
+itty_feed_model_measure_selected_node_direct_condensed_clear_set (itty_feed_model_t                             *model,
+                                                                  itty_bit_string_list_t                        *input,
+                                                                  itty_bit_string_t                             *target,
+                                                                  size_t const                                  *decoded_bits,
+                                                                  size_t                                         decoded_bit_count,
+                                                                  size_t                                         compare_node_a,
+                                                                  size_t                                         compare_node_b,
+                                                                  itty_feed_model_selected_clear_set_summary_t *summary)
+{
+        size_t final_layer;
+        itty_bit_string_list_t *final_layer_input = NULL;
+        itty_bit_string_list_t *final_outputs = NULL;
+        itty_bit_string_list_t *candidate_outputs = NULL;
+        itty_bit_string_t *selected_condensed = NULL;
+        itty_bit_string_t *candidate_condensed = NULL;
+        itty_bit_string_t *candidate_activation = NULL;
+        itty_feed_model_output_evaluation_t evaluation = { 0 };
+        size_t output_bits[ITTY_FEED_MODEL_RESTORE_CLEAR_TRACE_LIMIT] = { 0 };
+        size_t output_bit_count = 0;
+        bool ok = false;
+
+        if (summary)
+                *summary = (itty_feed_model_selected_clear_set_summary_t) { 0 };
+        if (!model ||
+            !input ||
+            !target ||
+            !decoded_bits ||
+            decoded_bit_count == 0 ||
+            !summary ||
+            model->number_of_layers == 0 ||
+            compare_node_a >= model->nodes_per_layer ||
+            compare_node_b >= model->nodes_per_layer)
+                return false;
+
+        final_layer = model->number_of_layers - 1;
+        final_layer_input = itty_feed_model_run_to_layer_input (model, input, final_layer);
+        final_outputs = itty_feed_model_run_layer (model, final_layer, final_layer_input);
+        ok = final_outputs &&
+             itty_feed_model_evaluate_output (model, final_outputs, target, &evaluation);
+        if (!ok)
+                goto done;
+
+        summary->selected_node_before = evaluation.selected_index;
+        summary->compare_node_a = compare_node_a;
+        summary->compare_node_b = compare_node_b;
+        summary->compare_node_a_popcount_before =
+                itty_bit_string_get_pop_count (itty_bit_string_list_fetch (final_outputs, compare_node_a));
+        summary->compare_node_b_popcount_before =
+                itty_bit_string_get_pop_count (itty_bit_string_list_fetch (final_outputs, compare_node_b));
+
+        selected_condensed = itty_feed_model_run_node_condensed (final_layer_input,
+                                                                 model->masks_by_layer_node[final_layer][evaluation.selected_index]);
+        if (!selected_condensed)
+                goto done;
+        if (!itty_feed_model_collect_selected_node_clear_set (model,
+                                                              final_layer,
+                                                              target,
+                                                              selected_condensed,
+                                                              decoded_bits,
+                                                              decoded_bit_count,
+                                                              output_bits,
+                                                              &output_bit_count))
+                goto done;
+
+        summary->clear_vote_count = output_bit_count;
+        candidate_condensed = itty_feed_model_bit_string_clone_to_words (selected_condensed,
+                                                                         itty_bit_string_get_number_of_words (selected_condensed));
+        if (!candidate_condensed)
+                goto done;
+        summary->changed = itty_feed_model_apply_final_output_clear_set (model,
+                                                                         final_layer,
+                                                                         candidate_condensed,
+                                                                         output_bits,
+                                                                         output_bit_count);
+        if (!summary->changed)
+                goto done;
+
+        candidate_outputs = itty_feed_model_bit_string_list_clone (final_outputs);
+        candidate_activation = itty_bit_string_clone (itty_bit_string_list_fetch (candidate_outputs,
+                                                                                  evaluation.selected_index));
+        if (!candidate_outputs || !candidate_activation)
+                goto done;
+
+        for (size_t output_bit_index = 0;
+             output_bit_index < itty_bit_string_get_bit_capacity (candidate_activation);
+             output_bit_index++) {
+                size_t condensed_bit_index = itty_feed_model_trace_output_bit_to_condensed (model,
+                                                                                            final_layer,
+                                                                                            output_bit_index);
+                bool condensed_bit = itty_bit_string_get_bit (candidate_condensed, condensed_bit_index);
+                itty_bit_string_set_bit (candidate_activation, output_bit_index, condensed_bit);
+        }
+        itty_bit_string_free (candidate_outputs->bit_strings[evaluation.selected_index]);
+        candidate_outputs->bit_strings[evaluation.selected_index] = candidate_activation;
+        candidate_activation = NULL;
+
+        itty_feed_model_measure_output_selection (candidate_outputs,
+                                                  &summary->selected_node_after,
+                                                  &summary->selection_margin_after);
+        summary->compare_node_a_popcount_after =
+                itty_bit_string_get_pop_count (itty_bit_string_list_fetch (candidate_outputs, compare_node_a));
+        summary->compare_node_b_popcount_after =
+                itty_bit_string_get_pop_count (itty_bit_string_list_fetch (candidate_outputs, compare_node_b));
+        if (!itty_feed_model_evaluate_decoder_objective_for_node (model,
+                                                                  candidate_outputs,
+                                                                  target,
+                                                                  summary->selected_node_after,
+                                                                  &summary->selected_objective_after))
+                goto done;
+
+        ok = true;
+
+done:
+        if (candidate_activation)
+                itty_bit_string_free (candidate_activation);
+        if (candidate_condensed)
+                itty_bit_string_free (candidate_condensed);
+        if (selected_condensed)
+                itty_bit_string_free (selected_condensed);
+        if (candidate_outputs)
+                itty_bit_string_list_free (candidate_outputs);
+        if (final_outputs)
+                itty_bit_string_list_free (final_outputs);
+        if (final_layer_input != input)
+                itty_bit_string_list_free (final_layer_input);
+        itty_bit_string_free (evaluation.folded_activation);
+        return ok;
+}
+
+bool
+itty_feed_model_train_selected_node_direct_clear_set (itty_feed_model_t                             *model,
+                                                      itty_bit_string_list_t                        *input,
+                                                      itty_bit_string_t                             *target,
+                                                      size_t const                                  *decoded_bits,
+                                                      size_t                                         decoded_bit_count,
+                                                      size_t                                         compare_node_a,
+                                                      size_t                                         compare_node_b,
+                                                      itty_feed_model_train_options_t const         *options,
+                                                      itty_feed_model_selected_clear_set_summary_t *summary)
+{
+        return itty_feed_model_measure_or_train_selected_node_direct_clear_set (model,
+                                                                                input,
+                                                                                target,
+                                                                                decoded_bits,
+                                                                                decoded_bit_count,
+                                                                                compare_node_a,
+                                                                                compare_node_b,
+                                                                                options,
+                                                                                true,
+                                                                                summary);
+}
+
+static bool
 itty_feed_model_contender_clear_set_trace_is_better (itty_feed_model_contender_clear_set_trace_t const *candidate,
                                                      itty_feed_model_contender_clear_set_trace_t const *best)
 {
@@ -2841,7 +3821,6 @@ itty_feed_model_try_best_transaction_completion_candidate (itty_feed_model_t    
                                                  repair->condensed_bit,
                                                  repair->value);
                         oracle_target->pop_count_computed = false;
-                        oracle_target->bit_length_computed = false;
                 }
 
                 if (oracle_target &&
@@ -3882,7 +4861,6 @@ itty_feed_model_make_condensed_realistic_outputs (itty_feed_model_t             
                                          assignment->bit_index,
                                          assignment->value);
                 condensed_targets[assignment->layer_node]->pop_count_computed = false;
-                condensed_targets[assignment->layer_node]->bit_length_computed = false;
                 touched_nodes[assignment->layer_node] = true;
         }
 
@@ -4797,7 +5775,6 @@ itty_feed_model_collect_segment_final_repairs_for_penultimate (itty_feed_model_t
                                                                  target_bit);
                                 }
                                 candidate_condensed->pop_count_computed = false;
-                                candidate_condensed->bit_length_computed = false;
 
                                 itty_bit_string_t *candidate_output = itty_feed_model_expand_condensed_output (candidate_condensed,
                                                                                                                model->rotations_by_layer[final_layer]);
@@ -5438,6 +6415,7 @@ itty_feed_model_make_decoder_tri_state_target_for_final_node (itty_feed_model_t 
         if (!itty_feed_model_fold_activation_to_target_width (model,
                                                               current_output,
                                                               target,
+                                                              node_index,
                                                               &folded_output)) {
                 itty_bit_string_free (current_output);
                 itty_bit_string_free (current_condensed);
@@ -5471,7 +6449,6 @@ itty_feed_model_make_decoder_tri_state_target_for_final_node (itty_feed_model_t 
         }
 
         node_target->pop_count_computed = false;
-        node_target->bit_length_computed = false;
 
         if (folded_output != current_output)
                 itty_bit_string_free (folded_output);
@@ -5531,7 +6508,6 @@ itty_feed_model_collect_final_repairs (itty_feed_model_t                  *model
                                                          bit_index,
                                                          target_bit);
                                 candidate_condensed->pop_count_computed = false;
-                                candidate_condensed->bit_length_computed = false;
 
                                 itty_bit_string_t *candidate_output = itty_feed_model_expand_condensed_output (candidate_condensed,
                                                                                                                model->rotations_by_layer[final_layer]);
@@ -5557,7 +6533,6 @@ itty_feed_model_collect_final_repairs (itty_feed_model_t                  *model
                                                                  bit_index,
                                                                  target_bit);
                                         working_condensed->pop_count_computed = false;
-                                        working_condensed->bit_length_computed = false;
                                         current_objective = candidate_objective;
                                 }
 
@@ -5597,7 +6572,6 @@ itty_feed_model_collect_final_repairs (itty_feed_model_t                  *model
                                 }
 
                                 candidate_condensed->pop_count_computed = false;
-                                candidate_condensed->bit_length_computed = false;
 
                                 itty_bit_string_t *candidate_output = itty_feed_model_expand_condensed_output (candidate_condensed,
                                                                                                                model->rotations_by_layer[final_layer]);
@@ -5851,7 +6825,6 @@ itty_feed_model_make_downstream_mask_aware_target_for_node (itty_feed_model_t   
                 }
 
                 target->pop_count_computed = false;
-                target->bit_length_computed = false;
 
                 free (set_requests);
                 free (set_request_weights);
@@ -5928,7 +6901,6 @@ itty_feed_model_make_downstream_mask_aware_target_for_node (itty_feed_model_t   
         }
 
         target->pop_count_computed = false;
-        target->bit_length_computed = false;
 
         free (set_request_weights);
         free (unset_request_weights);
@@ -5967,7 +6939,6 @@ itty_feed_model_make_disagreement_target_for_node (itty_feed_model_t      *model
         }
 
         target->pop_count_computed = false;
-        target->bit_length_computed = false;
         itty_bit_string_free (actual_condensed);
 
         return target;
@@ -6117,9 +7088,20 @@ static itty_bit_string_t *
 itty_feed_model_run_node_condensed (itty_bit_string_list_t *input,
                                     itty_bit_string_list_t *masks)
 {
+        return itty_feed_model_run_node_condensed_with_threshold (input,
+                                                                  masks,
+                                                                  0);
+}
+
+static itty_bit_string_t *
+itty_feed_model_run_node_condensed_with_threshold (itty_bit_string_list_t *input,
+                                                   itty_bit_string_list_t *masks,
+                                                   size_t                  threshold_override)
+{
         itty_bit_string_list_t *modulated_inputs = itty_bit_string_list_exclusive_or (input,
                                                                                       masks);
-        itty_bit_string_t *condensed_output = itty_bit_string_list_condense (modulated_inputs);
+        itty_bit_string_t *condensed_output = itty_feed_model_condense_with_threshold (modulated_inputs,
+                                                                                       threshold_override);
         itty_bit_string_list_free (modulated_inputs);
 
         if (!condensed_output)
@@ -6188,10 +7170,23 @@ itty_feed_model_new (size_t number_of_layers,
         model->inputs_per_node = inputs_per_node;
         model->vocabulary_words = vocabulary_words;
         model->masks_by_layer_node = calloc (number_of_layers, sizeof (itty_bit_string_list_t **));
+        model->input_route_adapters = calloc (nodes_per_layer, sizeof (itty_bit_string_list_t *));
         model->residual_enable_by_layer_node = calloc (number_of_layers, sizeof (itty_bit_string_t **));
         model->residual_mask_by_layer_node = calloc (number_of_layers, sizeof (itty_bit_string_t **));
+        model->gray_offset_override_enabled_by_route = calloc (nodes_per_layer, sizeof (bool));
+        model->gray_offset_override_payload_start_by_route = calloc (nodes_per_layer, sizeof (size_t));
         model->rotations_by_layer = calloc (number_of_layers, sizeof (size_t));
+        model->within_node_condense_threshold_override = 0;
+        model->residual_merge_enabled = true;
+        model->input_route_adapter_enabled = false;
         model->decoder = ITTY_FEED_MODEL_DECODER_REPEATED_AND_FOLD;
+
+        for (size_t route_index = 0; route_index < nodes_per_layer; route_index++) {
+                itty_bit_string_list_t *adapters = itty_bit_string_list_new ();
+                for (size_t input_index = 0; input_index < inputs_per_node; input_index++)
+                        itty_bit_string_list_append (adapters, itty_feed_model_zero_mask_new (vocabulary_words));
+                model->input_route_adapters[route_index] = adapters;
+        }
 
         for (size_t layer_index = 0; layer_index < number_of_layers; layer_index++) {
                 size_t layer_words = vocabulary_words << layer_index;
@@ -6230,10 +7225,15 @@ itty_feed_model_free (itty_feed_model_t *model)
                 free (model->residual_enable_by_layer_node[layer_index]);
                 free (model->residual_mask_by_layer_node[layer_index]);
         }
+        for (size_t route_index = 0; route_index < model->nodes_per_layer; route_index++)
+                itty_bit_string_list_free (model->input_route_adapters[route_index]);
         free (model->rotations_by_layer);
         free (model->masks_by_layer_node);
+        free (model->input_route_adapters);
         free (model->residual_enable_by_layer_node);
         free (model->residual_mask_by_layer_node);
+        free (model->gray_offset_override_enabled_by_route);
+        free (model->gray_offset_override_payload_start_by_route);
         free (model);
 }
 
@@ -6251,6 +7251,141 @@ itty_feed_model_set_decoder (itty_feed_model_t        *model,
                              itty_feed_model_decoder_t decoder)
 {
         model->decoder = decoder;
+}
+
+void
+itty_feed_model_set_within_node_condense_threshold_override (itty_feed_model_t *model,
+                                                             size_t             threshold)
+{
+        if (!model)
+                return;
+
+        model->within_node_condense_threshold_override = threshold;
+}
+
+void
+itty_feed_model_set_residual_merge_enabled (itty_feed_model_t *model,
+                                            bool               enabled)
+{
+        if (!model)
+                return;
+
+        model->residual_merge_enabled = enabled;
+}
+
+void
+itty_feed_model_set_input_route_adapter_enabled (itty_feed_model_t *model,
+                                                 bool               enabled)
+{
+        if (!model)
+                return;
+
+        model->input_route_adapter_enabled = enabled;
+}
+
+void
+itty_feed_model_set_gray_offset_override (itty_feed_model_t *model,
+                                          size_t             route_index,
+                                          bool               enabled,
+                                          size_t             payload_start)
+{
+        if (!model || route_index >= model->nodes_per_layer)
+                return;
+
+        model->gray_offset_override_enabled_by_route[route_index] = enabled;
+        model->gray_offset_override_payload_start_by_route[route_index] = payload_start;
+}
+
+bool
+itty_feed_model_train_input_route_adapter (itty_feed_model_t                     *model,
+                                           itty_bit_string_list_t                *input,
+                                           itty_bit_string_t                     *target,
+                                           size_t                                 route_index,
+                                           itty_feed_model_train_options_t const *options,
+                                           itty_feed_model_train_stats_t         *stats)
+{
+        size_t max_flips;
+        itty_bit_string_list_t *adapter_masks;
+        itty_feed_model_decoder_objective_t current_objective = { 0 };
+
+        if (stats)
+                *stats = (itty_feed_model_train_stats_t) { 0 };
+        if (!model ||
+            !input ||
+            !target ||
+            route_index >= model->nodes_per_layer ||
+            itty_bit_string_list_get_length (input) != model->inputs_per_node)
+                return false;
+
+        adapter_masks = model->input_route_adapters[route_index];
+        if (!adapter_masks)
+                return false;
+
+        if (!itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                 input,
+                                                                 target,
+                                                                 route_index,
+                                                                 &current_objective))
+                return false;
+
+        max_flips = options ? options->max_flips : 0;
+        for (size_t accepted_flips = 0; accepted_flips < max_flips; accepted_flips++) {
+                bool found = false;
+                size_t best_input_index = 0;
+                size_t best_bit_index = 0;
+                itty_feed_model_decoder_objective_t best_objective = current_objective;
+
+                for (size_t input_index = 0; input_index < adapter_masks->count; input_index++) {
+                        itty_bit_string_t *mask = itty_bit_string_list_fetch (adapter_masks, input_index);
+                        size_t bit_capacity = itty_bit_string_get_bit_capacity (mask);
+
+                        for (size_t bit_index = 0; bit_index < bit_capacity; bit_index++) {
+                                bool current_bit = itty_bit_string_get_bit (mask, bit_index);
+                                itty_feed_model_decoder_objective_t candidate_objective = { 0 };
+
+                                if (stats)
+                                        stats->candidate_bits++;
+
+                                itty_bit_string_set_bit (mask, bit_index, !current_bit);
+                                mask->pop_count_computed = false;
+
+                                if (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                                         input,
+                                                                                         target,
+                                                                                         route_index,
+                                                                                         &candidate_objective) &&
+                                    itty_feed_model_decoder_objective_accepts (&best_objective,
+                                                                               &candidate_objective) &&
+                                    !itty_feed_model_decoder_objective_accepts (&candidate_objective,
+                                                                                &best_objective)) {
+                                        found = true;
+                                        best_input_index = input_index;
+                                        best_bit_index = bit_index;
+                                        best_objective = candidate_objective;
+                                }
+
+                                itty_bit_string_set_bit (mask, bit_index, current_bit);
+                                mask->pop_count_computed = false;
+                        }
+                }
+
+                if (!found)
+                        break;
+
+                {
+                        itty_bit_string_t *mask = itty_bit_string_list_fetch (adapter_masks, best_input_index);
+                        bool current_bit = itty_bit_string_get_bit (mask, best_bit_index);
+                        itty_bit_string_set_bit (mask, best_bit_index, !current_bit);
+                        mask->pop_count_computed = false;
+                }
+                current_objective = best_objective;
+                if (stats)
+                        stats->flips++;
+        }
+
+        if (stats)
+                stats->largest_error = current_objective.selected_distance;
+        return true;
 }
 
 bool
@@ -6281,7 +7416,6 @@ itty_feed_model_randomize_masks (itty_feed_model_t *model,
                                 }
 
                                 mask->pop_count_computed = false;
-                                mask->bit_length_computed = false;
                         }
                 }
         }
@@ -6584,7 +7718,6 @@ itty_feed_model_measure_suffix_oracle (itty_feed_model_t                        
                                          bit_index,
                                          candidate_bit);
                 candidate_condensed->pop_count_computed = false;
-                candidate_condensed->bit_length_computed = false;
 
                 itty_bit_string_t *candidate_output = itty_feed_model_expand_condensed_output (candidate_condensed,
                                                                                                model->rotations_by_layer[options->layer_index]);
@@ -6665,10 +7798,8 @@ itty_feed_model_measure_residual_decode (itty_feed_model_t                      
             itty_bit_string_get_number_of_words (target) > model->vocabulary_words)
                 return false;
 
-        itty_network_t *network = itty_feed_model_build_network (model);
-        itty_bit_string_list_t *outputs = itty_network_feed (network,
-                                                             input);
-        itty_network_free (network);
+        itty_bit_string_list_t *outputs = itty_feed_model_run_outputs (model,
+                                                                       input);
         if (!outputs)
                 return false;
 
@@ -6711,10 +7842,8 @@ itty_feed_model_measure_decoder_objective (itty_feed_model_t                   *
             itty_bit_string_get_number_of_words (target) > model->vocabulary_words)
                 return false;
 
-        itty_network_t *network = itty_feed_model_build_network (model);
-        itty_bit_string_list_t *outputs = itty_network_feed (network,
-                                                             input);
-        itty_network_free (network);
+        itty_bit_string_list_t *outputs = itty_feed_model_run_outputs (model,
+                                                                       input);
         if (!outputs)
                 return false;
 
@@ -6746,9 +7875,8 @@ itty_feed_model_measure_decoder_objective_with_lane_split (itty_feed_model_t    
             itty_bit_string_get_number_of_words (target) > model->vocabulary_words)
                 return false;
 
-        itty_network_t *network = itty_feed_model_build_network (model);
-        itty_bit_string_list_t *outputs = itty_network_feed (network, input);
-        itty_network_free (network);
+        itty_bit_string_list_t *outputs = itty_feed_model_run_outputs (model,
+                                                                       input);
         if (!outputs)
                 return false;
 
@@ -6780,10 +7908,9 @@ itty_feed_model_measure_decoder_objective_for_node (itty_feed_model_t           
             itty_bit_string_get_number_of_words (target) > model->vocabulary_words)
                 return false;
 
-        itty_network_t *network = itty_feed_model_build_network (model);
-        itty_bit_string_list_t *outputs = itty_network_feed (network,
-                                                             input);
-        itty_network_free (network);
+        itty_bit_string_list_t *outputs = itty_feed_model_run_to_layer_input (model,
+                                                                              input,
+                                                                              model->number_of_layers);
         if (!outputs)
                 return false;
 
@@ -6817,9 +7944,8 @@ itty_feed_model_measure_decoder_objective_for_node_with_lane_split (itty_feed_mo
             itty_bit_string_get_number_of_words (target) > model->vocabulary_words)
                 return false;
 
-        itty_network_t *network = itty_feed_model_build_network (model);
-        itty_bit_string_list_t *outputs = itty_network_feed (network, input);
-        itty_network_free (network);
+        itty_bit_string_list_t *outputs = itty_feed_model_run_outputs (model,
+                                                                       input);
         if (!outputs)
                 return false;
 
@@ -6854,7 +7980,9 @@ itty_feed_model_measure_segment_node_selection (itty_feed_model_t               
         *summary = (itty_feed_model_segment_node_selection_summary_t) { 0 };
 
         itty_feed_model_decoder_t previous_decoder = model->decoder;
-        model->decoder = ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE;
+        model->decoder = previous_decoder == ITTY_FEED_MODEL_DECODER_SEGMENT_WEIGHTED_CONDENSE ?
+                         ITTY_FEED_MODEL_DECODER_SEGMENT_WEIGHTED_CONDENSE :
+                         ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE;
 
         itty_network_t *network = itty_feed_model_build_network (model);
         itty_bit_string_list_t *outputs = itty_network_feed (network,
@@ -6865,11 +7993,18 @@ itty_feed_model_measure_segment_node_selection (itty_feed_model_t               
                 return false;
         }
 
+        size_t selected_index = 0;
+        if (!itty_network_select_output (outputs, &selected_index)) {
+                itty_bit_string_list_free (outputs);
+                model->decoder = previous_decoder;
+                return false;
+        }
         itty_feed_model_decoder_objective_t selected_objective = { 0 };
-        if (!itty_feed_model_evaluate_decoder_objective (model,
-                                                         outputs,
-                                                         target,
-                                                         &selected_objective)) {
+        if (!itty_feed_model_evaluate_decoder_objective_for_node (model,
+                                                                  outputs,
+                                                                  target,
+                                                                  selected_index,
+                                                                  &selected_objective)) {
                 itty_bit_string_list_free (outputs);
                 model->decoder = previous_decoder;
                 return false;
@@ -7055,7 +8190,9 @@ itty_feed_model_measure_segment_node_polarity_selection (itty_feed_model_t      
         *summary = (itty_feed_model_segment_node_polarity_summary_t) { 0 };
 
         itty_feed_model_decoder_t previous_decoder = model->decoder;
-        model->decoder = ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE;
+        model->decoder = previous_decoder == ITTY_FEED_MODEL_DECODER_SEGMENT_WEIGHTED_CONDENSE ?
+                         ITTY_FEED_MODEL_DECODER_SEGMENT_WEIGHTED_CONDENSE :
+                         ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE;
 
         itty_network_t *network = itty_feed_model_build_network (model);
         itty_bit_string_list_t *outputs = itty_network_feed (network,
@@ -7158,7 +8295,9 @@ itty_feed_model_measure_segment_transform (itty_feed_model_t                    
         };
 
         itty_feed_model_decoder_t previous_decoder = model->decoder;
-        model->decoder = ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE;
+        model->decoder = previous_decoder == ITTY_FEED_MODEL_DECODER_SEGMENT_WEIGHTED_CONDENSE ?
+                         ITTY_FEED_MODEL_DECODER_SEGMENT_WEIGHTED_CONDENSE :
+                         ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE;
 
         itty_network_t *network = itty_feed_model_build_network (model);
         itty_bit_string_list_t *outputs = itty_network_feed (network,
@@ -7619,6 +8758,7 @@ itty_feed_model_measure_final_layer_restore_failure (itty_feed_model_t          
                         itty_feed_model_train_stats_t repair_stats = { 0 };
                         itty_feed_model_decoder_objective_t a_after_candidate = { 0 };
                         itty_feed_model_decoder_objective_t a_after_candidate_forced = { 0 };
+                        itty_feed_model_decoder_objective_t a_after_candidate_selected = { 0 };
                         itty_feed_model_decoder_objective_t b_after_candidate = { 0 };
                         itty_bit_string_list_t *after_final_outputs = NULL;
                         itty_feed_model_output_evaluation_t after_evaluation = { 0 };
@@ -7639,15 +8779,21 @@ itty_feed_model_measure_final_layer_restore_failure (itty_feed_model_t          
                                         (after_final_outputs = itty_feed_model_run_layer (model,
                                                                                            final_layer,
                                                                                            final_layer_input)) &&
+                                        itty_feed_model_evaluate_output (model,
+                                                                         after_final_outputs,
+                                                                         first_target,
+                                                                         &after_evaluation) &&
                                         itty_feed_model_evaluate_decoder_objective_for_node (model,
                                                                                               after_final_outputs,
                                                                                               first_target,
                                                                                               evaluation.selected_index,
                                                                                               &a_after_candidate_forced) &&
-                                        itty_feed_model_evaluate_output (model,
-                                                                         after_final_outputs,
-                                                                         first_target,
-                                                                         &after_evaluation);
+                                        itty_feed_model_evaluate_decoder_objective_for_node (model,
+                                                                                              after_final_outputs,
+                                                                                              first_target,
+                                                                                              after_evaluation.selected_index,
+                                                                                              &a_after_candidate_selected) &&
+                                        true;
 
                         bool useful = measured &&
                                       (a_after_candidate_forced.selected_distance < first_selected_before.selected_distance ||
@@ -7709,10 +8855,18 @@ itty_feed_model_measure_final_layer_restore_failure (itty_feed_model_t          
                                 trace.actual_final_condensed_ones_after = final_condensed_after;
                                 trace.actual_final_segment_ones_before = final_segment_before;
                                 trace.actual_final_segment_ones_after = final_segment_after;
+                                trace.forced_node_false_negative_deficit_before = first_selected_before.false_negative_vote_deficit;
                                 trace.forced_node_distance_before = first_selected_before.selected_distance;
+                                trace.forced_node_false_negative_deficit_after = a_after_candidate_forced.false_negative_vote_deficit;
                                 trace.forced_node_distance_after = a_after_candidate_forced.selected_distance;
                                 trace.forced_node_false_positive_excess_before = first_selected_before.false_positive_vote_excess;
                                 trace.forced_node_false_positive_excess_after = a_after_candidate_forced.false_positive_vote_excess;
+                                trace.selected_node_false_negative_deficit_after = a_after_candidate_selected.false_negative_vote_deficit;
+                                trace.selected_node_distance_after = a_after_candidate_selected.selected_distance;
+                                trace.selected_node_false_positive_excess_after = a_after_candidate_selected.false_positive_vote_excess;
+                                trace.replay_example_distance_after = b_after_candidate.selected_distance;
+                                trace.replay_example_false_negative_deficit_after = b_after_candidate.false_negative_vote_deficit;
+                                trace.replay_example_false_positive_excess_after = b_after_candidate.false_positive_vote_excess;
                                 trace.decoded_before = decoded_before;
                                 trace.decoded_after = decoded_after;
 
@@ -9001,7 +10155,6 @@ itty_feed_model_train_final_layer_with_suffix_oracle (itty_feed_model_t         
                 }
 
                 oracle_target->pop_count_computed = false;
-                oracle_target->bit_length_computed = false;
 
                 if (accepted_bits > 0) {
                         itty_feed_model_train_stats_t current_node_stats = { 0 };
@@ -9032,16 +10185,20 @@ itty_feed_model_train_final_layer_with_suffix_oracle (itty_feed_model_t         
         return trained;
 }
 
-bool
-itty_feed_model_train_final_layer_with_suffix_oracle_for_node (itty_feed_model_t                     *model,
-                                                               itty_bit_string_list_t                *input,
-                                                               itty_bit_string_t                     *target,
-                                                               size_t                                 node_index,
-                                                               itty_feed_model_train_options_t const *options,
-                                                               itty_feed_model_train_stats_t         *stats)
+static bool
+itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode_internal (itty_feed_model_t                           *model,
+                                                                             itty_bit_string_list_t                      *input,
+                                                                             itty_bit_string_t                           *target,
+                                                                             size_t                                       node_index,
+                                                                             itty_feed_model_train_options_t const       *options,
+                                                                             itty_feed_model_final_repair_mode_t          mode,
+                                                                             itty_feed_model_train_stats_t               *stats,
+                                                                             itty_feed_model_final_repair_mode_summary_t *summary)
 {
         if (stats)
                 *stats = (itty_feed_model_train_stats_t) { 0 };
+        if (summary)
+                *summary = (itty_feed_model_final_repair_mode_summary_t) { 0 };
 
         if (model->number_of_layers == 0 ||
             node_index >= model->nodes_per_layer ||
@@ -9076,11 +10233,16 @@ itty_feed_model_train_final_layer_with_suffix_oracle_for_node (itty_feed_model_t
 
                 if (repair->final_node != node_index)
                         continue;
+                if ((mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY && !repair->value) ||
+                    (mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY && repair->value))
+                        continue;
                 if (!itty_feed_model_train_options_bit_allowed (options,
                                                                 repair->condensed_bit,
                                                                 itty_bit_string_get_bit_capacity (oracle_target),
                                                                 false))
                         continue;
+                if (summary)
+                        summary->candidate_count++;
 
                 itty_bit_string_set_bit (oracle_target,
                                          repair->condensed_bit,
@@ -9088,8 +10250,12 @@ itty_feed_model_train_final_layer_with_suffix_oracle_for_node (itty_feed_model_t
                 accepted_bits++;
         }
 
+        if (summary)
+                summary->chosen_mode = mode;
+        if (summary)
+                summary->accepted_candidates = accepted_bits;
+
         oracle_target->pop_count_computed = false;
-        oracle_target->bit_length_computed = false;
 
         bool trained = true;
         if (accepted_bits > 0) {
@@ -9112,6 +10278,444 @@ itty_feed_model_train_final_layer_with_suffix_oracle_for_node (itty_feed_model_t
                 itty_bit_string_list_free (final_layer_input);
 
         return trained;
+}
+
+bool
+itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (itty_feed_model_t                           *model,
+                                                                    itty_bit_string_list_t                      *input,
+                                                                    itty_bit_string_t                           *target,
+                                                                    size_t                                       node_index,
+                                                                    itty_feed_model_train_options_t const       *options,
+                                                                    itty_feed_model_final_repair_mode_t          mode,
+                                                                    itty_feed_model_train_stats_t               *stats,
+                                                                    itty_feed_model_final_repair_mode_summary_t *summary)
+{
+        if (mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED)
+                return itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode_internal (model,
+                                                                                                    input,
+                                                                                                    target,
+                                                                                                    node_index,
+                                                                                                    options,
+                                                                                                    mode,
+                                                                                                    stats,
+                                                                                                    summary);
+
+        if (stats)
+                *stats = (itty_feed_model_train_stats_t) { 0 };
+        if (summary)
+                *summary = (itty_feed_model_final_repair_mode_summary_t) { 0 };
+
+        itty_feed_model_decoder_objective_t before_objective = { 0 };
+        if (!itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                 input,
+                                                                 target,
+                                                                 node_index,
+                                                                 &before_objective))
+                return false;
+
+        itty_feed_model_layer_state_snapshot_t *best_post_snapshot = NULL;
+        itty_feed_model_decoder_objective_t best_objective = before_objective;
+        itty_feed_model_train_stats_t best_stats = { 0 };
+        itty_feed_model_final_repair_mode_summary_t best_summary = { 0 };
+        bool found = false;
+
+        itty_feed_model_final_repair_mode_t const candidate_modes[] = {
+                ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY,
+                ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY,
+                ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+        };
+
+        for (size_t mode_index = 0; mode_index < sizeof (candidate_modes) / sizeof (candidate_modes[0]); mode_index++) {
+                itty_feed_model_layer_state_snapshot_t *before_snapshot = itty_feed_model_snapshot_final_layer_state (model);
+                itty_feed_model_layer_state_snapshot_t *after_snapshot = NULL;
+                itty_feed_model_train_stats_t candidate_stats = { 0 };
+                itty_feed_model_final_repair_mode_summary_t candidate_summary = { 0 };
+                itty_feed_model_decoder_objective_t candidate_objective = { 0 };
+                bool trained_ok;
+
+                if (!before_snapshot)
+                        break;
+
+                trained_ok = itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode_internal (model,
+                                                                                                          input,
+                                                                                                          target,
+                                                                                                          node_index,
+                                                                                                          options,
+                                                                                                          candidate_modes[mode_index],
+                                                                                                          &candidate_stats,
+                                                                                                          &candidate_summary) &&
+                             itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                                 input,
+                                                                                 target,
+                                                                                 node_index,
+                                                                                 &candidate_objective);
+                if (trained_ok)
+                        after_snapshot = itty_feed_model_snapshot_final_layer_state (model);
+
+                if (trained_ok &&
+                    after_snapshot &&
+                    (!found ||
+                     itty_feed_model_route_local_balanced_objective_is_better (&candidate_objective, &best_objective))) {
+                        if (best_post_snapshot)
+                                itty_feed_model_restore_final_layer_state_snapshot (model, best_post_snapshot);
+                        best_post_snapshot = after_snapshot;
+                        best_objective = candidate_objective;
+                        best_stats = candidate_stats;
+                        best_summary = candidate_summary;
+                        best_summary.chosen_mode = candidate_modes[mode_index];
+                        found = true;
+                }
+
+                itty_feed_model_restore_final_layer_state_snapshot (model, before_snapshot);
+                if (trained_ok && after_snapshot && after_snapshot != best_post_snapshot)
+                        itty_feed_model_restore_final_layer_state_snapshot (model, after_snapshot);
+        }
+
+        if (!found) {
+            return false;
+        }
+
+        itty_feed_model_restore_final_layer_state_snapshot (model, best_post_snapshot);
+
+        if (stats)
+                *stats = best_stats;
+        if (summary)
+                *summary = best_summary;
+        return true;
+}
+
+bool
+itty_feed_model_train_final_layer_with_suffix_oracle_for_node (itty_feed_model_t                     *model,
+                                                               itty_bit_string_list_t                *input,
+                                                               itty_bit_string_t                     *target,
+                                                               size_t                                 node_index,
+                                                               itty_feed_model_train_options_t const *options,
+                                                               itty_feed_model_train_stats_t         *stats)
+{
+        return itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (model,
+                                                                                   input,
+                                                                                   target,
+                                                                                   node_index,
+                                                                                   options,
+                                                                                   ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+                                                                                   stats,
+                                                                                   NULL);
+}
+
+bool
+itty_feed_model_measure_best_single_final_layer_flip_for_node (itty_feed_model_t                    *model,
+                                                               itty_bit_string_list_t               *input,
+                                                               itty_bit_string_t                    *target,
+                                                               size_t                                node_index,
+                                                               bool                                 *found,
+                                                               itty_feed_model_mask_flip_trace_t    *trace,
+                                                               itty_feed_model_decoder_objective_t  *objective)
+{
+        size_t final_layer;
+        itty_bit_string_list_t *baseline_outputs = NULL;
+        itty_feed_model_decoder_objective_t current = { 0 };
+        itty_feed_model_decoder_objective_t best = { 0 };
+        bool have_best = false;
+
+        if (found)
+                *found = false;
+        if (trace)
+                *trace = (itty_feed_model_mask_flip_trace_t) { 0 };
+        if (objective)
+                *objective = (itty_feed_model_decoder_objective_t) { 0 };
+        if (!model || !input || !target || node_index >= model->nodes_per_layer)
+                return false;
+
+        final_layer = model->number_of_layers - 1;
+        baseline_outputs = itty_feed_model_run_outputs (model, input);
+        if (!baseline_outputs ||
+            !itty_feed_model_evaluate_decoder_objective_for_node (model,
+                                                                  baseline_outputs,
+                                                                  target,
+                                                                  node_index,
+                                                                  &current)) {
+                if (baseline_outputs)
+                        itty_bit_string_list_free (baseline_outputs);
+                return false;
+        }
+        itty_bit_string_list_free (baseline_outputs);
+
+        itty_bit_string_list_t *masks = model->masks_by_layer_node[final_layer][node_index];
+        for (size_t input_index = 0; input_index < masks->count; input_index++) {
+                itty_bit_string_t *mask = masks->bit_strings[input_index];
+                size_t bit_capacity = itty_bit_string_get_bit_capacity (mask);
+
+                for (size_t bit_index = 0; bit_index < bit_capacity; bit_index++) {
+                        itty_bit_string_list_t *outputs = NULL;
+                        itty_feed_model_decoder_objective_t candidate = { 0 };
+
+                        itty_feed_model_flip_mask_bit (mask, bit_index);
+                        outputs = itty_feed_model_run_outputs (model, input);
+                        if (outputs &&
+                            itty_feed_model_evaluate_decoder_objective_for_node (model,
+                                                                                 outputs,
+                                                                                 target,
+                                                                                 node_index,
+                                                                                 &candidate) &&
+                            itty_feed_model_decoder_objective_is_better (&candidate, &current) &&
+                            (!have_best ||
+                             itty_feed_model_decoder_objective_is_better (&candidate, &best))) {
+                                have_best = true;
+                                best = candidate;
+                                if (trace) {
+                                        *trace = (itty_feed_model_mask_flip_trace_t) {
+                                                .node_index = node_index,
+                                                .input_index = input_index,
+                                                .bit_index = bit_index,
+                                                .value_after = itty_bit_string_get_bit (mask, bit_index),
+                                        };
+                                }
+                        }
+                        if (outputs)
+                                itty_bit_string_list_free (outputs);
+                        itty_feed_model_flip_mask_bit (mask, bit_index);
+                }
+        }
+
+        if (found)
+                *found = have_best;
+        if (objective && have_best)
+                *objective = best;
+        return true;
+}
+
+bool
+itty_feed_model_measure_best_single_penultimate_layer_flip_for_node (itty_feed_model_t                    *model,
+                                                                     itty_bit_string_list_t               *input,
+                                                                     itty_bit_string_t                    *target,
+                                                                     size_t                                node_index,
+                                                                     bool                                 *found,
+                                                                     itty_feed_model_mask_flip_trace_t    *trace,
+                                                                     itty_feed_model_decoder_objective_t  *objective)
+{
+        size_t penultimate_layer;
+        itty_bit_string_list_t *baseline_outputs = NULL;
+        itty_feed_model_decoder_objective_t current = { 0 };
+        itty_feed_model_decoder_objective_t best = { 0 };
+        bool have_best = false;
+
+        if (found)
+                *found = false;
+        if (trace)
+                *trace = (itty_feed_model_mask_flip_trace_t) { 0 };
+        if (objective)
+                *objective = (itty_feed_model_decoder_objective_t) { 0 };
+        if (!model || !input || !target || model->number_of_layers < 2 || node_index >= model->nodes_per_layer)
+                return false;
+
+        penultimate_layer = model->number_of_layers - 2;
+        baseline_outputs = itty_feed_model_run_outputs (model, input);
+        if (!baseline_outputs ||
+            !itty_feed_model_evaluate_decoder_objective_for_node (model,
+                                                                  baseline_outputs,
+                                                                  target,
+                                                                  node_index,
+                                                                  &current)) {
+                if (baseline_outputs)
+                        itty_bit_string_list_free (baseline_outputs);
+                return false;
+        }
+        itty_bit_string_list_free (baseline_outputs);
+
+        itty_bit_string_list_t *masks = model->masks_by_layer_node[penultimate_layer][node_index];
+        for (size_t input_index = 0; input_index < masks->count; input_index++) {
+                itty_bit_string_t *mask = masks->bit_strings[input_index];
+                size_t bit_capacity = itty_bit_string_get_bit_capacity (mask);
+
+                for (size_t bit_index = 0; bit_index < bit_capacity; bit_index++) {
+                        itty_bit_string_list_t *outputs = NULL;
+                        itty_feed_model_decoder_objective_t candidate = { 0 };
+
+                        itty_feed_model_flip_mask_bit (mask, bit_index);
+                        outputs = itty_feed_model_run_outputs (model, input);
+                        if (outputs &&
+                            itty_feed_model_evaluate_decoder_objective_for_node (model,
+                                                                                 outputs,
+                                                                                 target,
+                                                                                 node_index,
+                                                                                 &candidate) &&
+                            itty_feed_model_decoder_objective_is_better (&candidate, &current) &&
+                            (!have_best ||
+                             itty_feed_model_decoder_objective_is_better (&candidate, &best))) {
+                                have_best = true;
+                                best = candidate;
+                                if (trace) {
+                                        *trace = (itty_feed_model_mask_flip_trace_t) {
+                                                .node_index = node_index,
+                                                .input_index = input_index,
+                                                .bit_index = bit_index,
+                                                .value_after = itty_bit_string_get_bit (mask, bit_index),
+                                        };
+                                }
+                        }
+                        if (outputs)
+                                itty_bit_string_list_free (outputs);
+                        itty_feed_model_flip_mask_bit (mask, bit_index);
+                }
+        }
+
+        if (found)
+                *found = have_best;
+        if (objective && have_best)
+                *objective = best;
+        return true;
+}
+
+bool
+itty_feed_model_apply_penultimate_layer_mask_flip_trace (itty_feed_model_t                       *model,
+                                                         itty_feed_model_mask_flip_trace_t const *trace)
+{
+        size_t penultimate_layer;
+        itty_bit_string_list_t *masks;
+        itty_bit_string_t *mask;
+
+        if (!model || !trace || model->number_of_layers < 2 || trace->node_index >= model->nodes_per_layer)
+                return false;
+
+        penultimate_layer = model->number_of_layers - 2;
+        masks = model->masks_by_layer_node[penultimate_layer][trace->node_index];
+        if (!masks || trace->input_index >= masks->count)
+                return false;
+
+        mask = masks->bit_strings[trace->input_index];
+        if (!mask || trace->bit_index >= itty_bit_string_get_bit_capacity (mask))
+                return false;
+
+        itty_feed_model_flip_mask_bit (mask, trace->bit_index);
+        return true;
+}
+
+bool
+itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (itty_feed_model_t                    *model,
+                                                                   itty_bit_string_list_t               *input,
+                                                                   itty_bit_string_t                    *target,
+                                                                   size_t                                node_index,
+                                                                   size_t                                min_bundle_size,
+                                                                   size_t                                max_bundle_size,
+                                                                   bool                                 *found,
+                                                                   itty_feed_model_mask_flip_trace_t    *traces,
+                                                                   size_t                                trace_capacity,
+                                                                   size_t                               *trace_count,
+                                                                   itty_feed_model_decoder_objective_t  *objective)
+{
+        size_t penultimate_layer;
+        itty_bit_string_list_t *baseline_outputs = NULL;
+        itty_feed_model_decoder_objective_t current = { 0 };
+        itty_feed_model_decoder_objective_t best = { 0 };
+        bool have_best = false;
+        size_t best_trace_count = 0;
+
+        if (found)
+                *found = false;
+        if (trace_count)
+                *trace_count = 0;
+        if (objective)
+                *objective = (itty_feed_model_decoder_objective_t) { 0 };
+        if (traces && trace_capacity > 0)
+                memset (traces, 0, trace_capacity * sizeof (*traces));
+        if (!model || !input || !target || model->number_of_layers < 2 || node_index >= model->nodes_per_layer)
+                return false;
+
+        penultimate_layer = model->number_of_layers - 2;
+        if (model->nodes_per_layer == 0 || model->nodes_per_layer > 63)
+                return false;
+        if (min_bundle_size == 0)
+                min_bundle_size = 1;
+        if (max_bundle_size == 0 || max_bundle_size > model->nodes_per_layer)
+                max_bundle_size = model->nodes_per_layer;
+        if (min_bundle_size > max_bundle_size || trace_capacity < max_bundle_size)
+                return false;
+
+        baseline_outputs = itty_feed_model_run_outputs (model, input);
+        if (!baseline_outputs ||
+            !itty_feed_model_evaluate_decoder_objective_for_node (model,
+                                                                  baseline_outputs,
+                                                                  target,
+                                                                  node_index,
+                                                                  &current)) {
+                if (baseline_outputs)
+                        itty_bit_string_list_free (baseline_outputs);
+                return false;
+        }
+        itty_bit_string_list_free (baseline_outputs);
+
+        size_t input_count = model->masks_by_layer_node[penultimate_layer][0]->count;
+        for (size_t input_index = 0; input_index < input_count; input_index++) {
+                size_t bit_capacity =
+                        itty_bit_string_get_bit_capacity (model->masks_by_layer_node[penultimate_layer][0]->bit_strings[input_index]);
+                uint64_t subset_limit = UINT64_C(1) << model->nodes_per_layer;
+
+                for (size_t bit_index = 0; bit_index < bit_capacity; bit_index++) {
+                        for (uint64_t subset = 1; subset < subset_limit; subset++) {
+                                size_t bundle_size = (size_t) __builtin_popcountll ((unsigned long long) subset);
+                                itty_bit_string_list_t *outputs = NULL;
+                                itty_feed_model_decoder_objective_t candidate = { 0 };
+
+                                if (bundle_size < min_bundle_size || bundle_size > max_bundle_size)
+                                        continue;
+
+                                for (size_t bundle_node = 0; bundle_node < model->nodes_per_layer; bundle_node++) {
+                                        if ((subset & (UINT64_C(1) << bundle_node)) == 0)
+                                                continue;
+                                        itty_feed_model_flip_mask_bit (model->masks_by_layer_node[penultimate_layer][bundle_node]->bit_strings[input_index],
+                                                                       bit_index);
+                                }
+
+                                outputs = itty_feed_model_run_outputs (model, input);
+                                if (outputs &&
+                                    itty_feed_model_evaluate_decoder_objective_for_node (model,
+                                                                                         outputs,
+                                                                                         target,
+                                                                                         node_index,
+                                                                                         &candidate) &&
+                                    itty_feed_model_decoder_objective_is_better (&candidate, &current) &&
+                                    (!have_best ||
+                                     itty_feed_model_decoder_objective_is_better (&candidate, &best))) {
+                                        size_t trace_index = 0;
+
+                                        have_best = true;
+                                        best = candidate;
+                                        best_trace_count = bundle_size;
+                                        if (traces) {
+                                                memset (traces, 0, trace_capacity * sizeof (*traces));
+                                                for (size_t bundle_node = 0; bundle_node < model->nodes_per_layer; bundle_node++) {
+                                                        if ((subset & (UINT64_C(1) << bundle_node)) == 0)
+                                                                continue;
+                                                        traces[trace_index++] = (itty_feed_model_mask_flip_trace_t) {
+                                                                .node_index = bundle_node,
+                                                                .input_index = input_index,
+                                                                .bit_index = bit_index,
+                                                                .value_after = itty_bit_string_get_bit (model->masks_by_layer_node[penultimate_layer][bundle_node]->bit_strings[input_index],
+                                                                                                       bit_index),
+                                                        };
+                                                }
+                                        }
+                                }
+                                if (outputs)
+                                        itty_bit_string_list_free (outputs);
+
+                                for (size_t bundle_node = 0; bundle_node < model->nodes_per_layer; bundle_node++) {
+                                        if ((subset & (UINT64_C(1) << bundle_node)) == 0)
+                                                continue;
+                                        itty_feed_model_flip_mask_bit (model->masks_by_layer_node[penultimate_layer][bundle_node]->bit_strings[input_index],
+                                                                       bit_index);
+                                }
+                        }
+                }
+        }
+
+        if (found)
+                *found = have_best;
+        if (trace_count)
+                *trace_count = best_trace_count;
+        if (objective && have_best)
+                *objective = best;
+        return true;
 }
 
 static bool
@@ -9254,7 +10858,6 @@ itty_feed_model_train_final_layer_selector_protection_for_node_internal (itty_fe
 
                         itty_bit_string_set_bit (oracle_target, bit_index, desired_value);
                         oracle_target->pop_count_computed = false;
-                        oracle_target->bit_length_computed = false;
 
                         bool trained =
                                 itty_feed_model_train_layer_one_node (model->masks_by_layer_node[final_layer][candidate_route],
@@ -9510,6 +11113,35 @@ itty_feed_model_restore_final_layer_state_snapshot (itty_feed_model_t           
                 return;
 
         itty_feed_model_restore_layer_state_snapshot (model, model->number_of_layers - 1, snapshot);
+}
+
+itty_feed_model_layer_state_snapshot_t *
+itty_feed_model_snapshot_penultimate_layer_state (itty_feed_model_t *model)
+{
+        if (!model || model->number_of_layers < 2)
+                return NULL;
+
+        return itty_feed_model_snapshot_layer_state (model, model->number_of_layers - 2);
+}
+
+void
+itty_feed_model_restore_penultimate_layer_state_snapshot (itty_feed_model_t                      *model,
+                                                          itty_feed_model_layer_state_snapshot_t *snapshot)
+{
+        if (!model || !snapshot || model->number_of_layers < 2)
+                return;
+
+        itty_feed_model_restore_layer_state_snapshot (model, model->number_of_layers - 2, snapshot);
+}
+
+void
+itty_feed_model_free_penultimate_layer_state_snapshot (itty_feed_model_t                      *model,
+                                                       itty_feed_model_layer_state_snapshot_t *snapshot)
+{
+        if (!model || !snapshot || model->number_of_layers < 2)
+                return;
+
+        itty_feed_model_free_layer_state_snapshot (model, snapshot);
 }
 
 void
@@ -10156,9 +11788,7 @@ itty_feed_model_train_penultimate_layer_with_final_repairs (itty_feed_model_t   
                                                  assignment->value);
 
                         output_cares[assignment->layer_node]->pop_count_computed = false;
-                        output_cares[assignment->layer_node]->bit_length_computed = false;
                         output_targets[assignment->layer_node]->pop_count_computed = false;
-                        output_targets[assignment->layer_node]->bit_length_computed = false;
                 }
 
                 for (size_t assignment_index = 0; assignment_index < candidate->condensed_assignments.count; assignment_index++) {
@@ -10188,9 +11818,7 @@ itty_feed_model_train_penultimate_layer_with_final_repairs (itty_feed_model_t   
                                                  assignment->value);
 
                         care_bits->pop_count_computed = false;
-                        care_bits->bit_length_computed = false;
                         condensed_targets[assignment->layer_node]->pop_count_computed = false;
-                        condensed_targets[assignment->layer_node]->bit_length_computed = false;
                 }
 
                 if (candidate->use_residual) {
@@ -10235,9 +11863,7 @@ itty_feed_model_train_penultimate_layer_with_final_repairs (itty_feed_model_t   
                                                  structural_bit);
                 }
                 structural_output_cares[node_index]->pop_count_computed = false;
-                structural_output_cares[node_index]->bit_length_computed = false;
                 structural_output_targets[node_index]->pop_count_computed = false;
-                structural_output_targets[node_index]->bit_length_computed = false;
                 itty_bit_string_free (candidate_output);
         }
 
@@ -10953,6 +12579,32 @@ itty_feed_model_restore_layer_state_snapshot (itty_feed_model_t                 
         free (snapshot);
 }
 
+static void
+itty_feed_model_set_mask_trace_value (itty_feed_model_t const                 *model,
+                                      itty_bit_string_list_t                  *masks,
+                                      itty_feed_model_mask_flip_trace_t const *trace)
+{
+        itty_bit_string_t *mask;
+        size_t *words;
+        size_t word_index;
+        size_t bit_offset;
+        size_t bit_capacity;
+
+        mask = itty_bit_string_list_fetch (masks, trace->input_index);
+        words = itty_bit_string_get_words (mask);
+        word_index = trace->bit_index / ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+        bit_offset = trace->bit_index % ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+        bit_capacity = itty_bit_string_get_bit_capacity (mask);
+
+        if (!mask || !words || trace->node_index >= model->nodes_per_layer || trace->bit_index >= bit_capacity)
+                return;
+
+        if (trace->value_after)
+                words[word_index] |= ((size_t) 1) << bit_offset;
+        else
+                words[word_index] &= ~(((size_t) 1) << bit_offset);
+}
+
 static size_t
 itty_feed_model_collect_layer_mask_flip_traces (itty_feed_model_t                            *model,
                                                 size_t                                        layer_index,
@@ -10990,6 +12642,97 @@ itty_feed_model_collect_layer_mask_flip_traces (itty_feed_model_t               
         }
 
         return trace_count;
+}
+
+size_t
+itty_feed_model_collect_final_layer_mask_flip_traces (itty_feed_model_t                            *model,
+                                                      itty_feed_model_layer_state_snapshot_t const *before_snapshot,
+                                                      itty_feed_model_mask_flip_trace_t            *traces,
+                                                      size_t                                        trace_limit)
+{
+        if (!model || !before_snapshot || !traces || trace_limit == 0 || model->number_of_layers == 0)
+                return 0;
+
+        return itty_feed_model_collect_layer_mask_flip_traces (model,
+                                                               model->number_of_layers - 1,
+                                                               before_snapshot,
+                                                               traces,
+                                                               trace_limit);
+}
+
+size_t
+itty_feed_model_collect_final_layer_toggle_traces_for_nodes (itty_feed_model_t                 *model,
+                                                             size_t const                      *node_indices,
+                                                             size_t                             node_count,
+                                                             itty_feed_model_mask_flip_trace_t *traces,
+                                                             size_t                             trace_limit)
+{
+        size_t trace_count = 0;
+        size_t final_layer_index;
+
+        if (!model || !node_indices || !traces || trace_limit == 0 || model->number_of_layers == 0)
+                return 0;
+
+        final_layer_index = model->number_of_layers - 1;
+        for (size_t node_pos = 0; node_pos < node_count; node_pos++) {
+                size_t node_index = node_indices[node_pos];
+
+                if (node_index >= model->nodes_per_layer)
+                        continue;
+
+                for (size_t input_index = 0; input_index < model->inputs_per_node; input_index++) {
+                        itty_bit_string_t *mask =
+                                itty_bit_string_list_fetch (model->masks_by_layer_node[final_layer_index][node_index],
+                                                            input_index);
+                        size_t *words = mask ? itty_bit_string_get_words (mask) : NULL;
+                        size_t bit_capacity = mask ? itty_bit_string_get_bit_capacity (mask) : 0;
+
+                        if (!mask || !words)
+                                continue;
+
+                        for (size_t bit_index = 0; bit_index < bit_capacity; bit_index++) {
+                                size_t word_index = bit_index / ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+                                size_t bit_offset = bit_index % ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+                                bool current_value = (words[word_index] & (((size_t) 1) << bit_offset)) != 0;
+
+                                if (trace_count >= trace_limit)
+                                        return trace_count;
+
+                                traces[trace_count++] = (itty_feed_model_mask_flip_trace_t) {
+                                        .node_index = node_index,
+                                        .input_index = input_index,
+                                        .bit_index = bit_index,
+                                        .value_after = !current_value,
+                                };
+                        }
+                }
+        }
+
+        return trace_count;
+}
+
+bool
+itty_feed_model_apply_final_layer_mask_flip_traces (itty_feed_model_t                       *model,
+                                                    itty_feed_model_mask_flip_trace_t const *traces,
+                                                    size_t                                   trace_count)
+{
+        size_t final_layer_index;
+
+        if (!model || !traces || trace_count == 0 || model->number_of_layers == 0)
+                return false;
+
+        final_layer_index = model->number_of_layers - 1;
+        for (size_t trace_index = 0; trace_index < trace_count; trace_index++) {
+                if (traces[trace_index].node_index >= model->nodes_per_layer ||
+                    traces[trace_index].input_index >= model->inputs_per_node)
+                        return false;
+
+                itty_feed_model_set_mask_trace_value (model,
+                                                      model->masks_by_layer_node[final_layer_index][traces[trace_index].node_index],
+                                                      &traces[trace_index]);
+        }
+
+        return true;
 }
 
 static size_t
@@ -11081,6 +12824,317 @@ itty_feed_model_count_selected_segment_votes (itty_bit_string_list_t *outputs,
         }
 
         return ones;
+}
+
+bool
+itty_feed_model_measure_segment_vote_profile_for_node (itty_feed_model_t                      *model,
+                                                       itty_bit_string_list_t                 *input,
+                                                       itty_bit_string_t                      *target,
+                                                       size_t                                  selected_node,
+                                                       itty_feed_model_segment_vote_profile_t *profile)
+{
+        if (!model ||
+            !input ||
+            !target ||
+            !profile ||
+            model->number_of_layers == 0 ||
+            itty_bit_string_list_get_length (input) != model->inputs_per_node ||
+            itty_bit_string_get_number_of_words (target) > model->vocabulary_words)
+                return false;
+
+        *profile = (itty_feed_model_segment_vote_profile_t) { 0 };
+
+        itty_bit_string_list_t *outputs = itty_feed_model_run_to_layer_input (model,
+                                                                              input,
+                                                                              model->number_of_layers);
+        if (!outputs || selected_node >= outputs->count) {
+                if (outputs)
+                        itty_bit_string_list_free (outputs);
+                return false;
+        }
+
+        itty_bit_string_t *activation = itty_bit_string_list_fetch (outputs, selected_node);
+        size_t output_bit_capacity = itty_bit_string_get_bit_capacity (activation);
+        size_t target_bit_capacity = itty_bit_string_get_bit_capacity (target);
+        size_t segments_per_bit = target_bit_capacity == 0 ? 0 : output_bit_capacity / target_bit_capacity;
+        size_t threshold = segments_per_bit / 2 + 1;
+
+        profile->node_index = selected_node;
+        profile->target_bit_capacity = target_bit_capacity;
+        profile->segments_per_bit = segments_per_bit;
+        profile->threshold = threshold;
+
+        for (size_t decoded_bit = 0; decoded_bit < target_bit_capacity; decoded_bit++) {
+                size_t ones = itty_feed_model_count_selected_segment_votes (outputs,
+                                                                            selected_node,
+                                                                            decoded_bit,
+                                                                            target_bit_capacity);
+                size_t bucket = ones < ITTY_FEED_MODEL_SEGMENT_VOTE_PROFILE_LIMIT ?
+                                ones :
+                                ITTY_FEED_MODEL_SEGMENT_VOTE_PROFILE_LIMIT - 1;
+                bool target_bit = itty_bit_string_get_bit (target, decoded_bit);
+                bool decoded_one = ones >= threshold;
+                size_t deficit = target_bit && !decoded_one ? threshold - ones : 0;
+                size_t excess = !target_bit && decoded_one ? ones - (threshold - 1) : 0;
+                size_t aligned_levels = target_bit ? ones : (segments_per_bit >= ones ? segments_per_bit - ones : 0);
+                size_t opposed_levels = target_bit ? (segments_per_bit >= ones ? segments_per_bit - ones : 0) : ones;
+                ptrdiff_t signed_momentum = (ptrdiff_t) aligned_levels - (ptrdiff_t) opposed_levels;
+                ptrdiff_t frontier_margin = target_bit ?
+                                            (ptrdiff_t) ones - (ptrdiff_t) threshold + 1 :
+                                            (ptrdiff_t) (threshold == 0 ? 0 : threshold - 1) - (ptrdiff_t) ones;
+
+                profile->vote_histogram[bucket]++;
+                profile->target_aligned_threshold_crossings += aligned_levels;
+                profile->target_opposed_threshold_crossings += opposed_levels;
+                profile->net_threshold_momentum += signed_momentum;
+                profile->frontier_margin_sum += frontier_margin;
+
+                if (excess > 0) {
+                        profile->false_positive_bits++;
+                        profile->false_positive_vote_histogram[bucket]++;
+                        if (excess == 1)
+                                profile->near_threshold_false_positive_bits++;
+                        else
+                                profile->confident_false_positive_bits++;
+                }
+                if (deficit > 0) {
+                        profile->false_negative_bits++;
+                        profile->false_negative_vote_histogram[bucket]++;
+                        if (deficit == 1)
+                                profile->near_threshold_false_negative_bits++;
+                        else
+                                profile->confident_false_negative_bits++;
+                }
+                if (deficit > 0 || excess > 0) {
+                        profile->wrong_bit_net_threshold_momentum += signed_momentum;
+                        profile->wrong_bit_frontier_margin_sum += frontier_margin;
+                }
+                if ((deficit > 0 || excess > 0) &&
+                    profile->trace_count < ITTY_FEED_MODEL_SEGMENT_VOTE_TRACE_LIMIT) {
+                        profile->traces[profile->trace_count++] =
+                                (itty_feed_model_segment_vote_trace_t) {
+                                        .decoded_bit = decoded_bit,
+                                        .target_bit = target_bit,
+                                        .ones = ones,
+                                        .threshold = threshold,
+                                        .max_zero = threshold == 0 ? 0 : threshold - 1,
+                                        .deficit = deficit,
+                                        .excess = excess,
+                                        .target_aligned_levels = aligned_levels,
+                                        .target_opposed_levels = opposed_levels,
+                                        .signed_momentum = signed_momentum,
+                                        .frontier_margin = frontier_margin,
+                                };
+                }
+        }
+
+        itty_bit_string_list_free (outputs);
+        return true;
+}
+
+bool
+itty_feed_model_measure_node_condense_vote_histogram (itty_feed_model_t      *model,
+                                                      itty_bit_string_list_t *input,
+                                                      size_t                  layer_index,
+                                                      size_t                  node_index,
+                                                      size_t                 *histogram,
+                                                      size_t                  histogram_count,
+                                                      size_t                 *bit_count)
+{
+        if (!model ||
+            !input ||
+            !histogram ||
+            histogram_count == 0 ||
+            layer_index >= model->number_of_layers ||
+            node_index >= model->nodes_per_layer ||
+            itty_bit_string_list_get_length (input) != model->inputs_per_node)
+                return false;
+
+        memset (histogram, 0, histogram_count * sizeof *histogram);
+        if (bit_count)
+                *bit_count = 0;
+
+        itty_bit_string_list_t *layer_input = itty_feed_model_run_to_layer_input (model,
+                                                                                  input,
+                                                                                  layer_index);
+        if (!layer_input)
+                return false;
+
+        itty_bit_string_list_t *modulated_inputs =
+                itty_bit_string_list_exclusive_or (layer_input,
+                                                  model->masks_by_layer_node[layer_index][node_index]);
+        if (layer_input != input)
+                itty_bit_string_list_free (layer_input);
+        if (!modulated_inputs)
+                return false;
+
+        size_t bit_length = itty_bit_string_list_get_bit_length (modulated_inputs);
+        size_t vote_count = modulated_inputs->count;
+
+        for (size_t bit_index = 0; bit_index < bit_length; bit_index++) {
+                size_t one_votes = 0;
+                size_t bucket = 0;
+
+                for (size_t input_index = 0; input_index < vote_count; input_index++) {
+                        if (itty_bit_string_get_bit (modulated_inputs->bit_strings[input_index], bit_index))
+                                one_votes++;
+                }
+
+                bucket = one_votes < histogram_count ? one_votes : histogram_count - 1;
+                histogram[bucket]++;
+                if (bit_count)
+                        (*bit_count)++;
+        }
+
+        itty_bit_string_list_free (modulated_inputs);
+        return true;
+}
+
+bool
+itty_feed_model_measure_node_condensed_output (itty_feed_model_t      *model,
+                                               itty_bit_string_list_t *input,
+                                               size_t                  layer_index,
+                                               size_t                  node_index,
+                                               itty_bit_string_t     **condensed_output)
+{
+        if (!model ||
+            !input ||
+            !condensed_output ||
+            layer_index >= model->number_of_layers ||
+            node_index >= model->nodes_per_layer ||
+            itty_bit_string_list_get_length (input) != model->inputs_per_node)
+                return false;
+
+        *condensed_output = NULL;
+
+        itty_bit_string_list_t *layer_input = itty_feed_model_run_to_layer_input (model,
+                                                                                  input,
+                                                                                  layer_index);
+        if (!layer_input)
+                return false;
+
+        itty_bit_string_t *condensed =
+                itty_feed_model_run_node_condensed_with_threshold (layer_input,
+                                                                   model->masks_by_layer_node[layer_index][node_index],
+                                                                   model->within_node_condense_threshold_override);
+        if (layer_input != input)
+                itty_bit_string_list_free (layer_input);
+        if (!condensed)
+                return false;
+
+        *condensed_output = condensed;
+        return true;
+}
+
+bool
+itty_feed_model_measure_node_activation_output (itty_feed_model_t      *model,
+                                                itty_bit_string_list_t *input,
+                                                size_t                  node_index,
+                                                itty_bit_string_t     **activation_output)
+{
+        if (!model ||
+            !input ||
+            !activation_output ||
+            node_index >= model->nodes_per_layer ||
+            itty_bit_string_list_get_length (input) != model->inputs_per_node)
+                return false;
+
+        *activation_output = NULL;
+
+        itty_bit_string_list_t *outputs = itty_feed_model_run_outputs (model, input);
+        if (!outputs)
+                return false;
+
+        itty_bit_string_t *activation = itty_bit_string_clone (itty_bit_string_list_fetch (outputs,
+                                                                                           node_index));
+        itty_bit_string_list_free (outputs);
+        if (!activation)
+                return false;
+
+        *activation_output = activation;
+        return true;
+}
+
+bool
+itty_feed_model_measure_selected_folded_output (itty_feed_model_t      *model,
+                                                itty_bit_string_list_t *input,
+                                                itty_bit_string_t      *target,
+                                                size_t                 *selected_node,
+                                                itty_bit_string_t     **folded_output)
+{
+        if (!model ||
+            !input ||
+            !target ||
+            !selected_node ||
+            !folded_output ||
+            itty_bit_string_list_get_length (input) != model->inputs_per_node ||
+            itty_bit_string_get_number_of_words (target) > model->vocabulary_words)
+                return false;
+
+        *folded_output = NULL;
+        *selected_node = 0;
+
+        itty_bit_string_list_t *outputs = itty_feed_model_run_to_layer_input (model,
+                                                                              input,
+                                                                              model->number_of_layers);
+        if (!outputs)
+                return false;
+
+        itty_feed_model_output_evaluation_t evaluation = { 0 };
+        bool ok = itty_feed_model_evaluate_output (model,
+                                                   outputs,
+                                                   target,
+                                                   &evaluation);
+        itty_bit_string_list_free (outputs);
+        if (!ok)
+                return false;
+
+        *selected_node = evaluation.selected_index;
+        *folded_output = evaluation.folded_activation;
+        return true;
+}
+
+bool
+itty_feed_model_measure_node_folded_output (itty_feed_model_t      *model,
+                                            itty_bit_string_list_t *input,
+                                            itty_bit_string_t      *target,
+                                            size_t                  node_index,
+                                            itty_bit_string_t     **folded_output)
+{
+        if (!model ||
+            !input ||
+            !target ||
+            !folded_output ||
+            itty_bit_string_list_get_length (input) != model->inputs_per_node ||
+            itty_bit_string_get_number_of_words (target) > model->vocabulary_words)
+                return false;
+
+        *folded_output = NULL;
+
+        itty_bit_string_list_t *outputs = itty_feed_model_run_to_layer_input (model,
+                                                                              input,
+                                                                              model->number_of_layers);
+        if (!outputs || node_index >= outputs->count) {
+                if (outputs)
+                        itty_bit_string_list_free (outputs);
+                return false;
+        }
+
+        itty_bit_string_t *activation = itty_bit_string_list_fetch (outputs, node_index);
+        itty_bit_string_t *folded = NULL;
+        bool ok = itty_feed_model_fold_activation_to_target_width (model,
+                                                                   activation,
+                                                                   target,
+                                                                   node_index,
+                                                                   &folded);
+        itty_bit_string_list_free (outputs);
+        if (!ok)
+                return false;
+
+        *folded_output = folded == activation ?
+                         itty_feed_model_bit_string_clone (folded) :
+                         folded;
+        return *folded_output != NULL;
 }
 
 static size_t

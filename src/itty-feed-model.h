@@ -12,6 +12,8 @@ typedef struct itty_feed_model_layer_state_snapshot_t itty_feed_model_layer_stat
 
 #define ITTY_FEED_MODEL_DECODER_HISTOGRAM_BUCKETS 9
 #define ITTY_FEED_MODEL_DECODER_HISTOGRAM_OVERFLOW_BUCKET (ITTY_FEED_MODEL_DECODER_HISTOGRAM_BUCKETS - 1)
+#define ITTY_FEED_MODEL_SEGMENT_VOTE_PROFILE_LIMIT 65
+#define ITTY_FEED_MODEL_SEGMENT_VOTE_TRACE_LIMIT 16
 
 typedef enum {
         ITTY_FEED_MODEL_TRAIN_BUDGET_POLICY_LARGEST_ERROR_FIRST,
@@ -25,6 +27,10 @@ typedef enum {
 typedef enum {
         ITTY_FEED_MODEL_DECODER_REPEATED_AND_FOLD,
         ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE,
+        ITTY_FEED_MODEL_DECODER_SEGMENT_WEIGHTED_CONDENSE,
+        ITTY_FEED_MODEL_DECODER_DIRECT_DUPLICATED_TARGET,
+        ITTY_FEED_MODEL_DECODER_DIRECT_PADDED_TARGET,
+        ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET,
 } itty_feed_model_decoder_t;
 
 typedef enum {
@@ -166,6 +172,44 @@ typedef struct {
 } itty_feed_model_decoder_objective_t;
 
 typedef struct {
+        size_t decoded_bit;
+        bool   target_bit;
+        size_t ones;
+        size_t threshold;
+        size_t max_zero;
+        size_t deficit;
+        size_t excess;
+        size_t target_aligned_levels;
+        size_t target_opposed_levels;
+        ptrdiff_t signed_momentum;
+        ptrdiff_t frontier_margin;
+} itty_feed_model_segment_vote_trace_t;
+
+typedef struct {
+        size_t node_index;
+        size_t target_bit_capacity;
+        size_t segments_per_bit;
+        size_t threshold;
+        size_t false_positive_bits;
+        size_t false_negative_bits;
+        size_t near_threshold_false_positive_bits;
+        size_t near_threshold_false_negative_bits;
+        size_t confident_false_positive_bits;
+        size_t confident_false_negative_bits;
+        size_t target_aligned_threshold_crossings;
+        size_t target_opposed_threshold_crossings;
+        ptrdiff_t net_threshold_momentum;
+        ptrdiff_t wrong_bit_net_threshold_momentum;
+        ptrdiff_t frontier_margin_sum;
+        ptrdiff_t wrong_bit_frontier_margin_sum;
+        size_t vote_histogram[ITTY_FEED_MODEL_SEGMENT_VOTE_PROFILE_LIMIT];
+        size_t false_positive_vote_histogram[ITTY_FEED_MODEL_SEGMENT_VOTE_PROFILE_LIMIT];
+        size_t false_negative_vote_histogram[ITTY_FEED_MODEL_SEGMENT_VOTE_PROFILE_LIMIT];
+        size_t trace_count;
+        itty_feed_model_segment_vote_trace_t traces[ITTY_FEED_MODEL_SEGMENT_VOTE_TRACE_LIMIT];
+} itty_feed_model_segment_vote_profile_t;
+
+typedef struct {
         size_t selected_by_popcount;
         size_t selected_popcount;
         size_t best_by_target_distance;
@@ -289,10 +333,18 @@ typedef struct {
         size_t actual_final_condensed_ones_after;
         size_t actual_final_segment_ones_before;
         size_t actual_final_segment_ones_after;
+        size_t forced_node_false_negative_deficit_before;
         size_t forced_node_distance_before;
+        size_t forced_node_false_negative_deficit_after;
         size_t forced_node_distance_after;
         size_t forced_node_false_positive_excess_before;
         size_t forced_node_false_positive_excess_after;
+        size_t selected_node_false_negative_deficit_after;
+        size_t selected_node_distance_after;
+        size_t selected_node_false_positive_excess_after;
+        size_t replay_example_false_negative_deficit_after;
+        size_t replay_example_distance_after;
+        size_t replay_example_false_positive_excess_after;
         bool   decoded_before;
         bool   decoded_after;
         itty_feed_model_restore_propagation_failure_t propagation_failure;
@@ -1022,6 +1074,22 @@ void itty_feed_model_set_layer_rotation (itty_feed_model_t *model,
                                          size_t             rotation);
 void itty_feed_model_set_decoder (itty_feed_model_t        *model,
                                   itty_feed_model_decoder_t decoder);
+void itty_feed_model_set_within_node_condense_threshold_override (itty_feed_model_t *model,
+                                                                  size_t             threshold);
+void itty_feed_model_set_residual_merge_enabled (itty_feed_model_t *model,
+                                                 bool               enabled);
+void itty_feed_model_set_input_route_adapter_enabled (itty_feed_model_t *model,
+                                                      bool               enabled);
+void itty_feed_model_set_gray_offset_override (itty_feed_model_t *model,
+                                               size_t             route_index,
+                                               bool               enabled,
+                                               size_t             payload_start);
+bool itty_feed_model_train_input_route_adapter (itty_feed_model_t                     *model,
+                                                itty_bit_string_list_t                *input,
+                                                itty_bit_string_t                     *target,
+                                                size_t                                 route_index,
+                                                itty_feed_model_train_options_t const *options,
+                                                itty_feed_model_train_stats_t         *stats);
 bool itty_feed_model_randomize_masks (itty_feed_model_t *model,
                                       size_t             seed,
                                       size_t             numerator,
@@ -1068,6 +1136,37 @@ bool itty_feed_model_measure_decoder_objective_for_node (itty_feed_model_t      
                                                          itty_bit_string_t                    *target,
                                                          size_t                                selected_node,
                                                          itty_feed_model_decoder_objective_t  *objective);
+bool itty_feed_model_measure_segment_vote_profile_for_node (itty_feed_model_t                      *model,
+                                                            itty_bit_string_list_t                 *input,
+                                                            itty_bit_string_t                      *target,
+                                                            size_t                                  selected_node,
+                                                            itty_feed_model_segment_vote_profile_t *profile);
+bool itty_feed_model_measure_node_condense_vote_histogram (itty_feed_model_t      *model,
+                                                           itty_bit_string_list_t *input,
+                                                           size_t                  layer_index,
+                                                           size_t                  node_index,
+                                                           size_t                 *histogram,
+                                                           size_t                  histogram_count,
+                                                           size_t                 *bit_count);
+bool itty_feed_model_measure_node_condensed_output (itty_feed_model_t      *model,
+                                                    itty_bit_string_list_t *input,
+                                                    size_t                  layer_index,
+                                                    size_t                  node_index,
+                                                    itty_bit_string_t     **condensed_output);
+bool itty_feed_model_measure_node_activation_output (itty_feed_model_t      *model,
+                                                     itty_bit_string_list_t *input,
+                                                     size_t                  node_index,
+                                                     itty_bit_string_t     **activation_output);
+bool itty_feed_model_measure_selected_folded_output (itty_feed_model_t      *model,
+                                                     itty_bit_string_list_t *input,
+                                                     itty_bit_string_t      *target,
+                                                     size_t                 *selected_node,
+                                                     itty_bit_string_t     **folded_output);
+bool itty_feed_model_measure_node_folded_output (itty_feed_model_t      *model,
+                                                 itty_bit_string_list_t *input,
+                                                 itty_bit_string_t      *target,
+                                                 size_t                  node_index,
+                                                 itty_bit_string_t     **folded_output);
 bool itty_feed_model_measure_decoder_objective_for_node_with_lane_split (itty_feed_model_t                    *model,
                                                                          itty_bit_string_list_t               *input,
                                                                          itty_bit_string_t                    *target,
@@ -1135,12 +1234,119 @@ bool itty_feed_model_train_final_layer_transaction_scaffold (itty_feed_model_t  
                                                              itty_feed_model_transaction_scaffold_round_t    *trajectory,
                                                              size_t                                            trajectory_count,
                                                              itty_feed_model_transaction_scaffold_summary_t  *summary);
+typedef enum {
+        ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+        ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY,
+        ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY,
+} itty_feed_model_final_repair_mode_t;
+
+typedef struct {
+        itty_feed_model_final_repair_mode_t chosen_mode;
+        size_t candidate_count;
+        size_t accepted_candidates;
+} itty_feed_model_final_repair_mode_summary_t;
+
+typedef struct {
+        size_t                             selected_node_before;
+        size_t                             selected_node_after;
+        size_t                             selection_margin_after;
+        size_t                             clear_vote_count;
+        size_t                             total_flips;
+        size_t                             compare_node_a;
+        size_t                             compare_node_b;
+        size_t                             compare_node_a_popcount_before;
+        size_t                             compare_node_b_popcount_before;
+        size_t                             compare_node_a_popcount_after;
+        size_t                             compare_node_b_popcount_after;
+        bool                               changed;
+        itty_feed_model_decoder_objective_t selected_objective_after;
+} itty_feed_model_selected_clear_set_summary_t;
+
+typedef struct {
+        size_t node_index;
+        size_t input_index;
+        size_t bit_index;
+        bool   value_after;
+} itty_feed_model_mask_flip_trace_t;
+
+bool itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (itty_feed_model_t                                  *model,
+                                                                         itty_bit_string_list_t                             *input,
+                                                                         itty_bit_string_t                                  *target,
+                                                                         size_t                                              node_index,
+                                                                         itty_feed_model_train_options_t const              *options,
+                                                                         itty_feed_model_final_repair_mode_t                 mode,
+                                                                         itty_feed_model_train_stats_t                      *stats,
+                                                                         itty_feed_model_final_repair_mode_summary_t        *summary);
 bool itty_feed_model_train_final_layer_with_suffix_oracle_for_node (itty_feed_model_t                     *model,
                                                                     itty_bit_string_list_t                *input,
                                                                     itty_bit_string_t                     *target,
                                                                     size_t                                 node_index,
                                                                     itty_feed_model_train_options_t const *options,
                                                                     itty_feed_model_train_stats_t         *stats);
+bool itty_feed_model_measure_best_single_final_layer_flip_for_node (itty_feed_model_t                    *model,
+                                                                    itty_bit_string_list_t               *input,
+                                                                    itty_bit_string_t                    *target,
+                                                                    size_t                                node_index,
+                                                                    bool                                 *found,
+                                                                    itty_feed_model_mask_flip_trace_t    *trace,
+                                                                    itty_feed_model_decoder_objective_t  *objective);
+bool itty_feed_model_measure_best_single_penultimate_layer_flip_for_node (itty_feed_model_t                    *model,
+                                                                          itty_bit_string_list_t               *input,
+                                                                          itty_bit_string_t                    *target,
+                                                                          size_t                                node_index,
+                                                                          bool                                 *found,
+                                                                          itty_feed_model_mask_flip_trace_t    *trace,
+                                                                          itty_feed_model_decoder_objective_t  *objective);
+bool itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (itty_feed_model_t                    *model,
+                                                                        itty_bit_string_list_t               *input,
+                                                                        itty_bit_string_t                    *target,
+                                                                        size_t                                node_index,
+                                                                        size_t                                min_bundle_size,
+                                                                        size_t                                max_bundle_size,
+                                                                        bool                                 *found,
+                                                                        itty_feed_model_mask_flip_trace_t    *traces,
+                                                                        size_t                                trace_capacity,
+                                                                        size_t                               *trace_count,
+                                                                        itty_feed_model_decoder_objective_t  *objective);
+bool itty_feed_model_apply_penultimate_layer_mask_flip_trace (itty_feed_model_t                       *model,
+                                                              itty_feed_model_mask_flip_trace_t const *trace);
+bool itty_feed_model_measure_selected_node_direct_clear_set (itty_feed_model_t                                *model,
+                                                             itty_bit_string_list_t                           *input,
+                                                             itty_bit_string_t                                *target,
+                                                             size_t const                                     *decoded_bits,
+                                                             size_t                                            decoded_bit_count,
+                                                             size_t                                            compare_node_a,
+                                                             size_t                                            compare_node_b,
+                                                             itty_feed_model_selected_clear_set_summary_t    *summary);
+bool itty_feed_model_measure_selected_node_direct_condensed_clear_set (itty_feed_model_t                                *model,
+                                                                       itty_bit_string_list_t                           *input,
+                                                                       itty_bit_string_t                                *target,
+                                                                       size_t const                                     *decoded_bits,
+                                                                       size_t                                            decoded_bit_count,
+                                                                       size_t                                            compare_node_a,
+                                                                       size_t                                            compare_node_b,
+                                                                       itty_feed_model_selected_clear_set_summary_t    *summary);
+bool itty_feed_model_train_selected_node_direct_clear_set (itty_feed_model_t                                *model,
+                                                           itty_bit_string_list_t                           *input,
+                                                           itty_bit_string_t                                *target,
+                                                           size_t const                                     *decoded_bits,
+                                                           size_t                                            decoded_bit_count,
+                                                           size_t                                            compare_node_a,
+                                                           size_t                                            compare_node_b,
+                                                           itty_feed_model_train_options_t const            *options,
+                                                           itty_feed_model_selected_clear_set_summary_t    *summary);
+size_t itty_feed_model_collect_final_layer_mask_flip_traces (itty_feed_model_t                            *model,
+                                                             itty_feed_model_layer_state_snapshot_t const *before_snapshot,
+                                                             itty_feed_model_mask_flip_trace_t            *traces,
+                                                             size_t                                        trace_limit);
+size_t itty_feed_model_collect_final_layer_toggle_traces_for_nodes (itty_feed_model_t                     *model,
+                                                                    size_t const                          *node_indices,
+                                                                    size_t                                 node_count,
+                                                                    itty_feed_model_mask_flip_trace_t     *traces,
+                                                                    size_t                                 trace_limit);
+bool itty_feed_model_apply_final_layer_mask_flip_traces (itty_feed_model_t                          *model,
+                                                         itty_feed_model_mask_flip_trace_t const    *traces,
+                                                         size_t                                      trace_count);
 bool itty_feed_model_train_final_layer_selector_protection_for_node (itty_feed_model_t                                  *model,
                                                                      itty_bit_string_list_t                             *input,
                                                                      itty_bit_string_t                                  *target,
@@ -1180,6 +1386,11 @@ bool itty_feed_model_measure_final_layer_selector_margin_for_node (itty_feed_mod
 itty_feed_model_layer_state_snapshot_t *itty_feed_model_snapshot_final_layer_state (itty_feed_model_t *model);
 void itty_feed_model_restore_final_layer_state_snapshot (itty_feed_model_t                      *model,
                                                          itty_feed_model_layer_state_snapshot_t *snapshot);
+itty_feed_model_layer_state_snapshot_t *itty_feed_model_snapshot_penultimate_layer_state (itty_feed_model_t *model);
+void itty_feed_model_restore_penultimate_layer_state_snapshot (itty_feed_model_t                      *model,
+                                                               itty_feed_model_layer_state_snapshot_t *snapshot);
+void itty_feed_model_free_penultimate_layer_state_snapshot (itty_feed_model_t                      *model,
+                                                            itty_feed_model_layer_state_snapshot_t *snapshot);
 void itty_feed_model_free_final_layer_state_snapshot (itty_feed_model_t                      *model,
                                                       itty_feed_model_layer_state_snapshot_t *snapshot);
 

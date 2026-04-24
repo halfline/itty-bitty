@@ -5228,22 +5228,56 @@ The next stress test kept the same route-key selector setup and introduced a
 third example `C` with its own probe and target, while keeping the `A/B`
 decoder state and route assignments fixed.
 
-Focused `A/B/C` result:
+The first one-off `C` case only proved route allocation. That was then refined
+into a focused `C` candidate sweep:
+
+```text
+1. keep A route 2 and B route 0 fixed
+2. generate several candidate C probe/target pairs
+3. measure every unused route
+4. trial-train C under a final-layer snapshot
+5. pick the route/target pair with realized C improvement
+```
+
+The useful candidates were:
+
+```text
+dense
+sparse
+mixed
+complement-like
+```
+
+For the focused `8-sparse-none` route-key case, the sweep found:
+
+```text
+best C candidate:
+        label = dense
+        route = 5
+
+before training:
+        distance = 3
+        deficit  = 5
+        excess   = 0
+        gap      = 31
+
+trial result:
+        flips    = 6
+        distance = 0
+        deficit  = 0
+```
+
+Focused `A/B/C` result after training that selected `C` pair:
 
 ```text
 A route = 2
 B route = 0
-C route = 1
-
-before C training:
-        A selected route = 2, gap = 1
-        B selected route = 0, gap = 1
-        C selected route = 1, gap = 1
+C route = 5
 
 after C training:
         A selected route = 2, gap = 1
         B selected route = 0, gap = 1
-        C selected route = 1, gap = 1
+        C selected route = 5, gap = 31
 ```
 
 Decoder effects:
@@ -5254,36 +5288,2856 @@ B after A->B->A->B:
         forced deficit  = 57
 
 C before training:
-        forced distance = 15
-        forced deficit  = 0
+        forced distance = 3
+        forced deficit  = 5
 
 C training:
-        replay_c_flips = 0
+        replay_c_flips = 6
 
 C after training:
-        forced distance = 15
+        forced distance = 0
         forced deficit  = 0
 ```
 
-So the current `C` result is:
+So the refined `C` result is:
 
 ```text
-the route-key selector can allocate a third route cleanly
-without collapsing the existing A/B assignments or gaps;
-but this particular C case does not yet improve decoder storage.
-```
-
-That is still useful because it separates two questions:
-
-```text
-route allocation / addressing for C: yes
-route-local decoder improvement for C: not yet in this focused case
+the route-key selector can allocate a third route cleanly;
+A and B keep their route assignments and gaps;
+and a trainable C route can now be selected and solved to 0/0
+without regressing the existing A/B decoder state.
 ```
 
 So the route-key branch now supports the stronger claim:
 
 ```text
-associative route addressing scales past the first two examples
-in the focused diagnostic,
-but decoder training for newly claimed routes is still example-dependent.
+associative route addressing scales past the first two examples;
+and with a measured candidate sweep,
+route-local decoder training can also succeed for a third claimed route
+in the focused diagnostic.
+```
+
+Latest focused diagnostic update: route-key lifecycle chain
+-----------------------------------------------------------
+
+The next refinement turned the `C` case into a small route-key lifecycle test:
+
+```text
+keep A route 2 and B route 0 fixed
+sweep several candidate C targets across unused routes
+trial-train each candidate under a final-layer snapshot
+pick the C pair with realized improvement
+then replay A -> B -> C again
+```
+
+The measured `C` sweep selected:
+
+```text
+C label  = dense
+C route  = 5
+
+before:
+        distance = 3
+        deficit  = 5
+        gap      = 31
+
+after training:
+        flips    = 6
+        distance = 0
+        deficit  = 0
+```
+
+The resulting route assignment is:
+
+```text
+A -> route 2, gap = 1
+B -> route 0, gap = 1
+C -> route 5, gap = 31
+```
+
+And the replay chain `A -> B -> C -> A -> B -> C` remains stable:
+
+```text
+after C training:
+        A forced distance = 0
+        B forced distance = 27
+        B forced deficit  = 57
+        C forced distance = 0
+        C forced deficit  = 0
+
+chain replay A:
+        no flips
+        A/B/C routes unchanged
+
+chain replay B:
+        8 flips
+        A/B/C routes unchanged
+
+chain replay C:
+        no flips
+        A forced distance = 0
+        B forced distance = 26
+        B forced deficit  = 54
+        C forced distance = 0
+        C forced deficit  = 0
+```
+
+So the current strongest focused claim is now:
+
+```text
+associative route-key selection is the first selector mechanism here that
+supports:
+        stable route assignment for multiple examples,
+        route-local decoder training on claimed routes,
+        and replay-chain stability across A/B/C in the focused case.
+```
+
+This moves the main question from selector-head width to route-key capacity and
+allocation policy:
+
+```text
+how many route keys can coexist before gaps collapse,
+and when should a new example reuse an existing route versus claim a new one?
+```
+
+Latest focused diagnostic update: route table and D allocation
+--------------------------------------------------------------
+
+The next diagnostic moved from one-off route probes to a small route table with
+explicit allocation semantics:
+
+```text
+given a new example:
+        try only currently unused routes
+        require positive route-key gap
+        require replay safety for existing owners
+        choose the route with the best realized decoder improvement
+```
+
+This was used to extend the focused chain from `A/B/C` to `D`.
+
+Focused `A/B/C/D` route table:
+
+```text
+A:
+        assigned route = 2
+        selected route = 2
+        gap            = 1
+        nearest        = 0
+        forced         = 0 / 0
+
+B:
+        assigned route = 0
+        selected route = 0
+        gap            = 1
+        nearest        = 2
+        forced         = 26 / 50
+
+C:
+        assigned route = 5
+        selected route = 5
+        gap            = 31
+        nearest        = 0
+        forced         = 0 / 0
+
+D:
+        label          = complement-like
+        assigned route = 1
+        selected route = 1
+        gap            = 33
+        nearest        = 5
+        forced         = 31 / 33
+```
+
+All four examples receive distinct, stable route assignments with positive
+gaps:
+
+```text
+A -> 2
+B -> 0
+C -> 5
+D -> 1
+```
+
+But `D` marks the first focused capacity boundary:
+
+```text
+route allocation succeeds,
+route-key selection remains clean,
+yet route-local decoder storage for D does not reach a solved state.
+```
+
+So the current focused `D` result is reported as:
+
+```text
+d_capacity_conflict = yes
+```
+
+This sharpens the next question:
+
+```text
+the selector/address mechanism now scales farther than the decoder capacity
+for the tested route-local training recipe.
+```
+
+In other words:
+
+```text
+route-key allocation works for D
+but decoder storage for D is still capacity-limited
+even when it gets its own route with a strong selector gap.
+```
+
+That is a cleaner frontier than the earlier selector failures, because it
+separates:
+
+```text
+address allocation success
+from
+route-local decoder storage success
+```
+
+Latest focused diagnostic update: D decoder audit
+-------------------------------------------------
+
+The next refinement audited decoder training for the selected `D` example on
+every unused route, with two controls:
+
+```text
+replay-safe trial:
+        keep A/B/C owners stable
+
+no-replay trial:
+        train D alone on the same route
+```
+
+For the current focused `D = complement-like` case:
+
+```text
+chosen route:
+        route 1
+
+route 1 before:
+        distance = 32
+        deficit  = 37
+        excess   = 38
+
+route 1 replay-safe:
+        8 flips
+        distance = 32
+        deficit  = 35
+        kept owners = yes
+
+route 1 no-replay:
+        8 flips
+        distance = 32
+        deficit  = 35
+```
+
+Other unused routes:
+
+```text
+route 3: 32/39 -> 32/39, 0 flips
+route 4: 31/36 -> 31/36, 0 flips
+route 6: 34/40 -> 34/40, 0 flips
+route 7: 35/42 -> 35/42, 0 flips
+```
+
+The useful conclusion is:
+
+```text
+this D failure is not replay starvation.
+```
+
+The selected route improves slightly in exactly the same way with and without
+replay guards, while the other unused routes do nothing at all.
+
+So the current `D` boundary is better described as:
+
+```text
+route allocation succeeds
+route-key gap is strong
+replay is not the limiting factor
+but the selected D target family is decoder-capacity-limited on the available
+unused routes under the current route-local oracle.
+```
+
+Latest focused diagnostic update: D target-family table and stop reasons
+------------------------------------------------------------------------
+
+The `D` route-local decoder audit was then extended with:
+
+```text
+1. a target-family table under the same allocation policy
+2. per-route stop reasons for replay-safe and no-replay trials
+```
+
+For the current focused `D` sweep:
+
+```text
+dense:            unallocated
+sparse:           unallocated
+mixed:            unallocated
+complement-like:  route 1, gap 33, before 32/37, after 32/35, flips 8
+alt-dense:        unallocated
+alt-mixed:        unallocated
+```
+
+And for the chosen route `1`:
+
+```text
+before:
+        distance = 32
+        deficit  = 37
+        excess   = 38
+        zero-safety = 0
+
+replay-safe:
+        8 flips
+        distance = 32
+        deficit  = 35
+        excess   = 38
+        reason   = deficit-helpful
+        kept owners = yes
+
+no-replay:
+        8 flips
+        distance = 32
+        deficit  = 35
+        excess   = 38
+        reason   = deficit-helpful
+```
+
+All other unused routes show:
+
+```text
+0 flips
+no-effect
+same replay-safe and no-replay outcome
+```
+
+So the current D boundary is now very explicit:
+
+```text
+the available unused routes do not expose a route-local decoder path that can
+reduce D's selected distance;
+route 1 can only shave a little false-negative deficit;
+replay does not change that outcome;
+and the complement-like family is the only D family that is even viable under
+the current allocation policy.
+```
+
+Reporting fix: final D route-choice table
+-----------------------------------------
+
+The focused `D` diagnostic originally had a reporting bug: the printed
+`d_choice_route_*` rows were being populated during the family sweep, so they
+could reflect stale candidate-family data rather than the final chosen
+`D = complement-like` case.
+
+That reporting path was fixed so the `d_choice` table is recomputed from the
+final chosen:
+
+```text
+input_d
+target_d
+probe_d
+```
+
+after route selection is finalized.
+
+The focused output is now internally consistent. For the chosen `D` case:
+
+```text
+row_D_assigned_route = 1
+row_D_selected_gap   = 33
+row_D_forced_dist    = 31
+row_D_forced_def     = 33
+
+d_choice_route_1:
+        gap    = 33
+        before = 32/37
+        excess = 38
+        after  = 32/35
+        flips  = 8
+
+d_family_complement-like:
+        route  = 1
+        gap    = 33
+        before = 32/37
+        excess = 38
+        after  = 32/35
+        flips  = 8
+```
+
+So the per-route route-choice table now agrees with the final chosen
+complement-like `D` row and the route-1 decoder audit.
+
+Decoder-side split for D: positive-only vs zero-only vs balanced
+---------------------------------------------------------------
+
+To separate decoder storage from selector/allocation effects, the assigned
+`D = complement-like` route was then run in three route-local training modes:
+
+```text
+positive-only:
+        only target false-negative / deficit repairs
+
+zero-only:
+        only target false-positive / excess repairs
+
+balanced:
+        choose the best route-local result lexicographically
+```
+
+Before patching the balanced route-local scorer, the split was:
+
+```text
+positive-only:
+        candidates = 25
+        accepted   = 25
+        distance   =  0
+        deficit    = -2
+        excess     =  0
+
+zero-only:
+        candidates = 4
+        accepted   = 4
+        distance   = -2
+        deficit    =  0
+        excess     = -4
+
+balanced:
+        candidates = 29
+        accepted   = 29
+        distance   =  0
+        deficit    = -2
+        excess     =  0
+```
+
+That made the failure mode explicit:
+
+```text
+zero-side repairs existed and were accepted;
+they were the only repairs that actually reduced D's selected distance;
+but the old balanced route-local scoring still chose the deficit-only path.
+```
+
+The balanced route-local wrapper was then changed to rank candidate outcomes by:
+
+```text
+1. selected-distance reduction
+2. false-positive excess reduction
+3. false-negative deficit reduction
+4. target-one margin
+5. target-zero safety
+```
+
+with the change scoped to the balanced route-local wrapper rather than the
+global decoder-objective ordering.
+
+After that patch, the same focused `D` case became:
+
+```text
+row_D_forced_dist = 29
+row_D_forced_def  = 37
+row_D_training_flips = 8
+row_D_replay_flips   = 4
+```
+
+and the route-1 audit became:
+
+```text
+before:
+        32 / 37, excess 38
+
+replay-safe:
+        30 / 37, excess 34, flips 8
+        reason = distance-helpful
+
+no-replay:
+        30 / 37, excess 34, flips 8
+        reason = distance-helpful
+```
+
+The mode split after the patch is:
+
+```text
+positive-only:
+        candidates = 25
+        accepted   = 25
+        distance   =  0
+        deficit    = -2
+        excess     =  0
+
+zero-only:
+        candidates = 4
+        accepted   = 4
+        distance   = -2
+        deficit    =  0
+        excess     = -4
+
+balanced:
+        candidates = 4
+        accepted   = 4
+        distance   = -2
+        deficit    =  0
+        excess     = -4
+```
+
+So the current `D` conclusion is sharper again:
+
+```text
+D is not blocked because zero-side candidates are missing.
+
+D was blocked because the old balanced route-local scoring undervalued
+zero-side distance/excess repair and chose deficit-only scaffold instead.
+
+Once balanced scoring prefers actual distance movement first, D takes the
+zero-side path and improves from 32/37 excess 38 to 30/37 excess 34.
+```
+
+That means the `D` frontier is no longer purely "decoder capacity limit".
+It is now:
+
+```text
+decoder objective scheduling for mixed / excess-heavy targets,
+and how far repeated zero-aware balanced steps can continue to reduce distance.
+```
+
+Balanced-budget sweep for D
+---------------------------
+
+After the balanced route-local scorer was fixed, the next diagnostic was a
+budget sweep on the same assigned `D` route:
+
+```text
+max_flips = 8, 16, 32, 64
+mode      = balanced
+route     = D assigned route 1
+```
+
+The focused results are:
+
+```text
+8 flips:
+        candidates = 4
+        accepted   = 4
+        positive   = 0
+        zero       = 4
+        distance   = -2
+        deficit    =  0
+        excess     = -4
+        stop       = distance-helpful
+
+16 flips:
+        candidates = 4
+        accepted   = 4
+        positive   = 0
+        zero       = 4
+        distance   = -2
+        deficit    =  0
+        excess     = -4
+        stop       = distance-helpful
+
+32 flips:
+        candidates = 4
+        accepted   = 4
+        positive   = 0
+        zero       = 4
+        distance   = -2
+        deficit    =  0
+        excess     = -4
+        stop       = distance-helpful
+
+64 flips:
+        candidates = 25
+        accepted   = 25
+        positive   = 0
+        zero       = 0
+        distance   = -11
+        deficit    = -27
+        excess     = -4
+        stop       = distance-helpful
+
+128 flips:
+        candidates = 25
+        accepted   = 25
+        positive   = 0
+        zero       = 0
+        distance   = -15
+        deficit    = -37
+        excess     = -4
+        stop       = distance-helpful
+```
+
+This is a useful second split.
+
+At small budgets, balanced takes the zero-side cleanup and then stalls:
+
+```text
+32 / 37, excess 38
+    ->
+30 / 37, excess 34
+```
+
+for `8/16/32` flips.
+
+At a larger budget, the balanced route-local pass opens a broader mixed repair
+path:
+
+```text
+distance = -11
+deficit  = -27
+excess   = -4
+```
+
+So the current `D` boundary is no longer:
+
+```text
+no useful decoder path exists
+```
+
+It is:
+
+```text
+small balanced budgets buy the first zero-side cleanup,
+but larger balanced budgets unlock a stronger mixed repair path.
+```
+
+That pushes the next decoder question toward scheduling and budget rather than
+selector or route allocation:
+
+```text
+should hard mixed/excess-heavy targets get a larger balanced budget by default,
+or should the route-local decoder explicitly alternate zero-side cleanup and
+positive-side repair after the first zero-side step lands?
+```
+
+An important detail from the extended sweep is that owner stability still holds
+at the larger budgets:
+
+```text
+8/16/32/64/128:
+        owners_kept = yes
+```
+
+So the current `D` boundary is not replay pressure returning at higher budgets.
+It is:
+
+```text
+small balanced budgets buy only the first zero-side cleanup,
+while larger balanced budgets continue to open a stronger mixed repair path,
+and they can do so without breaking A/B/C in the focused chain.
+```
+
+Adaptive objective-driven balanced budget
+----------------------------------------
+
+The next step was to stop committing hard mixed targets with the small default
+budget once the diagnostic had already shown that:
+
+```text
+8/16/32:
+        only buy the first zero-side cleanup
+
+64/128:
+        unlock a much stronger mixed repair path
+```
+
+So the focused route-local decoder now uses a simple objective-driven adaptive
+budget rule:
+
+```text
+if distance is high
+and false-negative deficit is high
+and false-positive excess is high:
+        use mixed-target budget = 64
+
+else if false-positive excess dominates:
+        use zero-side cleanup budget
+
+else if false-negative deficit dominates:
+        use the normal positive/quota budget
+```
+
+For the current focused `D = complement-like` case, that chooses:
+
+```text
+d_commit_budget = 64
+d_commit_budget_class = mixed-target
+```
+
+The committed focused `D` row then becomes:
+
+```text
+row_D_assigned_route = 1
+row_D_selected_route = 1
+row_D_selected_gap   = 33
+row_D_forced_dist    = 9
+row_D_forced_def     = 0
+row_D_training_flips = 8
+row_D_replay_flips   = 46
+```
+
+So the objective-driven adaptive budget changes the interpretation again:
+
+```text
+the route-local decoder is not merely capable of the first zero-side cleanup;
+with a larger balanced budget it can drive D from 32/37 excess 38 down to a
+forced distance of 9 with deficit 0, while preserving A/B/C.
+```
+
+The budget classification counters also make the repair class explicit:
+
+```text
+8/16/32:
+        positive = 0
+        zero     = 4
+        mixed    = 0
+
+64/128:
+        positive = 0
+        zero     = 0
+        mixed    = 25
+```
+
+So the stronger 64/128 improvements are not unlabeled anymore. They are
+clearly:
+
+```text
+mixed repairs
+```
+
+That sharpens the current decoder-side picture:
+
+```text
+small budgets:
+        zero-side cleanup only
+
+larger budgets:
+        mixed repair path
+        large distance/deficit gains
+        owners still stable
+```
+
+At this point the route-key stack is no longer blocked by selector or route
+allocation for the focused `A/B/C/D` chain. The next decoder question is
+whether the route-local trainer should:
+
+```text
+1. choose a larger balanced budget adaptively for mixed high-deficit/high-excess
+   targets by default, or
+2. explicitly alternate zero-side cleanup and mixed/positive repair scheduling
+   after the first zero-side step lands.
+```
+
+Persisted replay policy and committed-baseline guard
+---------------------------------------------------
+
+The next failure boundary was not route allocation or replay pressure in the
+usual sense. It was replay policy drift.
+
+When `D` was replayed after being improved with the stronger committed
+`mixed-target` budget, the replay path originally reclassified it as a
+zero-side case and retrained it with a smaller zero-side budget. That caused
+`D` to regress away from its stronger committed state even though the route-key
+assignment itself remained stable.
+
+The focused replay policy was then changed in two ways:
+
+```text
+1. Persist the successful committed replay class and budget on each owned route.
+2. Add a committed-baseline guard:
+        if replay would push any owner below its committed baseline,
+        restore the prior final-layer snapshot instead.
+```
+
+So replay now uses the owned route's committed policy by default rather than
+reclassifying every replay pass from scratch.
+
+With that change, the focused replay chain:
+
+```text
+A -> B -> C -> D -> A -> B -> C -> D
+```
+
+now yields:
+
+```text
+A:
+        route 2, gap 1
+        forced 0 / 0 / 0
+        replay budget 8, class positive
+        replay flips 0
+
+B:
+        route 0, gap 1
+        forced 26 / 50 / 0
+        replay budget 8, class positive
+        replay flips 8
+        repairs: positive 40
+
+C:
+        route 5, gap 31
+        forced 0 / 0 / 0
+        replay budget 8, class positive
+        replay flips 0
+
+D:
+        route 1, gap 33
+        forced 9 / 0 / 18
+        replay budget 64, class mixed-target
+        replay flips 46
+        repairs: mixed 23
+```
+
+This is the first focused `A/B/C/D` replay chain where:
+
+```text
+A remains solved
+C remains solved
+B remains improved
+D does not regress below its committed 9/0 floor
+all route gaps stay positive
+```
+
+One detail is worth keeping explicit:
+
+```text
+D's preserved committed floor is currently 9 / 0 / 18,
+not 9 / 0 / 0.
+```
+
+So the current replay-side conclusion is:
+
+```text
+route-key routing is stable through A/B/C/D;
+adaptive mixed-target decoder budget can materially improve D;
+and replay no longer downgrades D once the committed replay class/budget is
+persisted and guarded.
+```
+
+That pushes the next question away from routing and toward decoder refinement:
+
+```text
+can the mixed-target route-local decoder keep reducing D's remaining excess
+without sacrificing the now-stable owned-route replay chain?
+```
+
+Maintenance replay vs improvement replay
+---------------------------------------
+
+Once maintenance replay was stable, the next focused question was whether the
+route table could support a second replay mode:
+
+```text
+maintenance replay:
+        preserve committed policy and committed objective floor
+
+improvement replay:
+        try to beat the committed floor;
+        only accept if other owners remain at or above their committed floors
+```
+
+For the current focused chain, the committed `D` maintenance baseline is:
+
+```text
+route 1
+gap 33
+forced 9 / 0 / 18
+budget 64
+class mixed-target
+```
+
+Three focused `D` improvement-replay probes were then run first:
+
+```text
+1. mixed-64
+2. mixed-128
+3. mixed-64 -> zero-16
+```
+
+with acceptance requiring:
+
+```text
+A/C remain solved
+B does not get worse
+D improves below the committed 9 / 0 / 18 floor
+all route gaps stay positive
+```
+
+All three improvement probes were accepted, and all three reached the same
+better owned-route objective:
+
+```text
+mixed-64:
+        accepted = yes
+        D = 5 / 0 / 10
+        flips = 15
+
+mixed-128:
+        accepted = yes
+        D = 5 / 0 / 10
+        flips = 15
+
+mixed-64 -> zero-16:
+        accepted = yes
+        D = 5 / 0 / 10
+        flips = 15
+```
+
+Two alternating positive/mixed schedules were then added:
+
+```text
+4. positive-8 -> mixed-64
+5. mixed-64 -> positive-8
+```
+
+Both were also accepted, but neither improved beyond the existing
+`mixed-64` result:
+
+```text
+positive-8 -> mixed-64:
+        accepted = yes
+        D = 5 / 0 / 10
+        flips = 15
+
+mixed-64 -> positive-8:
+        accepted = yes
+        D = 5 / 0 / 10
+        flips = 15
+```
+
+So the schedule-order question is narrower now:
+
+```text
+simple alternating positive/mixed schedules do not beat the current
+mixed-target improvement floor.
+```
+
+This is a useful new split.
+
+Maintenance replay now preserves the current committed floor:
+
+```text
+D = 9 / 0 / 18
+```
+
+while improvement replay can beat it:
+
+```text
+D = 5 / 0 / 10
+```
+
+without breaking `A/B/C`.
+
+So the route table story is now more complete:
+
+```text
+route-key selector:
+        stable addressing
+
+route allocation:
+        stable ownership through A/B/C/D
+
+maintenance replay:
+        preserves committed route policy and committed floor
+
+improvement replay:
+        can lower the committed floor further when the route-local decoder
+        finds a better mixed-target repair path
+```
+
+This means the next route-table refinement is no longer about preserving the
+first successful `D` policy. It is about promoting successful improvement
+replay results into the committed baseline:
+
+```text
+maintenance floor:
+        9 / 0 / 18
+
+candidate improved floor:
+        5 / 0 / 10
+```
+
+and then verifying that the maintenance replay chain can preserve that stronger
+baseline on the next pass.
+
+The immediate implication is that the next likely decoder gain is no longer
+"try a different simple two-step schedule order." The obvious next moves are:
+
+```text
+1. promote 5 / 0 / 10 into the committed D baseline and rerun maintenance
+   replay, or
+2. try a stronger post-mixed cleanup specifically targeting the remaining
+   excess once the mixed-target pass has already lowered distance and deficit.
+```
+
+Excess-specific audit from the `5 / 0 / 10` state
+-------------------------------------------------
+
+After the `mixed-64` improvement replay established the focused
+
+```text
+D = 5 / 0 / 10
+```
+
+state, the next decoder-side question was whether any zero-side work remained,
+and if so, what kind.
+
+The focused harness now rebuilds that improved `D` state and runs an
+excess-specific restore audit with `max_second_steps = 0`, so the audit is
+measuring the current `D` route directly rather than a new replay collision.
+
+The current audit prepares:
+
+```text
+budget = 16
+state  = 5 / 0 / 10
+```
+
+and then reports per remaining false-positive decoded bit:
+
+- current ones / threshold / max-zero / excess,
+- clearable final segment votes,
+- whether a negative-quota repair projection exists,
+- mask flips,
+- actual cleared votes,
+- distance / excess delta,
+- replay-owner veto state for `A`, `B`, and `C`,
+- rejection / propagation reason.
+
+For the current focused case, the remaining audited bits are:
+
+```text
+bits: 23, 25, 26, 28, 29
+```
+
+and each one currently looks like:
+
+```text
+ones        = 4
+threshold   = 3
+max-zero    = 2
+excess      = 2
+clearable   = 4
+neg-quota   = 1
+mask-flips  = 2
+cleared     = 0
+dist delta  = -1
+excess delta= -2
+```
+
+with all three replay owners still allowing the repair:
+
+```text
+A accepted = yes
+B accepted = yes
+C accepted = yes
+```
+
+So the new split is:
+
+```text
+no zero-side candidates remain:
+        false
+
+zero-side candidates are rejected by replay owners:
+        false
+
+zero-side candidates reduce excess but not distance:
+        false
+
+zero-side candidates hurt target-one bits:
+        false
+```
+
+What remains is subtler:
+
+```text
+zero-side candidates still exist and are replay-safe,
+but they currently realize through a mixed route-local repair path rather than
+a direct final-surface clear vote on the currently selected route.
+```
+
+The propagation trace on those remaining bits is currently:
+
+```text
+selected-node-mismatch
+```
+
+with `actual_cleared_votes = 0`, even though the candidate still improves both
+distance and excess.
+
+The next refinement split that followed was:
+
+```text
+1. intended-node effect
+2. post-candidate selected-node effect
+3. contender objective
+4. route-key stability
+```
+
+The focused audit now makes that concrete for the remaining excess bits:
+
+```text
+route-key route:
+        still route 1
+        gap 33
+
+intended internal final node:
+        1
+
+post-candidate selected internal final node:
+        6
+```
+
+for each of the currently remaining audited bits:
+
+```text
+23, 25, 26, 28, 29
+```
+
+The per-bit shape is currently:
+
+```text
+intended node before      = 1
+selected node after       = 6
+intended-node after       = 4 / 8
+selected-node after obj   = 34 / 36
+distance delta            = -1
+excess delta              = -2
+propagation               = selected-node-mismatch
+route-key route           = still 1
+```
+
+So the new boundary is:
+
+```text
+route-key selection remains stable on D's assigned route 1;
+the remaining zero-side gains are not route-key reroutes;
+they are internal final-node switches inside the assigned decoder route.
+```
+
+That is different from an earlier routing failure mode. The route table still
+owns `D -> route 1`. What changes is the selected internal final node used to
+decode that route after the candidate is applied.
+
+So the next decoder-side question is no longer "are there any zero-side repairs
+left?" The answer is yes. The more precise question is:
+
+```text
+can the remaining excess be reduced by a cleaner direct zero-side surface move,
+or is the current route-local decoder now relying on mixed repair paths for the
+last part of D's improvement?
+```
+
+The focused harness now classifies those remaining zero-side opportunities
+explicitly. The current internal-node summary is:
+
+```text
+route                = 1
+committed node       = 1
+current node         = 6
+switch count         = 5
+
+zero_direct_clear_helpful     = 0
+zero_internal_switch_helpful  = 5
+zero_internal_switch_harmful  = 0
+zero_internal_switch_neutral  = 0
+zero_route_key_switch         = 0
+zero_replay_rejected          = 0
+```
+
+So the current remaining excess bits are all landing in:
+
+```text
+zero_internal_switch_helpful
+```
+
+not in:
+
+```text
+direct clear-vote cleanup
+route-key reroute
+replay rejection
+harmful internal switching
+```
+
+This sharpens the current interpretation:
+
+```text
+the remaining D zero-side opportunities are legitimate within-route internal
+final-node switches, not route ownership failures.
+```
+
+An explicit follow-up probe was then added:
+
+```text
+excess-only-after-mixed
+```
+
+which starts from the accepted `mixed-64` improvement floor:
+
+```text
+D = 5 / 0 / 10
+```
+
+and then applies a zero-side cleanup pass under the same owner and route-key
+guards.
+
+That probe currently preserves the same floor but does not beat it:
+
+```text
+accepted      = no
+selected route= 1
+gap           = 33
+forced        = 5 / 0 / 10
+```
+
+So the next boundary is:
+
+```text
+post-mixed zero-side cleanup is stable,
+but it does not currently improve beyond the best mixed-target floor.
+```
+
+That means the current best focused `D` route story is:
+
+```text
+maintenance floor:
+        9 / 0 / 18
+
+improvement floor:
+        5 / 0 / 10
+
+remaining zero-side opportunities:
+        replay-safe internal-node switches within route 1
+
+extra zero-only cleanup after mixed:
+        stable, but not yet better than 5 / 0 / 10
+```
+
+Audit-to-trainer parity on the remaining excess bits
+---------------------------------------------------
+
+The next useful mismatch to resolve was:
+
+```text
+per-bit audit:
+        candidate exists
+        dist delta  -1
+        excess delta -2
+        replay-owner accept = yes
+
+excess-only-after-mixed pass:
+        accepted = no
+        D stays at 5 / 0 / 10
+```
+
+That meant the audit path and the cleanup pass were still not evaluating the
+same unit of work under the same acceptance rule.
+
+The focused harness now prints an audit-to-trainer parity trace for each
+remaining `D` false-positive bit. For each bit it now records:
+
+- route-key selected route before/after,
+- intended internal node before/after,
+- post-candidate selected internal node,
+- `D` objective on the intended node,
+- `D` objective on the actual selected node after the candidate,
+- `A/B/C` owner objectives after the same candidate,
+- parity accept/reject reason,
+- committed-baseline guard result.
+
+The current result is consistent across all five remaining excess bits:
+
+```text
+intended node before       = 1
+selected node after        = 6
+intended-node after        = 4 / 0 / 8
+selected-node after obj    = 34 / 40 / 36
+parity reason              = owner-baseline-guard
+baseline guard             = no
+route-key route            = still 1
+```
+
+The owner-side after-objectives currently print as:
+
+```text
+A after = 4 / 0 / 8
+B after = 26 / 50 / 0
+C after = 0 / 0 / 0
+```
+
+So the mismatch is now explicit:
+
+```text
+the per-bit audit still labels these candidates useful because the intended
+node improves;
+
+the real cleanup pass rejects them because the selected-objective / committed-
+baseline guard does not accept the resulting whole-route state.
+```
+
+That means the next decoder-side interpretation is tighter again:
+
+```text
+the remaining D excess bits are not blocked by missing candidates;
+they are blocked by audit-to-trainer objective mismatch.
+```
+
+In other words, the current useful zero-side candidates are real, but the
+current per-bit audit is still optimistic because it scores the intended node
+more generously than the real selected-objective replay guard does.
+
+Multi-threshold vote profile on the selected internal node
+----------------------------------------------------------
+
+The next diagnostic asked whether the remaining `D` errors at the current
+selected-objective floor
+
+```text
+D = 5 / 0 / 10
+```
+
+were near-threshold and therefore likely to benefit from a pressure /
+accumulator-style training substrate, or whether they were still confidently
+wrong.
+
+To answer that, the focused harness now measures a segment-vote profile on the
+actually selected internal decoder node. For each wrong decoded bit it records:
+
+- segment vote count,
+- strict majority threshold,
+- max-zero threshold,
+- deficit / excess,
+- whether the bit is near-threshold or confidently wrong.
+
+For the committed `D` maintenance baseline:
+
+```text
+D = 9 / 0 / 18
+selected internal node = 1
+gap = 16
+segments = 4
+threshold = 3
+false positives = 9
+near-threshold false positives = 0
+confident false positives = 9
+```
+
+For the accepted `mixed-64` improvement floor:
+
+```text
+D = 5 / 0 / 10
+selected internal node = 1
+gap = 0
+segments = 4
+threshold = 3
+false positives = 5
+near-threshold false positives = 0
+confident false positives = 5
+```
+
+The remaining wrong bits on the selected node are:
+
+```text
+23, 25, 26, 28, 29
+```
+
+and every one currently has the same profile:
+
+```text
+ones      = 4
+threshold = 3
+max-zero  = 2
+excess    = 2
+```
+
+So the current answer is:
+
+```text
+the remaining D errors are not near-threshold;
+they are confidently wrong on the selected internal node.
+```
+
+That is important because it narrows the next training interpretation:
+
+```text
+a simple near-threshold pressure / accumulator story is probably not enough
+for these five remaining bits;
+the current frontier still looks more like route-local capacity or selected-
+node structural search than shallow consensus cleanup.
+```
+
+Selected-objective-safe block search below `D = 5 / 0 / 10`
+-----------------------------------------------------------
+
+The next step was a bounded block search from the improved `D` floor:
+
+```text
+D = 5 / 0 / 10
+route-key route = 1
+```
+
+This search stayed entirely within the focused `D` harness and used the same
+hard guards as the replay/cleanup path:
+
+```text
+route-key route stays assigned route 1
+A/B/C committed baselines hold
+D selected distance / deficit / excess do not regress
+```
+
+The searched step families were:
+
+```text
+route-balanced-8
+route-balanced-16
+route-positive-8
+selected-zero-16
+selected-balanced-16
+contender-zero-16
+contender-balanced-16
+```
+
+and the harness tried both one-step and two-step sequences over that set.
+
+The block-search summary is:
+
+```text
+blocks tested   = 56
+selected-safe   = 37
+improving       = 4
+best found      = yes
+```
+
+The best selected-objective-safe block found so far is:
+
+```text
+route-balanced-8 -> route-balanced-8
+selected after = 1
+gap after      = 2
+selected obj   = 4 / 0 / 8
+flips          = 15
+```
+
+This changes the current boundary in an important way:
+
+```text
+the one-step route-local oracle is still exhausted at D = 5 / 0 / 10,
+but a small selected-objective-safe two-step block can improve below that
+floor.
+```
+
+So the current focused decoder frontier is no longer:
+
+```text
+no selected-safe local improvement below 5 / 0 / 10
+```
+
+It is now:
+
+```text
+no selected-safe one-step local improvement below 5 / 0 / 10,
+but selected-safe block search can still move the route to 4 / 0 / 8.
+```
+
+Promoting the two-step block into owned-route replay
+----------------------------------------------------
+
+The next step was to stop treating `4 / 0 / 8` as an isolated probe and to
+promote it into `D`'s committed replay policy.
+
+The promoted policy is now:
+
+```text
+committed D policy:
+        class = three-step-route-balanced-block
+        block = route-balanced-8 -> route-balanced-8 -> route-balanced-8
+        realized flips = 15
+```
+
+The focused harness now reuses that persisted two-step block for `D` replay by
+default, under the same committed-baseline guard used for the other owners.
+
+After promoting the block and rerunning the full maintenance chain:
+
+```text
+A -> B -> C -> D -> A -> B -> C -> D
+```
+
+the current focused rows are:
+
+```text
+A:
+        route 2, gap 1, forced 0 / 0 / 0
+
+B:
+        route 0, gap 1, forced 25 / 47 / 0
+
+C:
+        route 5, gap 31, forced 0 / 0 / 0
+
+D:
+        route 1, gap 33, forced 4 / 0 / 8
+        replay budget = 15
+        replay class  = three-step-route-balanced-block
+```
+
+So the key check now passes:
+
+```text
+the two-step selected-objective-safe block is not just an isolated improvement;
+it is stable enough to serve as D's owned-route committed baseline under the
+maintenance replay chain.
+```
+
+This sharpens the current route-table story again:
+
+```text
+maintenance baseline for D:
+        4 / 0 / 8
+
+persisted policy:
+        two-step route-balanced block
+
+A/C:
+        remain solved
+
+B:
+        remains improved and improves again to 25 / 47
+
+all route gaps:
+        remain positive
+```
+
+Extending the bounded selected-objective-safe block search from depth 2 to
+depth 3 did not improve the owned-route objective further.
+
+The depth-3 search summary is now:
+
+```text
+blocks tested   = 399
+selected-safe   = 326
+improving       = 56
+best found      = yes
+
+best block:
+        route-balanced-8 -> route-balanced-8 -> route-balanced-8
+        selected obj = 4 / 0 / 8
+        gap after    = 2
+        flips        = 15
+```
+
+So the current focused result is:
+
+```text
+depth 3 confirms the same D floor as depth 2.
+```
+
+That is useful because it suggests the current local block frontier is not
+"one more balanced step away" from another easy gain. The best known owned-
+route baseline remains:
+
+```text
+D = 4 / 0 / 8
+```
+
+Changing the block alphabet around the `D = 4 / 0 / 8` floor
+-------------------------------------------------------------
+
+The next targeted search changed the block alphabet instead of just increasing
+depth. The explicit two-step matrix was:
+
+```text
+balanced-8 -> balanced-8
+balanced-8 -> selected-zero-8
+selected-zero-8 -> balanced-8
+balanced-8 -> selected-positive-8
+selected-positive-8 -> balanced-8
+balanced-8 -> internal-selection-stabilizer
+internal-selection-stabilizer -> selected-zero-8
+```
+
+where:
+
+```text
+selected-zero-8:
+        zero-only pass on the currently selected internal node
+
+selected-positive-8:
+        positive-only pass on the currently selected internal node
+
+internal-selection-stabilizer:
+        balanced pass on the currently selected internal node,
+        but only accepted if that step leaves the selected internal node stable
+```
+
+From the current committed owned-route baseline:
+
+```text
+D = 4 / 0 / 8
+route-key route = 1
+gap = 33
+```
+
+all seven sequences are selected-safe, but none improves the selected
+objective further:
+
+```text
+all seven:
+        selected-safe = yes
+        improves      = no
+        selected obj  = 4 / 0 / 8
+        gap after     = 2
+        flips         = 0
+```
+
+So the current decoder interpretation is tighter again:
+
+```text
+changing the local block alphabet to selected-zero / selected-positive /
+selection-stabilizer does not expose an additional selected-objective-safe
+improvement below D = 4 / 0 / 8.
+```
+
+That means the next likely gain is no longer in small local sequencing alone.
+The current frontier looks more like:
+
+```text
+selected-node structural block search
+or
+bounded selected-objective solver/oracle search
+```
+
+Residual error decomposition at the committed `D = 4 / 0 / 8` floor
+-------------------------------------------------------------------
+
+The next useful narrowing was to stop asking "which schedule?" and instead
+print the remaining selected-objective errors on `D`'s actual committed owned-
+route baseline:
+
+```text
+D:
+        route 1
+        gap 33
+        forced 4 / 0 / 8
+```
+
+The focused harness now prints, for each remaining selected-node error:
+
+- decoded bit
+- target bit
+- selected internal node
+- `ones / threshold / max_zero`
+- `deficit / excess`
+- candidate final votes
+- candidate mask flips
+- the concrete reason no selected-safe local repair applies
+
+At the current maintained baseline, the residual wall is:
+
+```text
+bit 25:
+        target 0
+        selected node 1
+        ones 4
+        threshold 3
+        max_zero 2
+        deficit 0
+        excess 2
+        candidate final votes 4
+        mask flips 2
+        reason owner-baseline-guard
+
+bit 26:
+        target 0
+        selected node 1
+        ones 4
+        threshold 3
+        max_zero 2
+        deficit 0
+        excess 2
+        candidate final votes 4
+        mask flips 2
+        reason owner-baseline-guard
+
+bit 28:
+        target 0
+        selected node 1
+        ones 4
+        threshold 3
+        max_zero 2
+        deficit 0
+        excess 2
+        candidate final votes 4
+        mask flips 2
+        reason owner-baseline-guard
+
+bit 29:
+        target 0
+        selected node 1
+        ones 4
+        threshold 3
+        max_zero 2
+        deficit 0
+        excess 2
+        candidate final votes 4
+        mask flips 2
+        reason owner-baseline-guard
+```
+
+So the current maintained `D` state is now even sharper than before:
+
+```text
+the remaining selected-objective errors are four target-zero false positives
+on selected internal node 1;
+
+they do expose exact-zero-style local candidates,
+but those candidates currently fail the owner-baseline guard.
+```
+
+Selected-node exact-zero block family from `D = 4 / 0 / 8`
+----------------------------------------------------------
+
+The next explicit block family was then tested from the same committed
+baseline:
+
+```text
+selected-exact-zero -> selected-exact-zero
+selected-exact-zero -> internal-selection-stabilizer
+internal-selection-stabilizer -> selected-exact-zero
+selected-exact-zero -> selected-positive
+selected-exact-zero -> route-balanced-8
+```
+
+All five are selected-safe, but all five are inert:
+
+```text
+selected-safe = yes
+improves      = no
+selected obj  = 4 / 0 / 8
+gap after     = 2
+flips         = 0
+```
+
+So the current boundary is:
+
+```text
+selected-node exact-zero block families are safe under the current route /
+owner guards, but they do not move below D = 4 / 0 / 8.
+```
+
+That leaves a very narrow next frontier:
+
+```text
+per-error selected-node exact repair beyond the current local oracle,
+or a bounded selected-objective solver/oracle search for the four remaining
+target-zero false positives on D's selected internal node.
+```
+
+Residual wall after promoting `D = 4 / 0 / 8`
+---------------------------------------------
+
+The next diagnostic narrowed the maintained `D` baseline even further by
+printing the remaining selected-objective errors directly from the current
+owned-route state:
+
+```text
+D:
+        route 1
+        gap 33
+        forced 4 / 0 / 8
+```
+
+At this maintained floor, the residual wall is exactly four selected-node
+target-zero false positives:
+
+```text
+bit 25:
+        target 0
+        selected node 1
+        ones 4
+        threshold 3
+        max_zero 2
+        deficit 0
+        excess 2
+        candidate votes 4
+        mask flips 2
+        reason candidate-for-different-internal-node
+
+bit 26:
+        target 0
+        selected node 1
+        ones 4
+        threshold 3
+        max_zero 2
+        deficit 0
+        excess 2
+        candidate votes 4
+        mask flips 2
+        reason candidate-for-different-internal-node
+
+bit 28:
+        target 0
+        selected node 1
+        ones 4
+        threshold 3
+        max_zero 2
+        deficit 0
+        excess 2
+        candidate votes 4
+        mask flips 2
+        reason candidate-for-different-internal-node
+
+bit 29:
+        target 0
+        selected node 1
+        ones 4
+        threshold 3
+        max_zero 2
+        deficit 0
+        excess 2
+        candidate votes 4
+        mask flips 2
+        reason candidate-for-different-internal-node
+```
+
+So the current selected-objective frontier is no longer ambiguous:
+
+```text
+the remaining D errors are four target-zero false positives on selected
+internal node 1;
+
+each one exposes an exact-zero-style local candidate,
+but each candidate currently propagates to a different internal node.
+```
+
+Selected-node exact-zero family at `D = 4 / 0 / 8`
+--------------------------------------------------
+
+The next explicit local family was then tested from the same maintained
+baseline:
+
+```text
+selected-exact-zero -> selected-exact-zero
+selected-exact-zero -> internal-selection-stabilizer
+internal-selection-stabilizer -> selected-exact-zero
+selected-exact-zero -> selected-positive
+selected-exact-zero -> route-balanced-8
+```
+
+All five are selected-safe, but all five are inert:
+
+```text
+selected-safe = yes
+improves      = no
+selected obj  = 4 / 0 / 8
+gap after     = 2
+flips         = 0
+```
+
+That gives the current decoder frontier a very tight shape:
+
+```text
+exact-zero-style local repairs exist for the four residual bits,
+but none of the currently tested selected-node-safe exact-zero block families
+can move below D = 4 / 0 / 8.
+```
+
+Residual-set exact repair vs direct selected control
+---------------------------------------------------
+
+The next step split the residual problem into two explicitly different
+questions:
+
+```text
+1. direct selected-node control:
+        if the selected node's final output votes are cleared exactly for a
+        residual set, does a better selected objective exist at all?
+
+2. exact mask-realized repair:
+        if the same residual set is trained through the real selected-node
+        mask path, does it remain selected-safe under the committed route /
+        owner guards?
+```
+
+The residual set was:
+
+```text
+{ 25, 26, 28, 29 }
+```
+
+Direct selected-node control is strongly positive. It improves monotonically as
+more residual bits are cleared:
+
+```text
+25             -> 3 / 0 / 6
+26             -> 3 / 0 / 6
+28             -> 3 / 0 / 6
+29             -> 3 / 0 / 6
+25 + 26        -> 2 / 0 / 4
+25 + 28        -> 2 / 0 / 4
+26 + 28        -> 2 / 0 / 4
+25 + 26 + 28   -> 1 / 0 / 2
+25 + 26 + 29   -> 1 / 0 / 2
+25 + 28 + 29   -> 1 / 0 / 2
+26 + 28 + 29   -> 1 / 0 / 2
+25 + 26 + 28 + 29 -> 0 / 0 / 0
+```
+
+So the target state clearly exists on the current selected internal node.
+
+The exact mask-realized repair behaves very differently. Every tested residual
+subset is measured and trained successfully, but every one fails the
+selected-objective guard in the same way:
+
+```text
+selected_after        = 6
+selected_obj          = 34 / 40 / 36
+route_change          = no
+gap_lost              = no
+A/B/C baseline fail   = no
+D distance fail       = yes
+D deficit fail        = yes
+D excess fail         = yes
+selected_switch_worse = yes
+```
+
+That is the current sharpest decoder boundary on `D`:
+
+```text
+the selected-node target state exists directly,
+but exact local mask realization reroutes D to internal node 6 and blows up
+the selected objective to 34 / 40 / 36.
+```
+
+Node-1 vs node-6 comparison on residual subsets
+-----------------------------------------------
+
+The residual-set control was then measured specifically as a node-1 vs node-6
+selection problem.
+
+Baseline:
+
+```text
+selected node = 1
+node1 popcount = 158
+node6 popcount = 156
+gap(1 - 6) = +2
+```
+
+For the direct clear subsets:
+
+```text
+25:
+        selected after = 1
+        node1 popcount after = 158
+        node6 popcount after = 156
+        gap after = +2
+
+25 + 26:
+        selected after = 1
+        node1 popcount after = 158
+        node6 popcount after = 156
+        gap after = +2
+
+25 + 26 + 28:
+        selected after = 1
+        node1 popcount after = 158
+        node6 popcount after = 156
+        gap after = +2
+
+25 + 26 + 28 + 29:
+        selected after = 1
+        node1 popcount after = 158
+        node6 popcount after = 156
+        gap after = +2
+```
+
+So direct selected-node clear preserves node 1 selection while improving the
+selected decoder objective.
+
+Direct condensed-level edit behaves the same way:
+
+```text
+25:
+        selected after = 1
+        node1 popcount after = 158
+        node6 popcount after = 156
+        gap after = +2
+        selected obj = 3 / 0 / 6
+
+25 + 26:
+        selected after = 1
+        node1 popcount after = 158
+        node6 popcount after = 156
+        gap after = +2
+        selected obj = 2 / 0 / 4
+
+25 + 26 + 28:
+        selected after = 1
+        node1 popcount after = 158
+        node6 popcount after = 156
+        gap after = +2
+        selected obj = 1 / 0 / 2
+
+25 + 26 + 28 + 29:
+        selected after = 1
+        node1 popcount after = 158
+        node6 popcount after = 156
+        gap after = +2
+        selected obj = 0 / 0 / 0
+```
+
+So both direct activation edit and direct condensed edit preserve node 1
+selection and reach the intended selected-node target.
+
+For the exact mask-realized repair:
+
+```text
+25:
+        selected after = 6
+        node1 popcount after = 154
+        node6 popcount after = 156
+        gap after = -2
+
+25 + 26:
+        selected after = 6
+        node1 popcount after = 150
+        node6 popcount after = 156
+        gap after = -6
+
+25 + 26 + 28:
+        selected after = 6
+        node1 popcount after = 146
+        node6 popcount after = 156
+        gap after = -10
+
+25 + 26 + 28 + 29:
+        selected after = 6
+        node1 popcount after = 142
+        node6 popcount after = 156
+        gap after = -14
+```
+
+This identifies the concrete failure mode:
+
+```text
+direct clear preserves node 1 selection;
+mask realization does not.
+```
+
+More narrowly:
+
+```text
+direct activation edit works;
+direct condensed edit works;
+mask-realized exact-zero repair reduces node-1 support enough to lose the
+internal node-1 vs node-6 race;
+node 6 does not need to grow, because node 1 collapses below it.
+```
+
+So the next decoder frontier is not another generic cleanup schedule. It is:
+
+```text
+selection-preserving exact-zero realization for node 1,
+or an alternative realization that improves the selected objective without
+letting node 6 overtake node 1.
+```
+
+Node-1 support compensation search
+----------------------------------
+
+The next focused search tried exactly that: after each exact-zero residual-set
+repair, add a cheap node-1 support lift and keep only results that satisfy the
+existing route-key and owner guards while restoring a positive node-1 vs node-6
+gap.
+
+The checked subsets were:
+
+```text
+25
+25 + 26
+25 + 26 + 28
+25 + 26 + 28 + 29
+```
+
+and the support-lift family was:
+
+```text
+positive-only on node 1 with budgets 1, 2, 4, 8, 16
+balanced on node 1 with budgets 4, 8, 16
+```
+
+Result:
+
+```text
+25:                 no safe support-lift found
+25 + 26:            no safe support-lift found
+25 + 26 + 28:       no safe support-lift found
+25 + 26 + 28 + 29:  no safe support-lift found
+```
+
+So the local "exact-zero + cheap node-1 lift" family is exhausted too. In the
+current route-local oracle, even the smallest residual case does not admit a
+selection-preserving realization within these support-lift blocks.
+
+That sharpens the decoder frontier again:
+
+```text
+the desired selected-node target state exists directly;
+the current exact mask realization loses node 1 selection to node 6;
+and the tested cheap node-1 support compensation blocks do not recover it.
+```
+
+The next mechanism therefore needs to be more exact than the current local
+support-lift family, for example:
+
+```text
+an internal-node-preserving realization path,
+a teacher-style projection toward the direct selected-node target activation,
+or a bounded structural block/oracle that reasons about node-1 support and
+zero-side cleanup together.
+```
+
+Teacher-distance search after exact-zero realization
+---------------------------------------------------
+
+The next diagnostic then used the direct-clear selected-node activation itself
+as a teacher target on node 1.
+
+For the residual subsets:
+
+```text
+25
+25 + 26
+25 + 26 + 28
+25 + 26 + 28 + 29
+```
+
+the direct-clear teacher distance on node 1 is:
+
+```text
+25:                 2
+25 + 26:            4
+25 + 26 + 28:       6
+25 + 26 + 28 + 29:  8
+```
+
+A post-exact local support search was then run on node 1 with:
+
+```text
+positive-only budgets 1, 2, 4, 8, 16
+balanced budgets 4, 8, 16
+```
+
+under the same hard guards:
+
+```text
+route-key route remains 1
+A/B/C committed baselines hold
+node 1 remains selected over node 6
+D selected objective does not regress
+```
+
+Result:
+
+```text
+no safe teacher-distance-reducing candidate was found for any subset
+```
+
+So the route-local decoder frontier is now even tighter:
+
+```text
+the direct selected-node teacher exists,
+but the current local realization family cannot move the exact-zero repair
+toward that teacher while preserving node-1 selection.
+```
+
+A small teacher-realization beam search was then added after the exact-zero
+realization. The beam alphabet combined:
+
+```text
+node1 positive blocks
+node1 balanced blocks
+node6 zero-suppression blocks
+node6 balanced blocks
+```
+
+with one-step and two-step sequences, still under the same guards:
+
+```text
+route-key route remains 1
+A/B/C committed baselines hold
+node1 popcount stays above node6 popcount
+D selected objective does not regress
+teacher distance decreases
+```
+
+Result:
+
+```text
+25:                 no safe teacher-realization block found
+25 + 26:            no safe teacher-realization block found
+25 + 26 + 28:       no safe teacher-realization block found
+25 + 26 + 28 + 29:  no safe teacher-realization block found
+```
+
+So even the bounded node1-support / node6-suppression beam does not expose a
+selection-preserving path toward the direct-clear teacher. That is the current
+strongest negative result on `D`:
+
+```text
+the target selected-node state exists directly,
+but the current local block alphabet cannot realize it while preserving
+internal node 1 selection.
+```
+
+So the next frontier is no longer "is there a better state below 4 / 0 / 8?"
+The answer is yes. The real question is:
+
+```text
+how to realize that exact selected-node zero repair while preserving the
+selected internal node / selected objective path.
+```
+
+Structural mask-effect solver for `{25}`
+----------------------------------------
+
+The next focused step stopped using named pass families and instead searched
+over concrete final-layer mask flips after the exact `{25}` realization.
+
+The setup was:
+
+```text
+1. start from the post-exact `{25}` state
+2. collect the concrete final-layer mask flips produced by the earlier
+   support and teacher-search attempts
+3. deduplicate those flips into a bounded pool
+4. test singleton / pair / triple combinations directly
+5. keep only combinations that satisfy the real selected-objective guards:
+
+        A/B/C committed baselines hold
+        node1 popcount > node6 popcount
+        D selected objective does not regress
+```
+
+For the `{25}` case, the structural pool contained:
+
+```text
+pool size = 5 unique concrete final-layer flips
+```
+
+and the bounded search tested:
+
+```text
+35 singleton/pair/triple combinations
+```
+
+Result:
+
+```text
+selected-safe combinations = 0
+improving combinations     = 0
+best safe block found      = no
+```
+
+So the next boundary is sharper than the earlier pass-family negative result:
+
+```text
+even when the search is driven by concrete post-exact mask effects rather than
+named local schedules, the current shared final-layer mask realization still
+cannot keep node 1 selected for `{25}`.
+```
+
+This matters because it separates:
+
+```text
+pass-family weakness
+from
+shared mask-realization weakness
+```
+
+At this point the residual `D` story is:
+
+```text
+direct activation edit works
+direct condensed edit works
+named local compensation/search families fail
+concrete structural singleton/pair/triple mask-effect search for `{25}` fails
+```
+
+So the remaining frontier is now firmly below the condensed representation and
+inside the shared final-layer realization path itself.
+
+The next meaningful mechanism is therefore no longer another local schedule. It
+has to be one of:
+
+```text
+a more exact structural solver over a broader flip basis,
+a teacher-projection training path that works below the condensed surface,
+or route-local correction capacity once shared realization is shown to be
+exhausted.
+```
+
+Expanded effect-vector solver for `{25}`
+----------------------------------------
+
+The next pass broadened the structural search basis beyond the earlier
+support/teacher-derived pool.
+
+Instead of only reusing flips seen in earlier local repair attempts, the
+focused `{25}` search enumerated every single final-layer mask toggle on the two
+relevant internal decoder nodes:
+
+```text
+node 1
+node 6
+```
+
+from the post-exact `{25}` state, then ranked those single-flip effects by:
+
+```text
+selected-objective safety
+selected distance
+selected excess
+teacher distance
+node1-vs-node6 gap
+```
+
+and searched bounded singleton/pair/triple combinations over the top-ranked
+effect-vector pool.
+
+For the focused `{25}` case:
+
+```text
+expanded pool size = 256
+expanded combinations tested = 816
+selected-safe combinations   = 800
+improving combinations       = 784
+best found                   = yes
+```
+
+The best selected-safe `{25}` realization found so far is:
+
+```text
+label:
+        n1.i0.b25=0 + n6.i0.b5=1
+
+flips:
+        2
+
+selected node after:
+        1
+
+node1 popcount after:
+        156
+
+node6 popcount after:
+        154
+
+gap(1-6) after:
+        +2
+
+selected objective after:
+        3 / 0 / 6
+```
+
+So the earlier "shared masks cannot safely realize `{25}`" boundary was too
+strong. The corrected boundary is:
+
+```text
+the small derived local flip basis is exhausted for `{25}`,
+but a broader effect-vector search over concrete node1/node6 final-layer mask
+flips does expose selected-safe improving realizations.
+```
+
+That changes the next frontier materially.
+
+The shared final-layer surface is not exhausted yet. What was exhausted was the
+earlier local candidate basis. The right next step is now:
+
+```text
+try to promote the selected-safe `{25}` structural realization as a new D
+improvement candidate,
+then rerun maintenance replay to see whether `D = 3 / 0 / 6` is stable as an
+owned-route baseline.
+```
+
+Only if the broader effect-vector basis stops producing stable improving blocks
+for the remaining residual set does route-local correction capacity become the
+next justified mechanism.
+
+Promotion check for the `{25}` structural block
+-----------------------------------------------
+
+That promotion check was then run explicitly.
+
+The selected-safe `{25}` structural result found by the expanded effect-vector
+search was:
+
+```text
+n1.i0.b25=0 + n6.i0.b5=1
+    -> 3 / 0 / 6
+```
+
+But when that block was converted into a committed replay candidate and applied
+from the maintained `D = 4 / 0 / 8` state, the commit probe became:
+
+```text
+measured      = yes
+selected_safe = no
+improves      = no
+selected route = 1
+gap after      = 33
+selected obj   = 4 / 0 / 8
+```
+
+So the useful correction is:
+
+```text
+the expanded solver does find a selected-safe `{25}` repair relative to the
+post-exact `{25}` search state,
+but that structural block does not translate into a promotable owned-route
+baseline from the maintained `D = 4 / 0 / 8` state.
+```
+
+This means the next frontier is narrower again:
+
+```text
+it is not enough to find a local selected-safe structural repair in the `{25}`
+subproblem;
+the repair must also be realizable as a stable committed replay policy from the
+maintained route-owned baseline.
+```
+
+So the next meaningful move is no longer simply "promote the `{25}` block". It
+has to be one of:
+
+```text
+a structural solver that searches directly from the maintained 4 / 0 / 8 state,
+a teacher-projection realization path that starts from the maintained state
+rather than the post-exact substate,
+or route-local correction capacity if shared realization still cannot produce a
+promotable owned-route update.
+```
+
+Transactional `{25}` probe from the maintained baseline
+------------------------------------------------------
+
+That transactional check was then run explicitly from the maintained
+`D = 4 / 0 / 8` state:
+
+```text
+maintained baseline
+    -> exact-zero {25}
+    -> apply the best expanded `{25}` compensation block
+    -> score the final selected objective
+```
+
+The result is:
+
+```text
+measured      = yes
+selected_safe = yes
+improves      = no
+flips         = 4
+selected node = 1
+route gap     = 33
+node1 pop     = 158
+node6 pop     = 154
+selected obj  = 4 / 0 / 8
+```
+
+So the useful correction is:
+
+```text
+the `{25}` compensation is not merely failing because it was replayed without
+its exact-zero precondition;
+even as a single exact-zero-plus-compensation transaction from the maintained
+baseline, it is selected-safe but still does not improve beyond 4 / 0 / 8.
+```
+
+That makes the next frontier tighter again:
+
+```text
+baseline-safe `{25}` transactions exist,
+but the currently found exact-zero-plus-compensation transaction only preserves
+the maintained floor; it does not beat it.
+```
+
+So the next meaningful search needs to be:
+
+```text
+transactional structural search directly from the maintained 4 / 0 / 8 state,
+with exact-zero and compensation chosen together as one candidate block,
+rather than promotion of a post-exact local compensation result.
+```
+
+Baseline-state structural transaction search
+-------------------------------------------
+
+That search was then run directly from the maintained `D = 4 / 0 / 8` state
+across the residual subsets:
+
+```text
+{25}
+{26}
+{28}
+{29}
+{25,26}
+...
+{25,26,28,29}
+```
+
+For each subset, the transaction unit was:
+
+```text
+maintained baseline
+    -> exact-zero realization for the subset
+    -> bounded compensation/search block from the maintained-state effect pool
+    -> score only the final selected objective
+```
+
+The baseline effect pool used:
+
+```text
+all single final-layer toggles on nodes 1 and 6
+```
+
+and each subset tested:
+
+```text
+816 bounded compensation combinations
+```
+
+The important split is:
+
+```text
+subsets without bit 28:
+        selected-safe transactions exist
+        but they do not improve beyond 4 / 0 / 8
+
+subsets including bit 28:
+        selected-safe improving transactions do exist
+        and they reach 3 / 0 / 6 from the maintained baseline
+```
+
+Focused examples:
+
+```text
+{25}:
+        selected-safe = yes
+        improves      = no
+        final         = 4 / 0 / 8
+
+{28}:
+        selected-safe = yes
+        improves      = yes
+        final         = 3 / 0 / 6
+
+{25,28}:
+        selected-safe = yes
+        improves      = yes
+        final         = 3 / 0 / 6
+
+{25,26,28,29}:
+        selected-safe = yes
+        improves      = yes
+        final         = 3 / 0 / 6
+```
+
+The best compensation label found in this bounded search is the same across the
+improving subsets:
+
+```text
+n6.i0.b5=1 + n6.i0.b16=1 + n6.i0.b35=1
+```
+
+So the current boundary is better than before:
+
+```text
+baseline-state promotable shared-mask transactions do exist,
+but the current bounded search only moves the maintained floor from 4 / 0 / 8
+to 3 / 0 / 6, and only for residual subsets that include bit 28.
+```
+
+That means the shared final-layer realization path is not exhausted yet. The
+next meaningful move is no longer route-local correction capacity by default.
+It is:
+
+```text
+promote the best maintained-state improving subset transaction
+into the D replay path,
+then test whether 3 / 0 / 6 is stable under the owned-route maintenance chain.
+```
+
+Promoted maintained-state transaction baseline
+---------------------------------------------
+
+That promotion was then carried through using the best maintained-state subset
+transaction from the baseline structural search.
+
+The committed replay policy is now:
+
+```text
+d_commit_budget       = 5
+d_commit_budget_class = baseline-structural-selected-objective-block
+```
+
+And the promoted `D` floor becomes:
+
+```text
+d_post_commit_forced = 3 / 0 / 6
+```
+
+The maintenance replay check on the owned route also holds that same floor:
+
+```text
+d_post_replay_forced       = 3 / 0 / 6
+d_post_replay_budget       = 5
+d_post_replay_budget_class = baseline-structural-selected-objective-block
+```
+
+The promotion probe itself is now:
+
+```text
+measured      = yes
+selected_safe = yes
+improves      = yes
+final_stable  = yes
+selected route = 1
+gap after      = 33
+selected obj   = 3 / 0 / 6
+```
+
+So the current maintained focused state is now stronger again:
+
+```text
+A remains solved
+B remains improved
+C remains solved
+D now holds 3 / 0 / 6 under replay
+all route-key gaps remain positive
+```
+
+This updates the route-local decoder frontier:
+
+```text
+the right unit was not post-exact local compensation;
+the right unit was a maintained-baseline structural selected-objective block.
+```
+
+And the current best focused route-owned stack is now:
+
+```text
+route-key selector:
+        stable through A/B/C/D
+
+route table and replay policy:
+        stable
+
+D maintained replay:
+        improved from 4 / 0 / 8
+        to 3 / 0 / 6
+        with a maintained-state structural selected-objective block
+```
+
+The next frontier is therefore the same pattern applied again from the new
+maintained `D = 3 / 0 / 6` baseline:
+
+```text
+1. decompose the new residual selected-node errors
+2. run maintained-baseline structural transaction search
+3. promote only transactions discovered from that maintained state
+4. rerun the full replay chain
+```
+
+Post-commit residual recompute at `D = 3 / 0 / 6`
+--------------------------------------------------
+
+The residual/profile decomposition was then rerun from the actual committed
+post-promotion state, rather than reusing the earlier `4 / 0 / 8` snapshot.
+
+The authoritative post-commit profile is now:
+
+```text
+selected node = 1
+gap           = 0
+segments      = 4
+threshold     = 3
+false positives = 3
+false negatives = 0
+confident false positives = 3
+```
+
+The remaining selected-node residual wall at the committed `3 / 0 / 6` floor is:
+
+```text
+bit 25: target 0, node 1, ones 4, threshold 3, max_zero 2, excess 2,
+        candidate_votes 4, mask_flips 2,
+        reason candidate-for-different-internal-node
+
+bit 26: target 0, node 1, ones 4, threshold 3, max_zero 2, excess 2,
+        candidate_votes 4, mask_flips 2,
+        reason candidate-for-different-internal-node
+
+bit 29: target 0, node 1, ones 4, threshold 3, max_zero 2, excess 2,
+        candidate_votes 4, mask_flips 2,
+        reason candidate-for-different-internal-node
+```
+
+So the next maintained-baseline structural search should start from the actual
+committed `3 / 0 / 6` residual set:
+
+```text
+{ 25, 26, 29 }
+```
+
+not the older historical `4 / 0 / 8` wall.
+
+Maintained-baseline transaction search at `D = 3 / 0 / 6`
+----------------------------------------------------------
+
+That maintained-baseline structural transaction search was then rerun from the
+actual committed `3 / 0 / 6` state.
+
+The searched subset family is now exactly:
+
+```text
+{25}
+{26}
+{25,26}
+{29}
+{25,29}
+{26,29}
+{25,26,29}
+```
+
+For all seven subsets, the bounded baseline transaction search reports:
+
+```text
+pool          = 256
+tested        = 816
+selected_safe = 816
+improving     = 0
+found         = no
+```
+
+So the updated local frontier is now:
+
+```text
+D = 3 / 0 / 6 is the current maintained selected-objective floor.
+
+The new residual wall is {25, 26, 29}.
+Those residual bits still expose candidate-for-different-internal-node traces,
+but the current bounded maintained-baseline structural transaction search does
+not find another promotable improvement from this state.
+```
+
+That is a much narrower and cleaner stopping point than the earlier
+`4 / 0 / 8` frontier. The next useful move is no longer to reuse the older
+bit-28 gateway transactions; it is to decide whether to broaden the structural
+search further from `3 / 0 / 6`, or to treat `3 / 0 / 6` as the current owned-
+route floor and test a different realization mechanism for the residual
+`{25,26,29}` wall.
+
+Trimmed SAT-style oracle at `D = 3 / 0 / 6`
+--------------------------------------------
+
+After a disrupted run caused by a power outage, the SAT-style oracle was cut
+down to a bounded probe so the focused diagnostic would complete reliably:
+
+```text
+- post-commit residual wall only
+- small effect pool
+- exact-zero block plus at most one compensation flip
+```
+
+From the committed `D = 3 / 0 / 6` baseline, the bounded oracle reports:
+
+```text
+{25}:         pool 24, tested 300, selected_safe 300, improving 0
+{26}:         pool 24, tested 300, selected_safe 300, improving 0
+{25,26}:      pool 24, tested 300, selected_safe 300, improving 0
+{29}:         pool 24, tested 300, selected_safe 300, improving 0
+{25,29}:      pool 24, tested 300, selected_safe 300, improving 0
+{26,29}:      pool 24, tested 300, selected_safe 300, improving 0
+{25,26,29}:   pool 24, tested 300, selected_safe 300, improving 0
+```
+
+So the bounded SAT-style oracle does not change the current local conclusion:
+
+```text
+D = 3 / 0 / 6 remains the maintained floor,
+and neither the bounded maintained-baseline transaction search nor the trimmed
+bounded SAT-style oracle finds another promotable shared-mask improvement from
+the residual wall {25,26,29}.
+```
+
+Gray Payload Combined Probes
+----------------------------
+
+The direct Gray payload branch now has a stable layered training recipe for
+single-owner focused probes:
+
+```text
+1. run final-layer training with Gray offset retune
+2. freeze the resulting best offset
+3. run penultimate same-bit threshold-crossing bundles to stall
+```
+
+The order matters. An earlier ad hoc combined loop was misleading. Reusing the
+known-good final-layer-plus-offset helper as the baseline and only then adding a
+fixed-offset penultimate bundle phase produces coherent results.
+
+Current focused results:
+
+```text
+A:
+    before 1 / 4 / 0
+    after  0 / 0 / 0
+    final singles        1
+    penultimate bundles  0
+
+B:
+    before 31 / 120 / 0
+    after   0 /   0 / 0
+    final singles       19
+    penultimate bundles  1
+
+C:
+    before 1 / 0 / 0
+    after  0 / 0 / 0
+    final singles        0
+    penultimate bundles  1
+```
+
+So the current Gray payload interpretation is no longer:
+
+```text
+final-only
+or
+penultimate-only
+```
+
+but:
+
+```text
+final-layer and penultimate-layer work should both be available,
+with final-layer repair first,
+then offset pinned,
+then penultimate threshold-crossing cleanup.
+```
+
+That gives a clean layered allocation:
+
+```text
+A: final-layer cleanup is sufficient
+B: final-layer gets close; penultimate clears the residual
+C: penultimate clears the residual immediately once offset is pinned
 ```

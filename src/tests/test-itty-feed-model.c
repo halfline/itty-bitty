@@ -44,6 +44,11 @@ create_vocabulary (char **text_file,
         return itty_vocabulary_new (*text_file, *bit_string_file);
 }
 
+static bool measure_output_activation_for_node (itty_feed_model_t      *model,
+                                                itty_bit_string_list_t *input,
+                                                size_t                  node_index,
+                                                itty_bit_string_t     **activation_out);
+
 static itty_bit_string_list_t *
 create_input (void)
 {
@@ -72,6 +77,78 @@ typedef struct {
 } route_key_selection_summary_t;
 
 typedef struct {
+        size_t threshold;
+        bool   measured;
+        size_t regressions;
+        size_t total_distance;
+        size_t total_excess;
+        size_t d_selected_node;
+        size_t d_selected_gap;
+        itty_feed_model_decoder_objective_t objectives[4];
+} within_node_threshold_sweep_summary_t;
+
+typedef struct {
+        size_t threshold;
+        bool   measured;
+        size_t fixed_node;
+        size_t selected_node;
+        size_t node1_popcount;
+        size_t node6_popcount;
+        ptrdiff_t node1_vs_node6_gap;
+        itty_feed_model_decoder_objective_t node1_objective;
+} fixed_node_threshold_sweep_summary_t;
+
+static int
+compare_within_node_threshold_sweep_summary (void const *left_ptr,
+                                             void const *right_ptr)
+{
+        within_node_threshold_sweep_summary_t const *left = left_ptr;
+        within_node_threshold_sweep_summary_t const *right = right_ptr;
+
+        if (left->measured != right->measured)
+                return left->measured ? -1 : 1;
+        if (left->regressions != right->regressions)
+                return left->regressions < right->regressions ? -1 : 1;
+        if (left->objectives[3].selected_distance != right->objectives[3].selected_distance)
+                return left->objectives[3].selected_distance < right->objectives[3].selected_distance ? -1 : 1;
+        if (left->objectives[3].false_negative_vote_deficit != right->objectives[3].false_negative_vote_deficit)
+                return left->objectives[3].false_negative_vote_deficit < right->objectives[3].false_negative_vote_deficit ? -1 : 1;
+        if (left->objectives[3].false_positive_vote_excess != right->objectives[3].false_positive_vote_excess)
+                return left->objectives[3].false_positive_vote_excess < right->objectives[3].false_positive_vote_excess ? -1 : 1;
+        if (left->d_selected_gap != right->d_selected_gap)
+                return left->d_selected_gap > right->d_selected_gap ? -1 : 1;
+        if (left->total_distance != right->total_distance)
+                return left->total_distance < right->total_distance ? -1 : 1;
+        if (left->total_excess != right->total_excess)
+                return left->total_excess < right->total_excess ? -1 : 1;
+        if (left->threshold != right->threshold)
+                return left->threshold < right->threshold ? -1 : 1;
+        return 0;
+}
+
+static int
+compare_fixed_node_threshold_sweep_summary (void const *left_ptr,
+                                            void const *right_ptr)
+{
+        fixed_node_threshold_sweep_summary_t const *left = left_ptr;
+        fixed_node_threshold_sweep_summary_t const *right = right_ptr;
+
+        if (left->measured != right->measured)
+                return left->measured ? -1 : 1;
+        if (left->node1_objective.selected_distance != right->node1_objective.selected_distance)
+                return left->node1_objective.selected_distance < right->node1_objective.selected_distance ? -1 : 1;
+        if (left->node1_objective.false_negative_vote_deficit != right->node1_objective.false_negative_vote_deficit)
+                return left->node1_objective.false_negative_vote_deficit < right->node1_objective.false_negative_vote_deficit ? -1 : 1;
+        if (left->node1_objective.false_positive_vote_excess != right->node1_objective.false_positive_vote_excess)
+                return left->node1_objective.false_positive_vote_excess < right->node1_objective.false_positive_vote_excess ? -1 : 1;
+        if (left->node1_vs_node6_gap != right->node1_vs_node6_gap)
+                return left->node1_vs_node6_gap > right->node1_vs_node6_gap ? -1 : 1;
+        if (left->threshold != right->threshold)
+                return left->threshold < right->threshold ? -1 : 1;
+        return 0;
+}
+
+typedef struct {
         size_t a_selected_route;
         size_t a_selected_gap;
         size_t b_selected_route;
@@ -79,6 +156,12 @@ typedef struct {
         size_t c_selected_route;
         size_t c_selected_gap;
 } route_key_selection_summary_abc_t;
+
+typedef struct {
+        size_t selected_route;
+        size_t selected_gap;
+        size_t nearest_competing_route;
+} route_key_probe_summary_t;
 
 static route_key_selection_summary_t
 measure_route_key_selection (itty_bit_string_t **route_keys,
@@ -169,6 +252,706 @@ measure_route_key_selection_abc (itty_bit_string_t **route_keys,
         return summary;
 }
 
+static route_key_probe_summary_t
+measure_route_key_selection_for_probe (itty_bit_string_t **route_keys,
+                                       size_t              nodes,
+                                       itty_bit_string_t  *probe)
+{
+        route_key_probe_summary_t summary = { 0 };
+        size_t selected_score = 0;
+        size_t runner_up_score = 0;
+
+        for (size_t route = 0; route < nodes; route++) {
+                size_t score = itty_bit_string_evaluate_similarity (probe, route_keys[route]);
+
+                if (route == 0 || score > selected_score) {
+                        runner_up_score = selected_score;
+                        summary.nearest_competing_route = summary.selected_route;
+                        selected_score = score;
+                        summary.selected_route = route;
+                } else if (score > runner_up_score) {
+                        runner_up_score = score;
+                        summary.nearest_competing_route = route;
+                }
+        }
+
+        summary.selected_gap = selected_score - runner_up_score;
+        return summary;
+}
+
+static bool
+route_objective_not_worse_than_committed (itty_feed_model_decoder_objective_t const *after,
+                                          itty_feed_model_decoder_objective_t const *committed)
+{
+        if (after->selected_distance > committed->selected_distance)
+                return false;
+        if (after->selected_distance < committed->selected_distance)
+                return true;
+        if (after->false_negative_vote_deficit > committed->false_negative_vote_deficit)
+                return false;
+        if (after->false_negative_vote_deficit < committed->false_negative_vote_deficit)
+                return true;
+        if (after->false_positive_vote_excess > committed->false_positive_vote_excess)
+                return false;
+        return true;
+}
+
+static bool
+route_objective_improves_on_committed (itty_feed_model_decoder_objective_t const *after,
+                                       itty_feed_model_decoder_objective_t const *committed)
+{
+        if (after->selected_distance < committed->selected_distance)
+                return true;
+        if (after->selected_distance > committed->selected_distance)
+                return false;
+        if (after->false_negative_vote_deficit < committed->false_negative_vote_deficit)
+                return true;
+        if (after->false_negative_vote_deficit > committed->false_negative_vote_deficit)
+                return false;
+        return after->false_positive_vote_excess < committed->false_positive_vote_excess;
+}
+
+static bool
+train_owner_to_convergence (itty_feed_model_t                     *model,
+                            itty_bit_string_list_t                *input,
+                            itty_bit_string_t                     *target,
+                            size_t                                 route,
+                            itty_feed_model_train_options_t const *options,
+                            size_t                                 max_passes,
+                            size_t                                *accepted_passes,
+                            itty_feed_model_decoder_objective_t   *final_objective)
+{
+        itty_feed_model_decoder_objective_t current = { 0 };
+
+        if (accepted_passes)
+                *accepted_passes = 0;
+        if (final_objective)
+                *final_objective = (itty_feed_model_decoder_objective_t) { 0 };
+        if (!itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                 input,
+                                                                 target,
+                                                                 route,
+                                                                 &current))
+                return false;
+
+        for (size_t pass_index = 0; pass_index < max_passes; pass_index++) {
+                itty_feed_model_layer_state_snapshot_t *snapshot =
+                        itty_feed_model_snapshot_final_layer_state (model);
+                itty_feed_model_decoder_objective_t candidate = { 0 };
+
+                if (!snapshot)
+                        return false;
+                if (!itty_feed_model_train_final_layer_with_suffix_oracle_for_node (model,
+                                                                                    input,
+                                                                                    target,
+                                                                                    route,
+                                                                                    options,
+                                                                                    NULL) ||
+                    !itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                         input,
+                                                                         target,
+                                                                         route,
+                                                                         &candidate)) {
+                        itty_feed_model_restore_final_layer_state_snapshot (model, snapshot);
+                        return false;
+                }
+
+                if (!route_objective_improves_on_committed (&candidate, &current)) {
+                        itty_feed_model_restore_final_layer_state_snapshot (model, snapshot);
+                        break;
+                }
+
+                itty_feed_model_free_final_layer_state_snapshot (model, snapshot);
+                current = candidate;
+                if (accepted_passes)
+                        (*accepted_passes)++;
+        }
+
+        if (final_objective)
+                *final_objective = current;
+        return true;
+}
+
+static bool
+find_best_gray_offset_for_route (itty_feed_model_t                   *model,
+                                 itty_bit_string_list_t              *input,
+                                 itty_bit_string_t                   *target,
+                                 size_t                               route,
+                                 size_t                              *best_offset_out,
+                                 itty_feed_model_decoder_objective_t *best_objective_out)
+{
+        itty_bit_string_t *activation = NULL;
+        size_t activation_bit_capacity;
+        size_t payload_bit_capacity;
+        size_t min_start = 8;
+        size_t max_start;
+        bool found = false;
+        size_t best_offset = 0;
+        itty_feed_model_decoder_objective_t best_objective = { 0 };
+
+        if (!measure_output_activation_for_node (model, input, route, &activation))
+                return false;
+
+        activation_bit_capacity = itty_bit_string_get_bit_capacity (activation);
+        payload_bit_capacity = itty_bit_string_get_bit_capacity (target);
+        itty_bit_string_free (activation);
+
+        if (activation_bit_capacity <= payload_bit_capacity ||
+            activation_bit_capacity <= min_start)
+                return false;
+
+        max_start = activation_bit_capacity - payload_bit_capacity;
+        if (max_start < min_start)
+                return false;
+
+        for (size_t payload_start = min_start; payload_start <= max_start; payload_start++) {
+                itty_feed_model_decoder_objective_t candidate = { 0 };
+
+                itty_feed_model_set_gray_offset_override (model, route, true, payload_start);
+                if (!itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                         input,
+                                                                         target,
+                                                                         route,
+                                                                         &candidate))
+                        continue;
+
+                if (!found ||
+                    route_objective_improves_on_committed (&candidate, &best_objective)) {
+                        found = true;
+                        best_offset = payload_start;
+                        best_objective = candidate;
+                }
+        }
+
+        if (!found)
+                return false;
+
+        if (best_offset_out)
+                *best_offset_out = best_offset;
+        if (best_objective_out)
+                *best_objective_out = best_objective;
+        return true;
+}
+
+static bool
+train_gray_owner_with_offset_search (itty_feed_model_t                     *model,
+                                     itty_bit_string_list_t                *input,
+                                     itty_bit_string_t                     *target,
+                                     size_t                                 route,
+                                     itty_feed_model_train_options_t const *options,
+                                     size_t                                 max_passes_per_phase,
+                                     size_t                                 max_retunes,
+                                     size_t                                *accepted_passes,
+                                     itty_feed_model_decoder_objective_t   *final_objective)
+{
+        size_t accepted_total = 0;
+        size_t current_offset = 0;
+        itty_feed_model_decoder_objective_t current = { 0 };
+
+        if (!find_best_gray_offset_for_route (model,
+                                              input,
+                                              target,
+                                              route,
+                                              &current_offset,
+                                              &current))
+                return false;
+
+        itty_feed_model_set_gray_offset_override (model, route, true, current_offset);
+
+        for (size_t retune_index = 0; retune_index < max_retunes; retune_index++) {
+                size_t accepted_phase = 0;
+                itty_feed_model_decoder_objective_t converged = { 0 };
+                size_t best_offset = current_offset;
+                itty_feed_model_decoder_objective_t best_objective = current;
+
+                if (!train_owner_to_convergence (model,
+                                                 input,
+                                                 target,
+                                                 route,
+                                                 options,
+                                                 max_passes_per_phase,
+                                                 &accepted_phase,
+                                                 &converged))
+                        return false;
+
+                accepted_total += accepted_phase;
+                current = converged;
+
+                if (!find_best_gray_offset_for_route (model,
+                                                      input,
+                                                      target,
+                                                      route,
+                                                      &best_offset,
+                                                      &best_objective))
+                        return false;
+
+                if (!route_objective_improves_on_committed (&best_objective, &current)) {
+                        itty_feed_model_set_gray_offset_override (model, route, true, current_offset);
+                        break;
+                }
+
+                current_offset = best_offset;
+                current = best_objective;
+                itty_feed_model_set_gray_offset_override (model, route, true, current_offset);
+        }
+
+        if (accepted_passes)
+                *accepted_passes = accepted_total;
+        if (final_objective)
+                *final_objective = current;
+        return true;
+}
+
+static bool
+train_owner_single_final_slice (itty_feed_model_t                     *model,
+                                itty_bit_string_list_t                *input,
+                                itty_bit_string_t                     *target,
+                                size_t                                 route,
+                                itty_feed_model_train_options_t const *options,
+                                itty_feed_model_decoder_objective_t   *after_objective,
+                                bool                                  *improved)
+{
+        size_t accepted_passes = 0;
+        itty_feed_model_decoder_objective_t candidate = { 0 };
+
+        if (!train_owner_to_convergence (model,
+                                         input,
+                                         target,
+                                         route,
+                                         options,
+                                         1,
+                                         &accepted_passes,
+                                         &candidate))
+                return false;
+
+        if (after_objective)
+                *after_objective = candidate;
+        if (improved)
+                *improved = accepted_passes > 0;
+        return true;
+}
+
+static bool
+train_owner_single_penultimate_slice (itty_feed_model_t                   *model,
+                                      itty_bit_string_list_t              *input,
+                                      itty_bit_string_t                   *target,
+                                      size_t                               route,
+                                      itty_feed_model_decoder_objective_t *after_objective,
+                                      bool                                *improved)
+{
+        itty_feed_model_refreshed_projected_repair_options_t options = {
+                .batch_size = 8,
+                .max_rounds = 1,
+                .max_layer_flips_per_batch = 32,
+                .max_blocks_per_final_node = 4,
+                .top_k_segment_vote_alternatives = 4,
+        };
+        itty_feed_model_refreshed_projected_repair_stats_t stats = { 0 };
+        itty_feed_model_decoder_objective_t candidate = { 0 };
+
+        if (!itty_feed_model_train_penultimate_layer_with_refreshed_final_repairs (model,
+                                                                                    input,
+                                                                                    target,
+                                                                                    &options,
+                                                                                    &stats) ||
+            !itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                 input,
+                                                                 target,
+                                                                 route,
+                                                                 &candidate))
+                return false;
+
+        if (after_objective)
+                *after_objective = candidate;
+        if (improved)
+                *improved = stats.accepted_rounds > 0;
+        return true;
+}
+
+static bool
+train_gray_owner_penultimate_only_with_offset_search (itty_feed_model_t                   *model,
+                                                      itty_bit_string_list_t              *input,
+                                                      itty_bit_string_t                   *target,
+                                                      size_t                               route,
+                                                      size_t                               max_slices_per_phase,
+                                                      size_t                               max_retunes,
+                                                      size_t                              *accepted_slices,
+                                                      size_t                              *penultimate_slices_committed,
+                                                      itty_feed_model_decoder_objective_t *final_objective)
+{
+        size_t accepted_total = 0;
+        size_t penultimate_committed_total = 0;
+        size_t current_offset = 0;
+        itty_feed_model_decoder_objective_t current = { 0 };
+
+        if (!find_best_gray_offset_for_route (model,
+                                              input,
+                                              target,
+                                              route,
+                                              &current_offset,
+                                              &current))
+                return false;
+
+        itty_feed_model_set_gray_offset_override (model, route, true, current_offset);
+
+        for (size_t retune_index = 0; retune_index < max_retunes; retune_index++) {
+                bool phase_progress = false;
+
+                for (size_t slice_index = 0; slice_index < max_slices_per_phase; slice_index++) {
+                        itty_feed_model_layer_state_snapshot_t *penultimate_snapshot;
+                        itty_feed_model_decoder_objective_t penultimate_candidate = current;
+                        bool penultimate_improved = false;
+                        bool committed = false;
+
+                        penultimate_snapshot = itty_feed_model_snapshot_penultimate_layer_state (model);
+                        if (!penultimate_snapshot)
+                                return false;
+                        if (!train_owner_single_penultimate_slice (model,
+                                                                   input,
+                                                                   target,
+                                                                   route,
+                                                                   &penultimate_candidate,
+                                                                   &penultimate_improved)) {
+                                itty_feed_model_restore_penultimate_layer_state_snapshot (model, penultimate_snapshot);
+                                return false;
+                        }
+                        penultimate_improved = penultimate_improved &&
+                                               route_objective_improves_on_committed (&penultimate_candidate, &current);
+                        itty_feed_model_restore_penultimate_layer_state_snapshot (model, penultimate_snapshot);
+
+                        if (!penultimate_improved)
+                                break;
+
+                        if (!train_owner_single_penultimate_slice (model,
+                                                                   input,
+                                                                   target,
+                                                                   route,
+                                                                   &penultimate_candidate,
+                                                                   &committed))
+                                return false;
+                        if (!committed ||
+                            !route_objective_improves_on_committed (&penultimate_candidate, &current))
+                                return false;
+
+                        current = penultimate_candidate;
+                        accepted_total++;
+                        penultimate_committed_total++;
+                        phase_progress = true;
+                }
+
+                {
+                        size_t best_offset = current_offset;
+                        itty_feed_model_decoder_objective_t best_objective = current;
+
+                        if (!find_best_gray_offset_for_route (model,
+                                                              input,
+                                                              target,
+                                                              route,
+                                                              &best_offset,
+                                                              &best_objective))
+                                return false;
+
+                        if (route_objective_improves_on_committed (&best_objective, &current)) {
+                                current_offset = best_offset;
+                                current = best_objective;
+                                itty_feed_model_set_gray_offset_override (model, route, true, current_offset);
+                                continue;
+                        }
+                        itty_feed_model_set_gray_offset_override (model, route, true, current_offset);
+                }
+
+                if (!phase_progress)
+                        break;
+        }
+
+        if (accepted_slices)
+                *accepted_slices = accepted_total;
+        if (penultimate_slices_committed)
+                *penultimate_slices_committed = penultimate_committed_total;
+        if (final_objective)
+                *final_objective = current;
+        return true;
+}
+
+static bool
+train_gray_owner_penultimate_bruteforce_with_offset_search (itty_feed_model_t                   *model,
+                                                            itty_bit_string_list_t              *input,
+                                                            itty_bit_string_t                   *target,
+                                                            size_t                               route,
+                                                            size_t                               max_slices_per_phase,
+                                                            size_t                               max_retunes,
+                                                            size_t                              *accepted_slices,
+                                                            size_t                              *penultimate_slices_committed,
+                                                            itty_feed_model_decoder_objective_t *final_objective)
+{
+        size_t accepted_total = 0;
+        size_t penultimate_committed_total = 0;
+        size_t current_offset = 0;
+        itty_feed_model_decoder_objective_t current = { 0 };
+
+        if (!find_best_gray_offset_for_route (model,
+                                              input,
+                                              target,
+                                              route,
+                                              &current_offset,
+                                              &current))
+                return false;
+
+        itty_feed_model_set_gray_offset_override (model, route, true, current_offset);
+
+        for (size_t retune_index = 0; retune_index < max_retunes; retune_index++) {
+                bool phase_progress = false;
+
+                for (size_t slice_index = 0; slice_index < max_slices_per_phase; slice_index++) {
+                        bool found = false;
+                        itty_feed_model_mask_flip_trace_t best_trace = { 0 };
+                        itty_feed_model_decoder_objective_t best_objective = { 0 };
+
+                        if (!itty_feed_model_measure_best_single_penultimate_layer_flip_for_node (model,
+                                                                                                   input,
+                                                                                                   target,
+                                                                                                   route,
+                                                                                                   &found,
+                                                                                                   &best_trace,
+                                                                                                   &best_objective))
+                                return false;
+
+                        if (!found ||
+                            !route_objective_improves_on_committed (&best_objective, &current))
+                                break;
+
+                        if (!itty_feed_model_apply_penultimate_layer_mask_flip_trace (model, &best_trace))
+                                return false;
+
+                        current = best_objective;
+                        accepted_total++;
+                        penultimate_committed_total++;
+                        phase_progress = true;
+                }
+
+                {
+                        size_t best_offset = current_offset;
+                        itty_feed_model_decoder_objective_t best_objective = current;
+
+                        if (!find_best_gray_offset_for_route (model,
+                                                              input,
+                                                              target,
+                                                              route,
+                                                              &best_offset,
+                                                              &best_objective))
+                                return false;
+
+                        if (route_objective_improves_on_committed (&best_objective, &current)) {
+                                current_offset = best_offset;
+                                current = best_objective;
+                                itty_feed_model_set_gray_offset_override (model, route, true, current_offset);
+                                continue;
+                        }
+                        itty_feed_model_set_gray_offset_override (model, route, true, current_offset);
+                }
+
+                if (!phase_progress)
+                        break;
+        }
+
+        if (accepted_slices)
+                *accepted_slices = accepted_total;
+        if (penultimate_slices_committed)
+                *penultimate_slices_committed = penultimate_committed_total;
+        if (final_objective)
+                *final_objective = current;
+        return true;
+}
+
+static bool
+train_gray_owner_with_layer_scheduler (itty_feed_model_t                     *model,
+                                       itty_bit_string_list_t                *input,
+                                       itty_bit_string_t                     *target,
+                                       size_t                                 route,
+                                       itty_feed_model_train_options_t const *options,
+                                       size_t                                 max_slices_per_phase,
+                                       size_t                                 max_retunes,
+                                       size_t                                *accepted_slices,
+                                       size_t                                *final_slices_committed,
+                                       size_t                                *penultimate_slices_committed,
+                                       itty_feed_model_decoder_objective_t   *final_objective)
+{
+        size_t accepted_total = 0;
+        size_t final_committed_total = 0;
+        size_t penultimate_committed_total = 0;
+        size_t current_offset = 0;
+        itty_feed_model_decoder_objective_t current = { 0 };
+
+        if (!find_best_gray_offset_for_route (model,
+                                              input,
+                                              target,
+                                              route,
+                                              &current_offset,
+                                              &current))
+                return false;
+
+        itty_feed_model_set_gray_offset_override (model, route, true, current_offset);
+
+        for (size_t retune_index = 0; retune_index < max_retunes; retune_index++) {
+                bool phase_progress = false;
+
+                for (size_t slice_index = 0; slice_index < max_slices_per_phase; slice_index++) {
+                        itty_feed_model_layer_state_snapshot_t *final_snapshot;
+                        itty_feed_model_layer_state_snapshot_t *penultimate_snapshot;
+                        itty_feed_model_decoder_objective_t final_candidate = current;
+                        itty_feed_model_decoder_objective_t penultimate_candidate = current;
+                        bool final_improved = false;
+                        bool penultimate_improved = false;
+                        bool choose_final = false;
+                        bool choose_penultimate = false;
+
+                        final_snapshot = itty_feed_model_snapshot_final_layer_state (model);
+                        if (!final_snapshot)
+                                return false;
+                        if (!train_owner_single_final_slice (model,
+                                                            input,
+                                                            target,
+                                                            route,
+                                                            options,
+                                                            &final_candidate,
+                                                            &final_improved)) {
+                                itty_feed_model_restore_final_layer_state_snapshot (model, final_snapshot);
+                                return false;
+                        }
+                        final_improved = final_improved &&
+                                         route_objective_improves_on_committed (&final_candidate, &current);
+                        itty_feed_model_restore_final_layer_state_snapshot (model, final_snapshot);
+
+                        penultimate_snapshot = itty_feed_model_snapshot_penultimate_layer_state (model);
+                        if (!penultimate_snapshot)
+                                return false;
+                        if (!train_owner_single_penultimate_slice (model,
+                                                                   input,
+                                                                   target,
+                                                                   route,
+                                                                   &penultimate_candidate,
+                                                                   &penultimate_improved)) {
+                                itty_feed_model_restore_penultimate_layer_state_snapshot (model, penultimate_snapshot);
+                                return false;
+                        }
+                        penultimate_improved = penultimate_improved &&
+                                               route_objective_improves_on_committed (&penultimate_candidate, &current);
+                        itty_feed_model_restore_penultimate_layer_state_snapshot (model, penultimate_snapshot);
+
+                        if (penultimate_improved) {
+                                choose_penultimate = true;
+                        } else if (final_improved) {
+                                choose_final = true;
+                        } else {
+                                break;
+                        }
+
+                        if (choose_final) {
+                                bool committed = false;
+
+                                if (!train_owner_single_final_slice (model,
+                                                                    input,
+                                                                    target,
+                                                                    route,
+                                                                    options,
+                                                                    &final_candidate,
+                                                                    &committed))
+                                        return false;
+                                if (!committed ||
+                                    !route_objective_improves_on_committed (&final_candidate, &current))
+                                        return false;
+                                current = final_candidate;
+                                final_committed_total++;
+                        } else if (choose_penultimate) {
+                                bool committed = false;
+
+                                if (!train_owner_single_penultimate_slice (model,
+                                                                           input,
+                                                                           target,
+                                                                           route,
+                                                                           &penultimate_candidate,
+                                                                           &committed))
+                                        return false;
+                                if (!committed ||
+                                    !route_objective_improves_on_committed (&penultimate_candidate, &current))
+                                        return false;
+                                current = penultimate_candidate;
+                                penultimate_committed_total++;
+                        }
+
+                        accepted_total++;
+                        phase_progress = true;
+                }
+
+                {
+                        size_t best_offset = current_offset;
+                        itty_feed_model_decoder_objective_t best_objective = current;
+
+                        if (!find_best_gray_offset_for_route (model,
+                                                              input,
+                                                              target,
+                                                              route,
+                                                              &best_offset,
+                                                              &best_objective))
+                                return false;
+
+                        if (route_objective_improves_on_committed (&best_objective, &current)) {
+                                current_offset = best_offset;
+                                current = best_objective;
+                                itty_feed_model_set_gray_offset_override (model, route, true, current_offset);
+                                continue;
+                        }
+                        itty_feed_model_set_gray_offset_override (model, route, true, current_offset);
+                }
+
+                if (!phase_progress)
+                        break;
+        }
+
+        if (accepted_slices)
+                *accepted_slices = accepted_total;
+        if (final_slices_committed)
+                *final_slices_committed = final_committed_total;
+        if (penultimate_slices_committed)
+                *penultimate_slices_committed = penultimate_committed_total;
+        if (final_objective)
+                *final_objective = current;
+        return true;
+}
+
+static bool
+route_objective_improves_excess_cleanup_baseline (itty_feed_model_decoder_objective_t const *after,
+                                                  itty_feed_model_decoder_objective_t const *baseline)
+{
+        if (after->selected_distance < baseline->selected_distance)
+                return true;
+        if (after->selected_distance > baseline->selected_distance)
+                return false;
+        if (after->false_positive_vote_excess < baseline->false_positive_vote_excess)
+                return true;
+        if (after->false_positive_vote_excess > baseline->false_positive_vote_excess)
+                return false;
+        return after->target_zero_safety > baseline->target_zero_safety;
+}
+
+static bool
+measure_selected_node_objective (itty_feed_model_t                               *model,
+                                 itty_bit_string_list_t                          *input,
+                                 itty_bit_string_t                               *target,
+                                 itty_feed_model_segment_node_selection_summary_t *selection,
+                                 itty_feed_model_decoder_objective_t             *objective)
+{
+        return itty_feed_model_measure_segment_node_selection (model,
+                                                               input,
+                                                               target,
+                                                               selection) &&
+               itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                   input,
+                                                                   target,
+                                                                   selection->selected_by_popcount,
+                                                                   objective);
+}
+
 static size_t
 create_half_populated_word (void)
 {
@@ -221,6 +1004,108 @@ get_result_distance_to_target (itty_inference_result_t *result,
                 itty_bit_string_free (folded_activation);
         itty_bit_string_free (difference);
         return distance;
+}
+
+static bool
+measure_output_activation_for_node (itty_feed_model_t      *model,
+                                    itty_bit_string_list_t *input,
+                                    size_t                  node_index,
+                                    itty_bit_string_t     **activation_out)
+{
+        return itty_feed_model_measure_node_activation_output (model,
+                                                               input,
+                                                               node_index,
+                                                               activation_out);
+}
+
+static size_t
+measure_bit_string_distance (itty_bit_string_t *a,
+                             itty_bit_string_t *b)
+{
+        itty_bit_string_t *difference = itty_bit_string_exclusive_or (a, b);
+        size_t distance = difference ? itty_bit_string_get_pop_count (difference) : 0;
+
+        if (difference)
+                itty_bit_string_free (difference);
+        return distance;
+}
+
+static bool
+measure_public_bit (itty_bit_string_t *bit_string,
+                    size_t             bit_index)
+{
+        size_t word_index = bit_index / ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+        size_t bit_offset = bit_index % ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+        size_t word_count = itty_bit_string_get_number_of_words (bit_string);
+        size_t *words;
+
+        if (!bit_string || word_index >= word_count)
+                return false;
+
+        words = itty_bit_string_get_words (bit_string);
+        return (words[word_index] & (((size_t) 1) << bit_offset)) != 0;
+}
+
+static bool
+build_selected_node_direct_clear_teacher (itty_feed_model_t      *model,
+                                          itty_bit_string_list_t *input,
+                                          itty_bit_string_t      *target,
+                                          size_t                  node_index,
+                                          size_t const           *decoded_bits,
+                                          size_t                  decoded_bit_count,
+                                          itty_bit_string_t     **teacher_out)
+{
+        itty_bit_string_t *teacher = NULL;
+        size_t target_bit_capacity;
+        size_t output_bit_capacity;
+        size_t *teacher_words;
+
+        if (!teacher_out || !measure_output_activation_for_node (model, input, node_index, &teacher))
+                return false;
+
+        target_bit_capacity = itty_bit_string_get_number_of_words (target) * ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+        output_bit_capacity = itty_bit_string_get_bit_capacity (teacher);
+        teacher_words = itty_bit_string_get_words (teacher);
+        for (size_t decoded_index = 0; decoded_index < decoded_bit_count; decoded_index++) {
+                size_t decoded_bit = decoded_bits[decoded_index];
+                size_t ones = 0;
+                size_t threshold = output_bit_capacity / target_bit_capacity / 2 + 1;
+                size_t max_zero = threshold - 1;
+                size_t votes_needed;
+
+                for (size_t output_bit_index = decoded_bit;
+                     output_bit_index < output_bit_capacity;
+                     output_bit_index += target_bit_capacity) {
+                        size_t word_index = output_bit_index / ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+                        size_t bit_offset = output_bit_index % ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+
+                        if (teacher_words[word_index] & ((size_t) 1 << bit_offset))
+                                ones++;
+                }
+                if (ones <= max_zero) {
+                        itty_bit_string_free (teacher);
+                        return false;
+                }
+                votes_needed = ones - max_zero;
+                for (size_t output_bit_index = decoded_bit;
+                     output_bit_index < output_bit_capacity && votes_needed > 0;
+                     output_bit_index += target_bit_capacity) {
+                        size_t word_index = output_bit_index / ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+                        size_t bit_offset = output_bit_index % ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
+
+                        if (!(teacher_words[word_index] & ((size_t) 1 << bit_offset)))
+                                continue;
+                        teacher_words[word_index] &= ~((size_t) 1 << bit_offset);
+                        votes_needed--;
+                }
+                if (votes_needed != 0) {
+                        itty_bit_string_free (teacher);
+                        return false;
+                }
+        }
+
+        *teacher_out = teacher;
+        return true;
 }
 
 static void
@@ -1818,6 +2703,63 @@ restore_propagation_failure_to_string (itty_feed_model_restore_propagation_failu
         default:
                 return "unknown";
         }
+}
+
+static itty_feed_model_restore_failure_trace_t const *
+find_restore_trace_for_decoded_bit (itty_feed_model_restore_failure_summary_t const *summary,
+                                    size_t                                           decoded_bit)
+{
+        for (size_t trace_index = 0; trace_index < summary->trace_count; trace_index++) {
+                if (summary->traces[trace_index].decoded_bit == decoded_bit)
+                        return &summary->traces[trace_index];
+        }
+        return NULL;
+}
+
+static size_t
+count_cleared_votes_for_decoded_bit (itty_feed_model_restore_failure_summary_t const *summary,
+                                     size_t                                           decoded_bit)
+{
+        size_t cleared_votes = 0;
+
+        for (size_t trace_index = 0; trace_index < summary->clear_trace_count; trace_index++) {
+                if (summary->clear_traces[trace_index].decoded_bit == decoded_bit &&
+                    summary->clear_traces[trace_index].cleared)
+                        cleared_votes++;
+        }
+
+        return cleared_votes;
+}
+
+static char const *
+classify_excess_audit_trace (itty_feed_model_restore_failure_trace_t const *free_trace,
+                             size_t                                          replay_owner_rejections)
+{
+        if (free_trace->clearable_segment_votes == 0 ||
+            free_trace->rejection_reason == ITTY_FEED_MODEL_RESTORE_REJECTION_NO_FALSE_POSITIVES ||
+            free_trace->rejection_reason == ITTY_FEED_MODEL_RESTORE_REJECTION_NO_CANDIDATE_REPAIRS ||
+            free_trace->rejection_reason == ITTY_FEED_MODEL_RESTORE_REJECTION_NO_CLEARABLE_SEGMENT_VOTES)
+                return "no-zero-side-candidates-remain";
+
+        if (replay_owner_rejections > 0 && free_trace->accepted)
+                return "rejected-by-replay-owners";
+
+        if (free_trace->forced_node_distance_after > free_trace->forced_node_distance_before)
+                return "zero-side-candidates-hurt-target-one-bits";
+
+        if (free_trace->forced_node_false_positive_excess_after < free_trace->forced_node_false_positive_excess_before &&
+            free_trace->forced_node_distance_after == free_trace->forced_node_distance_before)
+                return "zero-side-candidates-reduce-excess-not-distance";
+
+        if (!free_trace->direct_candidate_changed ||
+            free_trace->candidate_mask_flips == 0 ||
+            free_trace->propagation_failure == ITTY_FEED_MODEL_RESTORE_PROPAGATION_NO_MAJORITY_CROSSING ||
+            free_trace->propagation_failure == ITTY_FEED_MODEL_RESTORE_PROPAGATION_DUPLICATE_CONDENSED_MAPPING ||
+            free_trace->propagation_failure == ITTY_FEED_MODEL_RESTORE_PROPAGATION_ROTATION_OR_EXPANSION_MISMATCH ||
+            free_trace->propagation_failure == ITTY_FEED_MODEL_RESTORE_PROPAGATION_SEGMENT_CHANGED_DECODED_NOT_CROSSED)
+                return "zero-side-candidates-final-surface-ineffective";
+
+        return free_trace->accepted ? "accepted-zero-side-candidate" : "unclear";
 }
 
 static void
@@ -7625,6 +8567,16 @@ test_itty_feed_model_segment_replay_route_key_selector_diagnostic (void)
 static void
 test_itty_feed_model_segment_replay_route_key_selector_add_c_diagnostic (void)
 {
+        struct c_candidate_spec {
+                char const *label;
+                size_t      input_word;
+                size_t      target_word;
+        } c_specs[] = {
+                { "dense",           create_half_populated_word (),                         create_half_populated_word () ^ ((size_t) 1 << 5) },
+                { "sparse",          create_mixed_word () ^ ((size_t) 1 << 1),              ((size_t) 1 << 1) | ((size_t) 1 << 6) },
+                { "mixed",           create_mixed_word () ^ (((size_t) 1 << 1) | ((size_t) 1 << 4)), ((size_t) 1 << 0) | ((size_t) 1 << 2) | ((size_t) 1 << 5) | ((size_t) 1 << 7) },
+                { "complement-like", ~create_mixed_word (),                                 ~create_half_populated_word () }
+        };
         size_t case_index = 2;
         size_t nodes = 8;
         size_t projection_batch_size = 64;
@@ -7637,11 +8589,10 @@ test_itty_feed_model_segment_replay_route_key_selector_add_c_diagnostic (void)
         itty_feed_model_t *baseline_selector_model = itty_feed_model_new (2, nodes, 1, 1);
         itty_bit_string_list_t *first_input = create_input_with_count (1, 0);
         itty_bit_string_list_t *second_input = create_input_with_count (1, 1);
-        itty_bit_string_list_t *third_input = create_input_with_count (1,
-                                                                       create_mixed_word () ^ ((size_t) 1 << 1));
         itty_bit_string_t *first_target = create_bit_string ((size_t) 1 << 3);
         itty_bit_string_t *second_target = create_bit_string (create_half_populated_word ());
-        itty_bit_string_t *third_target = create_bit_string (((size_t) 1 << 1) | ((size_t) 1 << 6));
+        itty_bit_string_list_t *third_input = NULL;
+        itty_bit_string_t *third_target = NULL;
         itty_feed_model_refreshed_projected_repair_options_t first_options = {
                 .batch_size = projection_batch_size,
                 .max_rounds = projection_max_rounds,
@@ -7664,21 +8615,47 @@ test_itty_feed_model_segment_replay_route_key_selector_add_c_diagnostic (void)
         itty_bit_string_t *route_keys[nodes];
         itty_bit_string_t *a_probe;
         itty_bit_string_t *b_probe;
-        itty_bit_string_t *c_probe;
+        itty_bit_string_t *c_probe = NULL;
         size_t a_route;
         size_t b_route;
-        size_t c_route;
+        size_t c_route = (size_t) -1;
         route_key_selection_summary_abc_t before_c = { 0 };
         route_key_selection_summary_abc_t after_c = { 0 };
+        route_key_selection_summary_abc_t after_chain_a = { 0 };
+        route_key_selection_summary_abc_t after_chain_b = { 0 };
+        route_key_selection_summary_abc_t after_chain_c = { 0 };
         itty_feed_model_train_stats_t replay_a_stats = { 0 };
         itty_feed_model_train_stats_t replay_b_stats = { 0 };
         itty_feed_model_train_stats_t replay_c_stats = { 0 };
+        itty_feed_model_train_stats_t replay_chain_a_stats = { 0 };
+        itty_feed_model_train_stats_t replay_chain_b_stats = { 0 };
+        itty_feed_model_train_stats_t replay_chain_c_stats = { 0 };
         itty_feed_model_decoder_objective_t after_replay2_a_forced = { 0 };
         itty_feed_model_decoder_objective_t after_replay2_b_forced = { 0 };
         itty_feed_model_decoder_objective_t before_c_forced = { 0 };
         itty_feed_model_decoder_objective_t after_c_a_forced = { 0 };
         itty_feed_model_decoder_objective_t after_c_b_forced = { 0 };
         itty_feed_model_decoder_objective_t after_c_c_forced = { 0 };
+        itty_feed_model_decoder_objective_t after_chain_a_a_forced = { 0 };
+        itty_feed_model_decoder_objective_t after_chain_a_b_forced = { 0 };
+        itty_feed_model_decoder_objective_t after_chain_a_c_forced = { 0 };
+        itty_feed_model_decoder_objective_t after_chain_b_a_forced = { 0 };
+        itty_feed_model_decoder_objective_t after_chain_b_b_forced = { 0 };
+        itty_feed_model_decoder_objective_t after_chain_b_c_forced = { 0 };
+        itty_feed_model_decoder_objective_t after_chain_c_a_forced = { 0 };
+        itty_feed_model_decoder_objective_t after_chain_c_b_forced = { 0 };
+        itty_feed_model_decoder_objective_t after_chain_c_c_forced = { 0 };
+        char const *c_label = NULL;
+        size_t c_inventory_rows = 0;
+        size_t c_rows_with_deficit = 0;
+        size_t c_best_gap = 0;
+        size_t c_best_before_dist = 0;
+        size_t c_best_before_def = 0;
+        size_t c_best_before_excess = 0;
+        size_t c_best_before_zero_safety = 0;
+        size_t c_best_after_dist = 0;
+        size_t c_best_after_def = 0;
+        size_t c_best_trial_flips = 0;
 
         memset (route_keys, 0, sizeof route_keys);
         assert (decoder_model && baseline_selector_model);
@@ -7817,23 +8794,215 @@ test_itty_feed_model_segment_replay_route_key_selector_add_c_diagnostic (void)
                                                                     b_route,
                                                                     &after_replay2_b_forced));
 
-        for (size_t route = 0; route < nodes; route++)
-                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
-                                                                            third_input,
-                                                                            third_target,
-                                                                            route,
-                                                                            &c_routes[route]));
-        c_route = replay_choose_c_route (c_routes, nodes, a_route, b_route);
-
         a_probe = itty_bit_string_clone (itty_bit_string_list_fetch (first_input, 0));
         b_probe = itty_bit_string_clone (itty_bit_string_list_fetch (second_input, 0));
-        c_probe = itty_bit_string_clone (itty_bit_string_list_fetch (third_input, 0));
         for (size_t route = 0; route < nodes; route++)
                 route_keys[route] = create_bit_string (create_mixed_word ());
         itty_bit_string_free (route_keys[a_route]);
         route_keys[a_route] = itty_bit_string_clone (a_probe);
         itty_bit_string_free (route_keys[b_route]);
         route_keys[b_route] = itty_bit_string_clone (b_probe);
+
+        printf ("---route-key-selector-c-begin\n");
+        printf ("---a_route=%zu\n", a_route);
+        printf ("---b_route=%zu\n", b_route);
+
+        for (size_t spec_index = 0; spec_index < sizeof (c_specs) / sizeof (c_specs[0]); spec_index++) {
+                itty_bit_string_list_t *candidate_input = create_input_with_count (1, c_specs[spec_index].input_word);
+                itty_bit_string_t *candidate_target = create_bit_string (c_specs[spec_index].target_word);
+                itty_bit_string_t *candidate_probe = itty_bit_string_clone (itty_bit_string_list_fetch (candidate_input, 0));
+                size_t spec_best_route = (size_t) -1;
+                size_t spec_best_gap = 0;
+                size_t spec_best_before_dist = 0;
+                size_t spec_best_before_def = 0;
+                size_t spec_best_before_excess = 0;
+                size_t spec_best_before_zero_safety = 0;
+                size_t spec_best_after_dist = 0;
+                size_t spec_best_after_def = 0;
+                size_t spec_best_trial_flips = 0;
+
+                for (size_t route = 0; route < nodes; route++) {
+                        itty_feed_model_layer_state_snapshot_t *candidate_snapshot;
+                        itty_feed_model_train_stats_t candidate_stats = { 0 };
+                        itty_feed_model_decoder_objective_t candidate_c_after = { 0 };
+                        itty_feed_model_decoder_objective_t candidate_a_after = { 0 };
+                        itty_feed_model_decoder_objective_t candidate_b_after = { 0 };
+                        size_t candidate_selected_gap = 0;
+                        size_t candidate_selected_route = route;
+                        size_t candidate_selected_score = itty_bit_string_evaluate_similarity (candidate_probe,
+                                                                                                candidate_probe);
+                        size_t candidate_runner_up_score = 0;
+                        bool candidate_train_ok;
+                        bool candidate_realized_gain;
+                        bool candidate_ab_safe;
+
+                        if (route == a_route || route == b_route)
+                                continue;
+
+                        c_inventory_rows++;
+                        if (!itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                 candidate_input,
+                                                                                 candidate_target,
+                                                                                 route,
+                                                                                 &c_routes[route])) {
+                                printf ("---c_candidate=%s route=%zu measure=failed\n",
+                                        c_specs[spec_index].label,
+                                        route);
+                                continue;
+                        }
+
+                        for (size_t competitor = 0; competitor < nodes; competitor++) {
+                                size_t competitor_score;
+
+                                if (competitor == route)
+                                        continue;
+
+                                competitor_score = itty_bit_string_evaluate_similarity (candidate_probe,
+                                                                                          route_keys[competitor]);
+                                if (competitor_score > candidate_runner_up_score) {
+                                        candidate_runner_up_score = competitor_score;
+                                        candidate_selected_route = competitor;
+                                }
+                        }
+                        candidate_selected_gap = candidate_selected_score - candidate_runner_up_score;
+                        if (candidate_selected_gap > 0)
+                                candidate_selected_route = route;
+
+                        printf ("---c_candidate=%s route=%zu dist=%zu def=%zu excess=%zu zero_safety=%zu gap=%zu selected=%zu\n",
+                                c_specs[spec_index].label,
+                                route,
+                                c_routes[route].selected_distance,
+                                c_routes[route].false_negative_vote_deficit,
+                                c_routes[route].false_positive_vote_excess,
+                                c_routes[route].target_zero_safety_min,
+                                candidate_selected_gap,
+                                candidate_selected_route);
+
+                        if (c_routes[route].false_negative_vote_deficit > 0)
+                                c_rows_with_deficit++;
+
+                        if (candidate_selected_route != route ||
+                            candidate_selected_gap < 1 ||
+                            c_routes[route].false_negative_vote_deficit == 0)
+                                continue;
+
+                        candidate_snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                        assert (candidate_snapshot);
+                        candidate_train_ok = itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model,
+                                                                                                            candidate_input,
+                                                                                                            candidate_target,
+                                                                                                            route,
+                                                                                                            &oracle_options,
+                                                                                                            &candidate_stats) &&
+                                             itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                 first_input,
+                                                                                                 first_target,
+                                                                                                 a_route,
+                                                                                                 &candidate_a_after) &&
+                                             itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                 second_input,
+                                                                                                 second_target,
+                                                                                                 b_route,
+                                                                                                 &candidate_b_after) &&
+                                             itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                 candidate_input,
+                                                                                                 candidate_target,
+                                                                                                 route,
+                                                                                                 &candidate_c_after);
+                        candidate_realized_gain = candidate_train_ok &&
+                                                  candidate_stats.flips > 0 &&
+                                                  (candidate_c_after.selected_distance < c_routes[route].selected_distance ||
+                                                   candidate_c_after.false_negative_vote_deficit < c_routes[route].false_negative_vote_deficit);
+                        candidate_ab_safe = candidate_train_ok &&
+                                            candidate_a_after.selected_distance == 0 &&
+                                            candidate_b_after.selected_distance <= after_replay2_b_forced.selected_distance + 1;
+                        printf ("---c_candidate_trial=%s route=%zu flips=%zu after_dist=%zu after_def=%zu a_after=%zu b_after=%zu\n",
+                                c_specs[spec_index].label,
+                                route,
+                                candidate_stats.flips,
+                                candidate_train_ok ? candidate_c_after.selected_distance : (size_t) -1,
+                                candidate_train_ok ? candidate_c_after.false_negative_vote_deficit : (size_t) -1,
+                                candidate_train_ok ? candidate_a_after.selected_distance : (size_t) -1,
+                                candidate_train_ok ? candidate_b_after.selected_distance : (size_t) -1);
+                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, candidate_snapshot);
+
+                        if (!candidate_realized_gain || !candidate_ab_safe)
+                                continue;
+
+                        if (spec_best_route == (size_t) -1 ||
+                            (c_routes[route].false_negative_vote_deficit - candidate_c_after.false_negative_vote_deficit) >
+                            (spec_best_before_def - spec_best_after_def) ||
+                            ((c_routes[route].false_negative_vote_deficit - candidate_c_after.false_negative_vote_deficit) ==
+                             (spec_best_before_def - spec_best_after_def) &&
+                             c_routes[route].selected_distance - candidate_c_after.selected_distance >
+                             spec_best_before_dist - spec_best_after_dist) ||
+                            ((c_routes[route].false_negative_vote_deficit - candidate_c_after.false_negative_vote_deficit) ==
+                             (spec_best_before_def - spec_best_after_def) &&
+                             c_routes[route].selected_distance - candidate_c_after.selected_distance ==
+                             spec_best_before_dist - spec_best_after_dist &&
+                             candidate_selected_gap > spec_best_gap) ||
+                            ((c_routes[route].false_negative_vote_deficit - candidate_c_after.false_negative_vote_deficit) ==
+                             (spec_best_before_def - spec_best_after_def) &&
+                             c_routes[route].selected_distance - candidate_c_after.selected_distance ==
+                             spec_best_before_dist - spec_best_after_dist &&
+                             candidate_selected_gap == spec_best_gap &&
+                             c_routes[route].false_positive_vote_excess < spec_best_before_excess)) {
+                                spec_best_route = route;
+                                spec_best_gap = candidate_selected_gap;
+                                spec_best_before_dist = c_routes[route].selected_distance;
+                                spec_best_before_def = c_routes[route].false_negative_vote_deficit;
+                                spec_best_before_excess = c_routes[route].false_positive_vote_excess;
+                                spec_best_before_zero_safety = c_routes[route].target_zero_safety_min;
+                                spec_best_after_dist = candidate_c_after.selected_distance;
+                                spec_best_after_def = candidate_c_after.false_negative_vote_deficit;
+                                spec_best_trial_flips = candidate_stats.flips;
+                        }
+                }
+
+                if (spec_best_route != (size_t) -1 &&
+                    (c_route == (size_t) -1 ||
+                     (spec_best_before_def - spec_best_after_def) > (c_best_before_def - c_best_after_def) ||
+                     ((spec_best_before_def - spec_best_after_def) == (c_best_before_def - c_best_after_def) &&
+                      spec_best_before_dist - spec_best_after_dist > c_best_before_dist - c_best_after_dist) ||
+                     ((spec_best_before_def - spec_best_after_def) == (c_best_before_def - c_best_after_def) &&
+                      spec_best_before_dist - spec_best_after_dist == c_best_before_dist - c_best_after_dist &&
+                      spec_best_gap > c_best_gap) ||
+                     ((spec_best_before_def - spec_best_after_def) == (c_best_before_def - c_best_after_def) &&
+                      spec_best_before_dist - spec_best_after_dist == c_best_before_dist - c_best_after_dist &&
+                      spec_best_gap == c_best_gap &&
+                      spec_best_before_excess < c_best_before_excess))) {
+                        if (third_input)
+                                itty_bit_string_list_free (third_input);
+                        if (third_target)
+                                itty_bit_string_free (third_target);
+                        if (c_probe)
+                                itty_bit_string_free (c_probe);
+                        third_input = candidate_input;
+                        third_target = candidate_target;
+                        c_probe = candidate_probe;
+                        c_route = spec_best_route;
+                        c_label = c_specs[spec_index].label;
+                        c_best_gap = spec_best_gap;
+                        c_best_before_dist = spec_best_before_dist;
+                        c_best_before_def = spec_best_before_def;
+                        c_best_before_excess = spec_best_before_excess;
+                        c_best_before_zero_safety = spec_best_before_zero_safety;
+                        c_best_after_dist = spec_best_after_dist;
+                        c_best_after_def = spec_best_after_def;
+                        c_best_trial_flips = spec_best_trial_flips;
+                        continue;
+                }
+
+                if (third_input != candidate_input)
+                        itty_bit_string_list_free (candidate_input);
+                if (third_target != candidate_target)
+                        itty_bit_string_free (candidate_target);
+                if (c_probe != candidate_probe)
+                        itty_bit_string_free (candidate_probe);
+        }
+
+        assert (c_route != (size_t) -1);
+        assert (third_input && third_target && c_probe);
         itty_bit_string_free (route_keys[c_route]);
         route_keys[c_route] = itty_bit_string_clone (c_probe);
 
@@ -7867,6 +9036,75 @@ test_itty_feed_model_segment_replay_route_key_selector_add_c_diagnostic (void)
                                                                     &after_c_c_forced));
         after_c = measure_route_key_selection_abc (route_keys, nodes, a_probe, b_probe, c_probe);
 
+        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model,
+                                                                               first_input,
+                                                                               first_target,
+                                                                               a_route,
+                                                                               &oracle_options,
+                                                                               &replay_chain_a_stats));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                    first_input,
+                                                                    first_target,
+                                                                    a_route,
+                                                                    &after_chain_a_a_forced));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                    second_input,
+                                                                    second_target,
+                                                                    b_route,
+                                                                    &after_chain_a_b_forced));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                    third_input,
+                                                                    third_target,
+                                                                    c_route,
+                                                                    &after_chain_a_c_forced));
+        after_chain_a = measure_route_key_selection_abc (route_keys, nodes, a_probe, b_probe, c_probe);
+
+        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model,
+                                                                               second_input,
+                                                                               second_target,
+                                                                               b_route,
+                                                                               &oracle_options,
+                                                                               &replay_chain_b_stats));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                    first_input,
+                                                                    first_target,
+                                                                    a_route,
+                                                                    &after_chain_b_a_forced));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                    second_input,
+                                                                    second_target,
+                                                                    b_route,
+                                                                    &after_chain_b_b_forced));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                    third_input,
+                                                                    third_target,
+                                                                    c_route,
+                                                                    &after_chain_b_c_forced));
+        after_chain_b = measure_route_key_selection_abc (route_keys, nodes, a_probe, b_probe, c_probe);
+
+        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model,
+                                                                               third_input,
+                                                                               third_target,
+                                                                               c_route,
+                                                                               &oracle_options,
+                                                                               &replay_chain_c_stats));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                    first_input,
+                                                                    first_target,
+                                                                    a_route,
+                                                                    &after_chain_c_a_forced));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                    second_input,
+                                                                    second_target,
+                                                                    b_route,
+                                                                    &after_chain_c_b_forced));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                    third_input,
+                                                                    third_target,
+                                                                    c_route,
+                                                                    &after_chain_c_c_forced));
+        after_chain_c = measure_route_key_selection_abc (route_keys, nodes, a_probe, b_probe, c_probe);
+
         assert (c_route != a_route);
         assert (c_route != b_route);
         assert (before_c.a_selected_route == a_route);
@@ -7887,11 +9125,40 @@ test_itty_feed_model_segment_replay_route_key_selector_add_c_diagnostic (void)
         assert (after_c_a_forced.selected_distance == 0);
         assert (after_c_b_forced.selected_distance <= after_replay2_b_forced.selected_distance + 1);
         assert (after_c_c_forced.selected_distance <= before_c_forced.selected_distance);
+        assert (after_chain_a.a_selected_route == a_route);
+        assert (after_chain_a.a_selected_gap >= 1);
+        assert (after_chain_a.b_selected_route == b_route);
+        assert (after_chain_a.b_selected_gap >= 1);
+        assert (after_chain_a.c_selected_route == c_route);
+        assert (after_chain_a.c_selected_gap >= 1);
+        assert (after_chain_b.a_selected_route == a_route);
+        assert (after_chain_b.a_selected_gap >= 1);
+        assert (after_chain_b.b_selected_route == b_route);
+        assert (after_chain_b.b_selected_gap >= 1);
+        assert (after_chain_b.c_selected_route == c_route);
+        assert (after_chain_b.c_selected_gap >= 1);
+        assert (after_chain_c.a_selected_route == a_route);
+        assert (after_chain_c.a_selected_gap >= 1);
+        assert (after_chain_c.b_selected_route == b_route);
+        assert (after_chain_c.b_selected_gap >= 1);
+        assert (after_chain_c.c_selected_route == c_route);
+        assert (after_chain_c.c_selected_gap >= 1);
+        assert (after_chain_c_a_forced.selected_distance == 0);
+        assert (after_chain_c_b_forced.selected_distance <= after_c_b_forced.selected_distance + 1);
+        assert (after_chain_c_c_forced.selected_distance <= after_c_c_forced.selected_distance);
 
-        printf ("---route-key-selector-c-begin\n");
-        printf ("---a_route=%zu\n", a_route);
-        printf ("---b_route=%zu\n", b_route);
+        printf ("---c_inventory_rows=%zu\n", c_inventory_rows);
+        printf ("---c_rows_with_deficit=%zu\n", c_rows_with_deficit);
+        printf ("---c_label=%s\n", c_label);
         printf ("---c_route=%zu\n", c_route);
+        printf ("---c_best_gap=%zu\n", c_best_gap);
+        printf ("---c_best_before_dist=%zu\n", c_best_before_dist);
+        printf ("---c_best_before_def=%zu\n", c_best_before_def);
+        printf ("---c_best_before_excess=%zu\n", c_best_before_excess);
+        printf ("---c_best_before_zero_safety=%zu\n", c_best_before_zero_safety);
+        printf ("---c_best_after_dist=%zu\n", c_best_after_dist);
+        printf ("---c_best_after_def=%zu\n", c_best_after_def);
+        printf ("---c_best_trial_flips=%zu\n", c_best_trial_flips);
         printf ("---before_c_a_selected_route=%zu\n", before_c.a_selected_route);
         printf ("---before_c_a_selected_gap=%zu\n", before_c.a_selected_gap);
         printf ("---before_c_b_selected_route=%zu\n", before_c.b_selected_route);
@@ -7916,6 +9183,32 @@ test_itty_feed_model_segment_replay_route_key_selector_add_c_diagnostic (void)
         printf ("---after_c_b_selected_gap=%zu\n", after_c.b_selected_gap);
         printf ("---after_c_c_selected_route=%zu\n", after_c.c_selected_route);
         printf ("---after_c_c_selected_gap=%zu\n", after_c.c_selected_gap);
+        printf ("---chain_replay_a_flips=%zu\n", replay_chain_a_stats.flips);
+        printf ("---chain_replay_b_flips=%zu\n", replay_chain_b_stats.flips);
+        printf ("---chain_replay_c_flips=%zu\n", replay_chain_c_stats.flips);
+        printf ("---after_chain_a_a_route=%zu\n", after_chain_a.a_selected_route);
+        printf ("---after_chain_a_a_gap=%zu\n", after_chain_a.a_selected_gap);
+        printf ("---after_chain_a_b_route=%zu\n", after_chain_a.b_selected_route);
+        printf ("---after_chain_a_b_gap=%zu\n", after_chain_a.b_selected_gap);
+        printf ("---after_chain_a_c_route=%zu\n", after_chain_a.c_selected_route);
+        printf ("---after_chain_a_c_gap=%zu\n", after_chain_a.c_selected_gap);
+        printf ("---after_chain_b_a_route=%zu\n", after_chain_b.a_selected_route);
+        printf ("---after_chain_b_a_gap=%zu\n", after_chain_b.a_selected_gap);
+        printf ("---after_chain_b_b_route=%zu\n", after_chain_b.b_selected_route);
+        printf ("---after_chain_b_b_gap=%zu\n", after_chain_b.b_selected_gap);
+        printf ("---after_chain_b_c_route=%zu\n", after_chain_b.c_selected_route);
+        printf ("---after_chain_b_c_gap=%zu\n", after_chain_b.c_selected_gap);
+        printf ("---after_chain_c_a_route=%zu\n", after_chain_c.a_selected_route);
+        printf ("---after_chain_c_a_gap=%zu\n", after_chain_c.a_selected_gap);
+        printf ("---after_chain_c_b_route=%zu\n", after_chain_c.b_selected_route);
+        printf ("---after_chain_c_b_gap=%zu\n", after_chain_c.b_selected_gap);
+        printf ("---after_chain_c_c_route=%zu\n", after_chain_c.c_selected_route);
+        printf ("---after_chain_c_c_gap=%zu\n", after_chain_c.c_selected_gap);
+        printf ("---after_chain_c_a_forced_dist=%zu\n", after_chain_c_a_forced.selected_distance);
+        printf ("---after_chain_c_b_forced_dist=%zu\n", after_chain_c_b_forced.selected_distance);
+        printf ("---after_chain_c_b_forced_def=%zu\n", after_chain_c_b_forced.false_negative_vote_deficit);
+        printf ("---after_chain_c_c_forced_dist=%zu\n", after_chain_c_c_forced.selected_distance);
+        printf ("---after_chain_c_c_forced_def=%zu\n", after_chain_c_c_forced.false_negative_vote_deficit);
         printf ("---route-key-selector-c-end\n");
 
         for (size_t route = 0; route < nodes; route++)
@@ -7934,6 +9227,8296 @@ test_itty_feed_model_segment_replay_route_key_selector_add_c_diagnostic (void)
         itty_bit_string_list_free (first_input);
         itty_bit_string_list_free (second_input);
         itty_bit_string_list_free (third_input);
+}
+
+static void
+test_itty_feed_model_segment_replay_route_key_selector_add_d_diagnostic (void)
+{
+        struct candidate_spec {
+                char const *label;
+                size_t      input_word;
+                size_t      target_word;
+        } specs[] = {
+                { "dense",           create_half_populated_word (),                         create_half_populated_word () ^ ((size_t) 1 << 5) },
+                { "sparse",          create_mixed_word () ^ ((size_t) 1 << 1),              ((size_t) 1 << 1) | ((size_t) 1 << 6) },
+                { "mixed",           create_mixed_word () ^ (((size_t) 1 << 1) | ((size_t) 1 << 4)), ((size_t) 1 << 0) | ((size_t) 1 << 2) | ((size_t) 1 << 5) | ((size_t) 1 << 7) },
+                { "complement-like", ~create_mixed_word (),                                 ~create_half_populated_word () },
+                { "disjoint-sparse", ((size_t) 1 << 0) | ((size_t) 1 << 3),                ((size_t) 1 << 4) | ((size_t) 1 << 7) }
+        };
+        typedef struct {
+                char const                      *label;
+                size_t                           assigned_route;
+                route_key_probe_summary_t        selector;
+                itty_feed_model_decoder_objective_t objective;
+                size_t                           training_flips;
+                size_t                           replay_flips;
+                bool                             newly_allocated;
+                char const                      *committed_budget_class;
+                size_t                           committed_budget;
+                itty_feed_model_decoder_objective_t committed_baseline;
+        } route_table_row_t;
+        typedef struct {
+                bool   measured;
+                size_t before_dist;
+                size_t before_def;
+                size_t before_excess;
+                size_t before_zero_safety;
+                size_t replay_safe_flips;
+                size_t replay_safe_after_dist;
+                size_t replay_safe_after_def;
+                size_t replay_safe_after_excess;
+                size_t replay_safe_after_zero_safety;
+                bool   replay_safe_kept_owners;
+                char const *replay_safe_reason;
+                size_t no_replay_flips;
+                size_t no_replay_after_dist;
+                size_t no_replay_after_def;
+                size_t no_replay_after_excess;
+                size_t no_replay_after_zero_safety;
+                char const *no_replay_reason;
+        } d_route_audit_t;
+        typedef struct {
+                char const *label;
+                bool        found_route;
+                size_t      route;
+                size_t      gap;
+                size_t      before_dist;
+                size_t      before_def;
+                size_t      before_excess;
+                size_t      after_dist;
+                size_t      after_def;
+                size_t      flips;
+        } d_family_summary_t;
+        typedef struct {
+                bool   admitted;
+                size_t route;
+                size_t gap;
+                size_t before_dist;
+                size_t before_def;
+                size_t before_excess;
+                size_t after_dist;
+                size_t after_def;
+                size_t after_excess;
+                size_t flips;
+                bool   replay_safe;
+        } d_route_choice_summary_t;
+        typedef struct {
+                char const *label;
+                size_t      candidate_count;
+                size_t      accepted_candidates;
+                ptrdiff_t   distance_delta;
+                ptrdiff_t   deficit_delta;
+                ptrdiff_t   excess_delta;
+                ptrdiff_t   target_one_margin_delta;
+                ptrdiff_t   target_zero_safety_delta;
+                size_t      flips;
+                char const *stop_reason;
+        } d_mode_summary_t;
+        typedef struct {
+                size_t      max_flips;
+                size_t      candidate_count;
+                size_t      accepted_candidates;
+                size_t      positive_repairs;
+                size_t      zero_repairs;
+                size_t      mixed_repairs;
+                size_t      uncategorized_repairs;
+                ptrdiff_t   distance_delta;
+                ptrdiff_t   deficit_delta;
+                ptrdiff_t   excess_delta;
+                size_t      flips;
+                bool        owners_kept;
+                char const *stop_reason;
+        } d_budget_summary_t;
+        typedef struct {
+                char const *label;
+                char const *budget_class;
+                size_t      budget;
+                size_t      replay_flips;
+                size_t      positive_repairs;
+                size_t      zero_repairs;
+                size_t      mixed_repairs;
+                size_t      uncategorized_repairs;
+                route_key_probe_summary_t selector;
+                itty_feed_model_decoder_objective_t objective;
+        } replay_step_summary_t;
+        typedef struct {
+                char const *label;
+                bool        accepted;
+                size_t      first_budget;
+                char const *first_class;
+                size_t      second_budget;
+                char const *second_class;
+                size_t      third_budget;
+                char const *third_class;
+                size_t      replay_flips;
+                size_t      positive_repairs;
+                size_t      zero_repairs;
+                size_t      mixed_repairs;
+                size_t      uncategorized_repairs;
+                route_key_probe_summary_t selector;
+                itty_feed_model_decoder_objective_t objective;
+        } d_improvement_summary_t;
+        typedef struct {
+                size_t route_id;
+                size_t committed_internal_node;
+                size_t current_internal_node;
+                size_t switch_count;
+                size_t zero_direct_clear_helpful;
+                size_t zero_internal_switch_helpful;
+                size_t zero_internal_switch_harmful;
+                size_t zero_internal_switch_neutral;
+                size_t zero_route_key_switch;
+                size_t zero_replay_rejected;
+        } d_internal_node_summary_t;
+        typedef struct {
+                bool        measured;
+                size_t      decoded_bit;
+                size_t      intended_node_before;
+                size_t      selected_node_after;
+                size_t      current_ones;
+                size_t      threshold;
+                size_t      max_zero;
+                size_t      excess;
+                size_t      clearable_final_segment_votes;
+                size_t      candidate_negative_quota_repairs;
+                size_t      mask_flips;
+                size_t      actual_cleared_votes;
+                size_t      intended_node_distance_after;
+                size_t      intended_node_deficit_after;
+                size_t      intended_node_excess_after;
+                size_t      selected_node_distance_after;
+                size_t      selected_node_deficit_after;
+                size_t      selected_node_excess_after;
+                ptrdiff_t   distance_delta;
+                ptrdiff_t   excess_delta;
+                char const *free_reason;
+                char const *propagation;
+                char const *classification;
+                size_t      replay_owner_rejections;
+                bool        owner_accepted[3];
+                char const *owner_reason[3];
+                size_t      owner_distance_after[3];
+                size_t      owner_deficit_after[3];
+                size_t      owner_excess_after[3];
+                char const *parity_reason;
+                bool        parity_baseline_guard;
+                char const *selected_switch_class;
+                bool        selected_objective_not_worse;
+                bool        selected_objective_improves;
+                bool        direct_selected_node_improvement;
+        } d_excess_audit_row_t;
+        typedef struct {
+                size_t direct_selected_node_improvements;
+                size_t internal_switch_helpful;
+                size_t internal_switch_harmful;
+                size_t internal_switch_neutral;
+                size_t selected_objective_not_worse;
+                size_t selected_objective_improves;
+        } d_internal_search_summary_t;
+        typedef struct {
+                size_t route_id;
+                size_t entries;
+                size_t local_intended_helpful;
+                size_t selected_objective_helpful;
+                size_t selected_objective_harmful;
+                size_t replay_conflicting;
+                size_t internal_switch_harmful;
+                size_t accepted_count;
+                size_t rejected_count;
+                ptrdiff_t pressure_score;
+        } d_conflict_accumulator_summary_t;
+        typedef struct {
+                char const *label;
+                size_t      target_node;
+                size_t      candidate_count;
+                size_t      selected_safe;
+                size_t      improves_distance;
+                size_t      improves_excess;
+                size_t      selected_node_after;
+                size_t      selected_gap_after;
+                itty_feed_model_decoder_objective_t selected_objective_after;
+        } d_candidate_family_summary_t;
+        typedef struct {
+                char const                          *label;
+                size_t                               target_node;
+                itty_feed_model_final_repair_mode_t  mode;
+                size_t                               max_flips;
+        } d_block_step_spec_t;
+        typedef struct {
+                size_t      blocks_tested;
+                size_t      selected_safe_blocks;
+                size_t      improving_blocks;
+                bool        best_found;
+                char        best_label[128];
+                size_t      best_step_indices[3];
+                size_t      best_step_count;
+                size_t      best_selected_node;
+                size_t      best_selected_gap;
+                size_t      best_total_flips;
+                itty_feed_model_decoder_objective_t best_objective;
+        } d_block_search_summary_t;
+        typedef enum {
+                D_BLOCK_TARGET_ROUTE,
+                D_BLOCK_TARGET_CURRENT_SELECTED,
+        } d_block_target_kind_t;
+        typedef struct {
+                char const                 *label;
+                d_block_target_kind_t       target_kind;
+                itty_feed_model_final_repair_mode_t mode;
+                size_t                      max_flips;
+                bool                        require_selected_node_stable;
+        } d_block_matrix_step_spec_t;
+        typedef struct {
+                char const *label;
+                bool        selected_safe;
+                bool        improves;
+                char const *reason;
+                size_t      selected_after;
+                size_t      gap_after;
+                size_t      total_flips;
+                itty_feed_model_decoder_objective_t selected_objective_after;
+        } d_block_matrix_summary_t;
+        typedef struct {
+                bool        measured;
+                size_t      decoded_bit;
+                size_t      target_bit;
+                size_t      selected_internal_node;
+                size_t      ones;
+                size_t      threshold;
+                size_t      max_zero;
+                size_t      deficit;
+                size_t      excess;
+                size_t      candidate_final_votes;
+                size_t      candidate_mask_flips;
+                char const *reason;
+        } d_residual_error_row_t;
+        typedef struct {
+                char const *label;
+                bool        selected_safe;
+                bool        improves;
+                char const *reason;
+                size_t      selected_after;
+                size_t      gap_after;
+                size_t      total_flips;
+                itty_feed_model_decoder_objective_t selected_objective_after;
+        } d_exact_zero_block_summary_t;
+        typedef struct {
+                char        label[64];
+                size_t      bit_mask;
+                size_t      bit_count;
+                bool        exact_measured;
+                bool        exact_selected_safe;
+                bool        exact_improves;
+                char const *exact_reason;
+                bool        fail_route_change;
+                bool        fail_gap_loss;
+                bool        fail_a_baseline;
+                bool        fail_b_baseline;
+                bool        fail_c_baseline;
+                bool        fail_d_distance;
+                bool        fail_d_deficit;
+                bool        fail_d_excess;
+                bool        fail_selected_switch_worse;
+                size_t      exact_selected_after;
+                size_t      exact_gap_after;
+                size_t      exact_flips;
+                itty_feed_model_decoder_objective_t exact_objective_after;
+                size_t      exact_trace_count;
+                itty_feed_model_mask_flip_trace_t exact_traces[16];
+                bool        direct_measured;
+                bool        direct_improves;
+                size_t      direct_selected_after;
+                size_t      direct_gap_after;
+                size_t      direct_clear_votes;
+                itty_feed_model_decoder_objective_t direct_objective_after;
+                size_t      tx_pool_count;
+                size_t      tx_tested;
+                size_t      tx_selected_safe;
+                size_t      tx_improving;
+                bool        tx_found;
+                char        tx_label[96];
+                size_t      tx_flips;
+                size_t      tx_teacher_distance_after;
+                size_t      tx_selected_after;
+                size_t      tx_node1_pop_after;
+                size_t      tx_node6_pop_after;
+                ptrdiff_t   tx_node1_vs_node6_gap_after;
+                itty_feed_model_decoder_objective_t tx_objective_after;
+                size_t      tx_trace_count;
+                itty_feed_model_mask_flip_trace_t tx_traces[32];
+                size_t      sat_pool_count;
+                size_t      sat_tested;
+                size_t      sat_selected_safe;
+                size_t      sat_improving;
+                bool        sat_found;
+                char        sat_label[96];
+                size_t      sat_flips;
+                size_t      sat_teacher_distance_after;
+                size_t      sat_selected_after;
+                size_t      sat_node1_pop_after;
+                size_t      sat_node6_pop_after;
+                ptrdiff_t   sat_node1_vs_node6_gap_after;
+                itty_feed_model_decoder_objective_t sat_objective_after;
+                size_t      sat_trace_count;
+                itty_feed_model_mask_flip_trace_t sat_traces[32];
+        } d_residual_set_summary_t;
+        typedef struct {
+                char        label[32];
+                size_t      bit_count;
+                size_t      bits[4];
+                size_t      before_selected_node_direct;
+                size_t      before_selected_node_exact;
+                size_t      before_node1_popcount;
+                size_t      before_node6_popcount;
+                ptrdiff_t   before_node1_vs_node6_gap;
+                bool        direct_measured;
+                size_t      direct_selected_node_after;
+                size_t      direct_node1_popcount_after;
+                size_t      direct_node6_popcount_after;
+                ptrdiff_t   direct_node1_vs_node6_gap_after;
+                bool        condensed_measured;
+                size_t      condensed_selected_node_after;
+                size_t      condensed_node1_popcount_after;
+                size_t      condensed_node6_popcount_after;
+                ptrdiff_t   condensed_node1_vs_node6_gap_after;
+                itty_feed_model_decoder_objective_t condensed_selected_objective_after;
+                bool        exact_measured;
+                size_t      exact_selected_node_after;
+                size_t      exact_node1_popcount_after;
+                size_t      exact_node6_popcount_after;
+                ptrdiff_t   exact_node1_vs_node6_gap_after;
+                bool        support_found;
+                char const *support_label;
+                size_t      support_budget;
+                size_t      support_candidate_count;
+                size_t      support_accepted_candidates;
+                size_t      support_flips;
+                size_t      teacher_requested_bits;
+                size_t      teacher_distance_before;
+                size_t      teacher_distance_after;
+                bool        support_a_ok;
+                bool        support_b_ok;
+                bool        support_c_ok;
+                size_t      support_selected_node_after;
+                size_t      support_node1_popcount_after;
+                size_t      support_node6_popcount_after;
+                ptrdiff_t   support_node1_vs_node6_gap_after;
+                itty_feed_model_decoder_objective_t support_selected_objective_after;
+                bool        teacher_search_found;
+                char        teacher_search_label[96];
+                size_t      teacher_search_flips;
+                size_t      teacher_search_selected_node_after;
+                size_t      teacher_search_node1_popcount_after;
+                size_t      teacher_search_node6_popcount_after;
+                ptrdiff_t   teacher_search_node1_vs_node6_gap_after;
+                size_t      teacher_search_distance_after;
+                itty_feed_model_decoder_objective_t teacher_search_selected_objective_after;
+                size_t      structural_pool_count;
+                size_t      structural_blocks_tested;
+                size_t      structural_selected_safe_blocks;
+                size_t      structural_improving_blocks;
+                bool        structural_found;
+                char        structural_label[96];
+                size_t      structural_flips;
+                size_t      structural_teacher_distance_after;
+                size_t      structural_selected_node_after;
+                size_t      structural_node1_popcount_after;
+                size_t      structural_node6_popcount_after;
+                ptrdiff_t   structural_node1_vs_node6_gap_after;
+                itty_feed_model_decoder_objective_t structural_selected_objective_after;
+                size_t      expanded_pool_count;
+                size_t      expanded_blocks_tested;
+                size_t      expanded_selected_safe_blocks;
+                size_t      expanded_improving_blocks;
+                bool        expanded_found;
+                char        expanded_label[96];
+                size_t      expanded_flips;
+                size_t      expanded_teacher_distance_after;
+                size_t      expanded_selected_node_after;
+                size_t      expanded_node1_popcount_after;
+                size_t      expanded_node6_popcount_after;
+                ptrdiff_t   expanded_node1_vs_node6_gap_after;
+                itty_feed_model_decoder_objective_t expanded_selected_objective_after;
+        } d_residual_compare_summary_t;
+        typedef struct {
+                bool        measured;
+                bool        selected_safe;
+                bool        improves;
+                bool        final_stable;
+                size_t      flips;
+                size_t      selected_after;
+                size_t      gap_after;
+                itty_feed_model_decoder_objective_t objective_after;
+        } d_trace_commit_probe_summary_t;
+        typedef struct {
+                bool        measured;
+                bool        selected_safe;
+                bool        improves;
+                size_t      flips;
+                size_t      selected_after;
+                size_t      gap_after;
+                size_t      node1_pop_after;
+                size_t      node6_pop_after;
+                itty_feed_model_decoder_objective_t objective_after;
+        } d_trace_transaction_probe_summary_t;
+        typedef enum {
+                D_BUDGET_CLASS_POSITIVE,
+                D_BUDGET_CLASS_ZERO_SIDE,
+                D_BUDGET_CLASS_MIXED_TARGET,
+        } d_budget_class_t;
+
+        size_t case_index = 2;
+        size_t nodes = 8;
+        size_t projection_batch_size = 64;
+        size_t projection_max_rounds = 32;
+        size_t projection_max_layer_flips = 128;
+        size_t oracle_max_flips = 8;
+        size_t stage1_step_limit = 8;
+        ptrdiff_t owner_margin_reserve = 2;
+        itty_feed_model_t *decoder_model = itty_feed_model_new (2, nodes, 1, 1);
+        itty_feed_model_t *baseline_selector_model = itty_feed_model_new (2, nodes, 1, 1);
+        itty_bit_string_list_t *input_a = create_input_with_count (1, 0);
+        itty_bit_string_list_t *input_b = create_input_with_count (1, 1);
+        itty_bit_string_t *target_a = create_bit_string ((size_t) 1 << 3);
+        itty_bit_string_t *target_b = create_bit_string (create_half_populated_word ());
+        itty_bit_string_list_t *input_c = NULL;
+        itty_bit_string_t *target_c = NULL;
+        itty_bit_string_list_t *input_d = NULL;
+        itty_bit_string_t *target_d = NULL;
+        itty_feed_model_refreshed_projected_repair_options_t first_options = {
+                .batch_size = projection_batch_size,
+                .max_rounds = projection_max_rounds,
+                .max_layer_flips_per_batch = projection_max_layer_flips
+        };
+        itty_feed_model_train_options_t oracle_options = {
+                .max_flips = oracle_max_flips,
+                .budget_policy = ITTY_FEED_MODEL_TRAIN_BUDGET_POLICY_LARGEST_ERROR_FIRST,
+                .backward_fold = ITTY_FEED_MODEL_BACKWARD_FOLD_SEGMENT_CONDENSE
+        };
+        itty_feed_model_segment_training_summary_t first_summary;
+        itty_feed_model_segment_training_summary_t selector_first_summary;
+        itty_feed_model_segment_node_selection_summary_t a_selection = { 0 };
+        itty_feed_model_segment_node_selection_summary_t b_selection = { 0 };
+        itty_feed_model_decoder_objective_t *a_routes = calloc (nodes, sizeof *a_routes);
+        itty_feed_model_decoder_objective_t *b_routes = calloc (nodes, sizeof *b_routes);
+        itty_feed_model_decoder_objective_t candidate_routes[nodes];
+        replay_selector_block_summary_t selector_stage0 = { 0 };
+        itty_feed_model_decoder_objective_t committed_b_forced = { 0 };
+        itty_bit_string_t *route_keys[nodes];
+        itty_bit_string_t *probe_a;
+        itty_bit_string_t *probe_b;
+        itty_bit_string_t *probe_c = NULL;
+        itty_bit_string_t *probe_d = NULL;
+        size_t a_route;
+        size_t b_route;
+        size_t c_route = (size_t) -1;
+        size_t d_route = (size_t) -1;
+        char const *c_label = NULL;
+        char const *d_label = NULL;
+        route_table_row_t rows[4] = { 0 };
+        d_route_audit_t d_audit[8] = { 0 };
+        d_family_summary_t d_family[sizeof (specs) / sizeof (specs[0])] = { 0 };
+        d_route_choice_summary_t d_choice[8] = { 0 };
+        d_mode_summary_t d_modes[3] = {
+                { .label = "positive-only" },
+                { .label = "zero-only" },
+                { .label = "balanced" },
+        };
+        d_budget_summary_t d_budgets[5] = {
+                { .max_flips = 8 },
+                { .max_flips = 16 },
+                { .max_flips = 32 },
+                { .max_flips = 64 },
+                { .max_flips = 128 },
+        };
+        itty_feed_model_train_stats_t stats_a = { 0 };
+        itty_feed_model_train_stats_t stats_b = { 0 };
+        itty_feed_model_train_stats_t stats_c = { 0 };
+        itty_feed_model_train_stats_t chain_a = { 0 };
+        itty_feed_model_train_stats_t chain_b = { 0 };
+        itty_feed_model_train_stats_t chain_c = { 0 };
+        itty_feed_model_train_stats_t stats_d = { 0 };
+        itty_feed_model_train_stats_t chain_d = { 0 };
+        itty_feed_model_decoder_objective_t obj_a = { 0 };
+        itty_feed_model_decoder_objective_t obj_b = { 0 };
+        itty_feed_model_decoder_objective_t obj_c = { 0 };
+        itty_feed_model_decoder_objective_t obj_d = { 0 };
+        itty_feed_model_decoder_objective_t chain_obj_a = { 0 };
+        itty_feed_model_decoder_objective_t chain_obj_b = { 0 };
+        itty_feed_model_decoder_objective_t chain_obj_c = { 0 };
+        itty_feed_model_decoder_objective_t chain_obj_d = { 0 };
+        itty_feed_model_train_options_t d_commit_options;
+        size_t d_commit_budget = 0;
+        d_budget_class_t d_commit_budget_class = D_BUDGET_CLASS_POSITIVE;
+        char const *d_commit_budget_label = "positive";
+        bool d_commit_uses_block = false;
+        bool d_commit_uses_trace_block = false;
+        size_t d_commit_block_step_indices[3] = { 0 };
+        size_t d_commit_block_step_count = 0;
+        itty_feed_model_mask_flip_trace_t d_commit_trace_block[16] = { 0 };
+        size_t d_commit_trace_block_count = 0;
+        replay_step_summary_t replay_steps[4] = { 0 };
+        itty_feed_model_decoder_objective_t committed_objectives[4] = { 0 };
+        d_improvement_summary_t d_improvements[6] = {
+                { .label = "mixed-64" },
+                { .label = "mixed-128" },
+                { .label = "mixed-64-zero-16" },
+                { .label = "positive-8-mixed-64" },
+                { .label = "mixed-64-positive-8" },
+                { .label = "excess-only-after-mixed" },
+        };
+        itty_feed_model_restore_failure_summary_t d_excess_free = { 0 };
+        itty_feed_model_restore_failure_summary_t d_excess_owner[3] = { 0 };
+        d_excess_audit_row_t d_excess_rows[ITTY_FEED_MODEL_RESTORE_TRACE_LIMIT] = { 0 };
+        size_t d_excess_row_count = 0;
+        itty_feed_model_train_stats_t d_excess_prepare_stats = { 0 };
+        itty_feed_model_final_repair_mode_summary_t d_excess_prepare_summary = { 0 };
+        itty_feed_model_decoder_objective_t d_excess_objective = { 0 };
+        size_t d_excess_budget = 16;
+        d_internal_node_summary_t d_internal = { 0 };
+        d_internal_search_summary_t d_internal_search = { 0 };
+        itty_feed_model_segment_node_selection_summary_t d_profile_committed_selection = { 0 };
+        itty_feed_model_segment_node_selection_summary_t d_profile_improved_selection = { 0 };
+        itty_feed_model_segment_node_selection_summary_t d_profile_post_commit_selection = { 0 };
+        itty_feed_model_segment_node_selection_summary_t d_profile_weighted_selection = { 0 };
+        itty_feed_model_segment_vote_profile_t d_profile_committed = { 0 };
+        itty_feed_model_segment_vote_profile_t d_profile_improved = { 0 };
+        itty_feed_model_segment_vote_profile_t d_profile_post_commit = { 0 };
+        itty_feed_model_segment_vote_profile_t d_profile_weighted = { 0 };
+        itty_feed_model_decoder_objective_t d_weighted_objectives[4] = { 0 };
+        size_t d_post_commit_node_histogram[9] = { 0 };
+        size_t d_post_commit_node_histogram_bits = 0;
+        within_node_threshold_sweep_summary_t d_threshold_sweep[8] = { 0 };
+        within_node_threshold_sweep_summary_t d_threshold_ranked[8] = { 0 };
+        size_t d_threshold_sweep_count = 0;
+        fixed_node_threshold_sweep_summary_t d_fixed_node_threshold_sweep[8] = { 0 };
+        fixed_node_threshold_sweep_summary_t d_fixed_node_threshold_ranked[8] = { 0 };
+        size_t d_fixed_node_threshold_sweep_count = 0;
+        struct {
+                bool measured;
+                bool residual_disabled;
+                size_t threshold_low;
+                size_t threshold_high;
+                size_t selected_node_low;
+                size_t selected_node_high;
+                size_t condensed_distance;
+                size_t condensed_pop_low;
+                size_t condensed_pop_high;
+                size_t activation_distance;
+                size_t activation_pop_low;
+                size_t activation_pop_high;
+                size_t folded_selected_low;
+                size_t folded_selected_high;
+                size_t fixed_node_index;
+                size_t fixed_folded_distance;
+                size_t fixed_folded_pop_low;
+                size_t fixed_folded_pop_high;
+                itty_feed_model_decoder_objective_t objective_low;
+                itty_feed_model_decoder_objective_t objective_high;
+                size_t target_bit_capacity;
+                size_t segments_per_bit;
+                size_t decoded_groups_changed;
+                size_t decoded_groups_crossed_threshold;
+                size_t residual_bits_compared;
+                struct {
+                        size_t decoded_bit;
+                        size_t ones_low;
+                        size_t ones_high;
+                        bool   folded_low;
+                        bool   folded_high;
+                } residual_rows[8];
+        } d_threshold_extremes = { 0 };
+        struct {
+                bool measured;
+                bool residual_disabled;
+                size_t threshold_low;
+                size_t threshold_high;
+                size_t selected_node_low;
+                size_t selected_node_high;
+                size_t fixed_node_index;
+                size_t condensed_distance;
+                size_t condensed_pop_low;
+                size_t condensed_pop_high;
+                size_t activation_distance;
+                size_t activation_pop_low;
+                size_t activation_pop_high;
+                size_t folded_selected_low;
+                size_t folded_selected_high;
+                size_t fixed_folded_distance;
+                size_t fixed_folded_pop_low;
+                size_t fixed_folded_pop_high;
+                itty_feed_model_decoder_objective_t objective_low;
+                itty_feed_model_decoder_objective_t objective_high;
+                size_t target_bit_capacity;
+                size_t segments_per_bit;
+                size_t decoded_groups_changed;
+                size_t decoded_groups_crossed_threshold;
+                size_t residual_bits_compared;
+                struct {
+                        size_t decoded_bit;
+                        size_t ones_low;
+                        size_t ones_high;
+                        bool   folded_low;
+                        bool   folded_high;
+                } residual_rows[8];
+        } d_threshold_extremes_enabled = { 0 };
+        struct {
+                bool measured;
+                bool trained;
+                itty_feed_model_decoder_objective_t before[4];
+                itty_feed_model_decoder_objective_t after[4];
+        } d_direct_duplicate_probe = { 0 };
+        struct {
+                bool measured;
+                bool before_measured[4];
+                bool trained;
+                bool after_train_measured[4];
+                bool replay_trained;
+                bool after_replay_measured[4];
+                size_t owner_passes[4];
+                size_t rounds_completed;
+                bool round_measured[8][4];
+                itty_feed_model_decoder_objective_t rounds[8][4];
+                size_t a_route;
+                size_t b_route;
+                size_t c_route;
+                size_t d_route;
+                size_t a_selected_route;
+                size_t a_selected_gap;
+                bool a_activation_measured;
+                size_t a_activation_words;
+                size_t a_activation_popcount;
+                size_t a_target_words;
+                size_t a_duplicated_target_words;
+                size_t a_duplicated_target_popcount;
+                bool a_target_aligned;
+                size_t a_route_activation_words[8];
+                size_t a_route_activation_popcounts[8];
+                itty_feed_model_decoder_objective_t before[4];
+                itty_feed_model_decoder_objective_t after_train[4];
+                itty_feed_model_decoder_objective_t after_replay[4];
+        } d_direct_duplicate_fresh = { 0 };
+        struct {
+                bool before_measured[4];
+                itty_feed_model_decoder_objective_t before[4];
+                bool trained;
+                size_t owner_passes[4];
+                size_t rounds_completed;
+                bool round_measured[4][4];
+                itty_feed_model_decoder_objective_t rounds[4][4];
+                bool after_train_measured[4];
+                itty_feed_model_decoder_objective_t after_train[4];
+                bool replay_trained;
+                bool after_replay_measured[4];
+                itty_feed_model_decoder_objective_t after_replay[4];
+        } d_direct_padded_fresh = { 0 };
+        struct {
+                bool before_measured[4];
+                itty_feed_model_decoder_objective_t before[4];
+                bool trained;
+                size_t owner_passes[4];
+                size_t rounds_completed;
+                bool round_measured[4][4];
+                itty_feed_model_decoder_objective_t rounds[4][4];
+                bool after_train_measured[4];
+                itty_feed_model_decoder_objective_t after_train[4];
+                bool replay_trained;
+                bool after_replay_measured[4];
+                itty_feed_model_decoder_objective_t after_replay[4];
+        } d_direct_gray_fresh = { 0 };
+        struct {
+                bool measured;
+                size_t wrong_bit_count;
+                size_t wrong_bits[8];
+                bool best_single_flip_found;
+                itty_feed_model_mask_flip_trace_t best_single_flip;
+                itty_feed_model_decoder_objective_t best_single_flip_objective;
+        } d_direct_gray_b_probe = { 0 };
+        struct {
+                bool measured;
+                size_t wrong_bit_count;
+                size_t wrong_bits[8];
+                bool best_single_flip_found;
+                itty_feed_model_mask_flip_trace_t best_single_flip;
+                itty_feed_model_decoder_objective_t best_single_flip_objective;
+        } d_direct_gray_c_probe = { 0 };
+        struct {
+                bool before_measured[4];
+                itty_feed_model_decoder_objective_t before[4];
+                bool trained;
+                size_t rounds_completed;
+                bool round_measured[8][4];
+                itty_feed_model_decoder_objective_t rounds[8][4];
+                bool after_train_measured[4];
+                itty_feed_model_decoder_objective_t after_train[4];
+                bool replay_trained;
+                bool after_replay_measured[4];
+                itty_feed_model_decoder_objective_t after_replay[4];
+        } d_direct_duplicate_adapter = { 0 };
+        d_conflict_accumulator_summary_t d_conflict = { 0 };
+        d_candidate_family_summary_t d_families[4] = {
+                { .label = "intended-node-zero" },
+                { .label = "selected-node-zero" },
+                { .label = "selection-stable-intended" },
+                { .label = "joint-zero-internal-margin" },
+        };
+        d_block_search_summary_t d_block_search = { 0 };
+        d_block_step_spec_t block_step_specs[7] = { 0 };
+        d_block_matrix_summary_t d_block_matrix[7] = {
+                { .label = "balanced-8 -> balanced-8" },
+                { .label = "balanced-8 -> selected-zero-8" },
+                { .label = "selected-zero-8 -> balanced-8" },
+                { .label = "balanced-8 -> selected-positive-8" },
+                { .label = "selected-positive-8 -> balanced-8" },
+                { .label = "balanced-8 -> internal-selection-stabilizer" },
+                { .label = "internal-selection-stabilizer -> selected-zero-8" },
+        };
+        d_residual_error_row_t d_residual_rows[ITTY_FEED_MODEL_SEGMENT_VOTE_TRACE_LIMIT] = { 0 };
+        size_t d_residual_row_count = 0;
+        d_residual_error_row_t d_post_commit_residual_rows[ITTY_FEED_MODEL_SEGMENT_VOTE_TRACE_LIMIT] = { 0 };
+        size_t d_post_commit_residual_row_count = 0;
+        d_exact_zero_block_summary_t d_exact_zero_blocks[5] = {
+                { .label = "selected-exact-zero -> selected-exact-zero" },
+                { .label = "selected-exact-zero -> internal-selection-stabilizer" },
+                { .label = "internal-selection-stabilizer -> selected-exact-zero" },
+                { .label = "selected-exact-zero -> selected-positive" },
+                { .label = "selected-exact-zero -> route-balanced-8" },
+        };
+        d_residual_set_summary_t d_residual_sets[16] = { 0 };
+        size_t d_residual_set_count = 0;
+        d_residual_set_summary_t d_post_commit_residual_sets[16] = { 0 };
+        size_t d_post_commit_residual_set_count = 0;
+        d_residual_compare_summary_t d_residual_compare[4] = {
+                { .label = "25", .bit_count = 1, .bits = { 25 } },
+                { .label = "25+26", .bit_count = 2, .bits = { 25, 26 } },
+                { .label = "25+26+28", .bit_count = 3, .bits = { 25, 26, 28 } },
+                { .label = "25+26+28+29", .bit_count = 4, .bits = { 25, 26, 28, 29 } },
+        };
+        struct {
+                itty_feed_model_mask_flip_trace_t trace;
+                char                              source[48];
+        } structural_flip_pool[128] = { 0 };
+        size_t structural_flip_pool_count = 0;
+        itty_feed_model_mask_flip_trace_t d_expanded_best_trace_block[16] = { 0 };
+        size_t d_expanded_best_trace_block_count = 0;
+        bool d_expanded_best_found = false;
+        itty_feed_model_mask_flip_trace_t d_exact_25_trace_block[16] = { 0 };
+        size_t d_exact_25_trace_block_count = 0;
+        d_trace_commit_probe_summary_t d_trace_commit_probe = { 0 };
+        d_trace_transaction_probe_summary_t d_trace_transaction_probe = { 0 };
+        d_trace_commit_probe_summary_t d_tx_commit_probe = { 0 };
+
+        memset (route_keys, 0, sizeof route_keys);
+        assert (decoder_model && baseline_selector_model);
+        assert (a_routes && b_routes);
+
+        itty_feed_model_set_decoder (decoder_model, ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE);
+        itty_feed_model_set_decoder (baseline_selector_model, ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE);
+        assert (itty_feed_model_randomize_masks (decoder_model, 0xa100 + case_index, 1, 8));
+        assert (itty_feed_model_randomize_masks (baseline_selector_model, 0xa100 + case_index, 1, 8));
+        assert (itty_feed_model_train_segment_condense_quota_repair_projection (decoder_model,
+                                                                                input_a,
+                                                                                target_a,
+                                                                                &first_options,
+                                                                                &first_summary));
+        assert (itty_feed_model_train_segment_condense_quota_repair_projection (baseline_selector_model,
+                                                                                input_a,
+                                                                                target_a,
+                                                                                &first_options,
+                                                                                &selector_first_summary));
+        assert (itty_feed_model_measure_segment_node_selection (decoder_model, input_a, target_a, &a_selection));
+        assert (itty_feed_model_measure_segment_node_selection (decoder_model, input_b, target_b, &b_selection));
+        for (size_t route = 0; route < nodes; route++) {
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_a,
+                                                                            target_a,
+                                                                            route,
+                                                                            &a_routes[route]));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_b,
+                                                                            target_b,
+                                                                            route,
+                                                                            &b_routes[route]));
+        }
+        a_route = replay_choose_a_route (a_routes, nodes, &a_selection);
+        b_route = replay_choose_b_route (b_routes, nodes, a_route, &b_selection);
+
+        assert (replay_apply_selector_protection_block (baseline_selector_model,
+                                                        input_a,
+                                                        target_a,
+                                                        a_route,
+                                                        NULL,
+                                                        NULL,
+                                                        0,
+                                                        nodes,
+                                                        owner_margin_reserve,
+                                                        8,
+                                                        &oracle_options,
+                                                        &selector_stage0));
+
+        for (size_t step = 0; step < stage1_step_limit; step++) {
+                itty_feed_model_train_stats_t step_stats = { 0 };
+                itty_feed_model_decoder_objective_t probe_b_before = { 0 };
+                itty_feed_model_decoder_objective_t probe_b_after = { 0 };
+                itty_feed_model_decoder_objective_t probe_a_forced = { 0 };
+                itty_feed_model_decoder_objective_t probe_a_shadow = { 0 };
+                itty_feed_model_segment_node_selection_summary_t probe_a_selector = { 0 };
+                itty_feed_model_decoder_objective_t selector_routes[nodes];
+                ptrdiff_t probe_a_margin = 0;
+
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_b,
+                                                                            target_b,
+                                                                            b_route,
+                                                                            &probe_b_before));
+                if (!itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model,
+                                                                                    input_b,
+                                                                                    target_b,
+                                                                                    b_route,
+                                                                                    &oracle_options,
+                                                                                    &step_stats))
+                        break;
+                if (step_stats.flips == 0)
+                        break;
+                assert (replay_measure_shadow_selected_decode (decoder_model,
+                                                               baseline_selector_model,
+                                                               input_a,
+                                                               target_a,
+                                                               &probe_a_selector,
+                                                               &probe_a_shadow));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_a,
+                                                                            target_a,
+                                                                            a_route,
+                                                                            &probe_a_forced));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_b,
+                                                                            target_b,
+                                                                            b_route,
+                                                                            &probe_b_after));
+                for (size_t route = 0; route < nodes; route++)
+                        assert (itty_feed_model_measure_decoder_objective_for_node (baseline_selector_model,
+                                                                                    input_a,
+                                                                                    target_a,
+                                                                                    route,
+                                                                                    &selector_routes[route]));
+                probe_a_margin = replay_route_margin_for_objectives (selector_routes, nodes, a_route);
+                if (!replay_route_is_a_safe (&probe_a_forced) ||
+                    probe_a_shadow.selected_distance != 0 ||
+                    probe_a_margin < owner_margin_reserve ||
+                    !(probe_b_after.selected_distance < probe_b_before.selected_distance ||
+                      (probe_b_after.selected_distance == probe_b_before.selected_distance &&
+                       probe_b_after.false_negative_vote_deficit < probe_b_before.false_negative_vote_deficit)))
+                        break;
+                committed_b_forced = probe_b_after;
+        }
+
+        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model, input_a, target_a, a_route, &oracle_options, &stats_a));
+        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model, input_b, target_b, b_route, &oracle_options, &stats_b));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_a, target_a, a_route, &obj_a));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_b, target_b, b_route, &obj_b));
+
+        probe_a = itty_bit_string_clone (itty_bit_string_list_fetch (input_a, 0));
+        probe_b = itty_bit_string_clone (itty_bit_string_list_fetch (input_b, 0));
+        for (size_t route = 0; route < nodes; route++)
+                route_keys[route] = create_bit_string (create_mixed_word ());
+        itty_bit_string_free (route_keys[a_route]);
+        route_keys[a_route] = itty_bit_string_clone (probe_a);
+        itty_bit_string_free (route_keys[b_route]);
+        route_keys[b_route] = itty_bit_string_clone (probe_b);
+
+        for (size_t spec_index = 0; spec_index < sizeof (specs) / sizeof (specs[0]); spec_index++) {
+                itty_bit_string_list_t *candidate_input = create_input_with_count (1, specs[spec_index].input_word);
+                itty_bit_string_t *candidate_target = create_bit_string (specs[spec_index].target_word);
+                itty_bit_string_t *candidate_probe = itty_bit_string_clone (itty_bit_string_list_fetch (candidate_input, 0));
+                size_t best_route = (size_t) -1;
+                size_t best_before_dist = 0, best_before_def = 0, best_before_excess = 0;
+                size_t best_after_dist = 0, best_after_def = 0, best_after_excess = 0;
+                size_t best_gap = 0, best_flips = 0;
+
+                for (size_t route = 0; route < nodes; route++) {
+                        route_key_probe_summary_t sel;
+                        itty_feed_model_layer_state_snapshot_t *snapshot;
+                        itty_feed_model_train_stats_t trial = { 0 };
+                        itty_feed_model_decoder_objective_t cand_after = { 0 }, a_after = { 0 }, b_after = { 0 };
+                        size_t score = itty_bit_string_evaluate_similarity (candidate_probe, candidate_probe);
+                        size_t runner = 0;
+                        size_t comp = 0;
+
+                        if (route == a_route || route == b_route)
+                                continue;
+                        if (!itty_feed_model_measure_decoder_objective_for_node (decoder_model, candidate_input, candidate_target, route, &candidate_routes[route]))
+                                continue;
+                        for (size_t competitor = 0; competitor < nodes; competitor++) {
+                                size_t competitor_score;
+                                if (competitor == route)
+                                        continue;
+                                competitor_score = itty_bit_string_evaluate_similarity (candidate_probe, route_keys[competitor]);
+                                if (competitor_score > runner) {
+                                        runner = competitor_score;
+                                        comp = competitor;
+                                }
+                        }
+                        sel.selected_route = score > runner ? route : comp;
+                        sel.selected_gap = score - runner;
+                        sel.nearest_competing_route = comp;
+                        if (sel.selected_route != route || sel.selected_gap < 1 || candidate_routes[route].false_negative_vote_deficit == 0)
+                                continue;
+
+                        snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                        assert (snapshot);
+                        if (!itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model,
+                                                                                            candidate_input,
+                                                                                            candidate_target,
+                                                                                            route,
+                                                                                            &oracle_options,
+                                                                                            &trial) ||
+                            !itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_a, target_a, a_route, &a_after) ||
+                            !itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_b, target_b, b_route, &b_after) ||
+                            !itty_feed_model_measure_decoder_objective_for_node (decoder_model, candidate_input, candidate_target, route, &cand_after)) {
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                                continue;
+                        }
+                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                        if (trial.flips == 0 || a_after.selected_distance != 0 || b_after.selected_distance > obj_b.selected_distance + 1)
+                                continue;
+                        if (!(cand_after.selected_distance < candidate_routes[route].selected_distance ||
+                              cand_after.false_negative_vote_deficit < candidate_routes[route].false_negative_vote_deficit))
+                                continue;
+                        if (best_route == (size_t) -1 ||
+                            (candidate_routes[route].false_negative_vote_deficit - cand_after.false_negative_vote_deficit) > (best_before_def - best_after_def) ||
+                            ((candidate_routes[route].false_negative_vote_deficit - cand_after.false_negative_vote_deficit) == (best_before_def - best_after_def) &&
+                             candidate_routes[route].selected_distance - cand_after.selected_distance > best_before_dist - best_after_dist)) {
+                                best_route = route;
+                                best_before_dist = candidate_routes[route].selected_distance;
+                                best_before_def = candidate_routes[route].false_negative_vote_deficit;
+                                best_after_dist = cand_after.selected_distance;
+                                best_after_def = cand_after.false_negative_vote_deficit;
+                                best_gap = sel.selected_gap;
+                                best_flips = trial.flips;
+                        }
+                }
+
+                if (best_route != (size_t) -1) {
+                        input_c = candidate_input;
+                        target_c = candidate_target;
+                        probe_c = candidate_probe;
+                        c_route = best_route;
+                        c_label = specs[spec_index].label;
+                        rows[2].training_flips = best_flips;
+                        rows[2].newly_allocated = true;
+                        break;
+                }
+                itty_bit_string_list_free (candidate_input);
+                itty_bit_string_free (candidate_target);
+                itty_bit_string_free (candidate_probe);
+        }
+
+        assert (c_route != (size_t) -1);
+        itty_bit_string_free (route_keys[c_route]);
+        route_keys[c_route] = itty_bit_string_clone (probe_c);
+        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model, input_c, target_c, c_route, &oracle_options, &stats_c));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_c, target_c, c_route, &obj_c));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_b, target_b, b_route, &obj_b));
+
+        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model, input_a, target_a, a_route, &oracle_options, &chain_a));
+        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model, input_b, target_b, b_route, &oracle_options, &chain_b));
+        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model, input_c, target_c, c_route, &oracle_options, &chain_c));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_a, target_a, a_route, &obj_a));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_b, target_b, b_route, &obj_b));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_c, target_c, c_route, &obj_c));
+
+        for (size_t spec_index = 0; spec_index < sizeof (specs) / sizeof (specs[0]); spec_index++) {
+                itty_bit_string_list_t *candidate_input = create_input_with_count (1, specs[spec_index].input_word ^ ((size_t) 1 << 7));
+                itty_bit_string_t *candidate_target = create_bit_string (specs[spec_index].target_word ^ ((size_t) 1 << 0));
+                itty_bit_string_t *candidate_probe = itty_bit_string_clone (itty_bit_string_list_fetch (candidate_input, 0));
+                size_t best_route = (size_t) -1;
+                size_t best_before_dist = 0, best_before_def = 0, best_before_excess = 0;
+                size_t best_after_dist = 0, best_after_def = 0, best_after_excess = 0;
+                size_t best_flips = 0;
+                size_t best_gap = 0;
+
+                d_family[spec_index].label = specs[spec_index].label;
+
+                for (size_t route = 0; route < nodes; route++) {
+                        route_key_probe_summary_t sel;
+                        itty_feed_model_layer_state_snapshot_t *snapshot;
+                        itty_feed_model_train_stats_t trial = { 0 };
+                        itty_feed_model_decoder_objective_t cand_after = { 0 }, a_after = { 0 }, b_after = { 0 }, c_after = { 0 };
+                        size_t score = itty_bit_string_evaluate_similarity (candidate_probe, candidate_probe);
+                        size_t runner = 0;
+                        size_t comp = 0;
+
+                        if (route == a_route || route == b_route || route == c_route)
+                                continue;
+                        if (!itty_feed_model_measure_decoder_objective_for_node (decoder_model, candidate_input, candidate_target, route, &candidate_routes[route]))
+                                continue;
+                        for (size_t competitor = 0; competitor < nodes; competitor++) {
+                                size_t competitor_score;
+                                if (competitor == route)
+                                        continue;
+                                competitor_score = itty_bit_string_evaluate_similarity (candidate_probe, route_keys[competitor]);
+                                if (competitor_score > runner) {
+                                        runner = competitor_score;
+                                        comp = competitor;
+                                }
+                        }
+                        sel.selected_route = score > runner ? route : comp;
+                        sel.selected_gap = score - runner;
+                        sel.nearest_competing_route = comp;
+                        if (sel.selected_route != route || sel.selected_gap < 1 || candidate_routes[route].false_negative_vote_deficit == 0)
+                                continue;
+
+                        snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                        assert (snapshot);
+                        if (!itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model,
+                                                                                            candidate_input,
+                                                                                            candidate_target,
+                                                                                            route,
+                                                                                            &oracle_options,
+                                                                                            &trial) ||
+                            !itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_a, target_a, a_route, &a_after) ||
+                            !itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_b, target_b, b_route, &b_after) ||
+                            !itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_c, target_c, c_route, &c_after) ||
+                            !itty_feed_model_measure_decoder_objective_for_node (decoder_model, candidate_input, candidate_target, route, &cand_after)) {
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                                continue;
+                        }
+                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                        d_choice[route].admitted =
+                                sel.selected_gap > 0 &&
+                                a_after.selected_distance == 0 &&
+                                b_after.selected_distance <= obj_b.selected_distance + 1 &&
+                                c_after.selected_distance <= obj_c.selected_distance + 1;
+                        d_choice[route].route = route;
+                        d_choice[route].gap = sel.selected_gap;
+                        d_choice[route].before_dist = candidate_routes[route].selected_distance;
+                        d_choice[route].before_def = candidate_routes[route].false_negative_vote_deficit;
+                        d_choice[route].before_excess = candidate_routes[route].false_positive_vote_excess;
+                        d_choice[route].after_dist = cand_after.selected_distance;
+                        d_choice[route].after_def = cand_after.false_negative_vote_deficit;
+                        d_choice[route].after_excess = cand_after.false_positive_vote_excess;
+                        d_choice[route].flips = trial.flips;
+                        d_choice[route].replay_safe = d_choice[route].admitted;
+
+                        if (trial.flips == 0 || !d_choice[route].admitted)
+                                continue;
+                        if (!(cand_after.selected_distance < candidate_routes[route].selected_distance ||
+                              cand_after.false_negative_vote_deficit < candidate_routes[route].false_negative_vote_deficit))
+                                continue;
+                        if (best_route == (size_t) -1 ||
+                            candidate_routes[route].selected_distance - cand_after.selected_distance > best_before_dist - best_after_dist ||
+                            (candidate_routes[route].selected_distance - cand_after.selected_distance == best_before_dist - best_after_dist &&
+                             candidate_routes[route].false_negative_vote_deficit - cand_after.false_negative_vote_deficit >
+                             best_before_def - best_after_def) ||
+                            (candidate_routes[route].selected_distance - cand_after.selected_distance == best_before_dist - best_after_dist &&
+                             candidate_routes[route].false_negative_vote_deficit - cand_after.false_negative_vote_deficit ==
+                             best_before_def - best_after_def &&
+                             candidate_routes[route].false_positive_vote_excess - cand_after.false_positive_vote_excess >
+                             best_before_excess - best_after_excess) ||
+                            (candidate_routes[route].selected_distance - cand_after.selected_distance == best_before_dist - best_after_dist &&
+                             candidate_routes[route].false_negative_vote_deficit - cand_after.false_negative_vote_deficit ==
+                             best_before_def - best_after_def &&
+                             candidate_routes[route].false_positive_vote_excess - cand_after.false_positive_vote_excess ==
+                             best_before_excess - best_after_excess &&
+                             sel.selected_gap > best_gap)) {
+                                best_route = route;
+                                best_before_dist = candidate_routes[route].selected_distance;
+                                best_before_def = candidate_routes[route].false_negative_vote_deficit;
+                                best_before_excess = candidate_routes[route].false_positive_vote_excess;
+                                best_after_dist = cand_after.selected_distance;
+                                best_after_def = cand_after.false_negative_vote_deficit;
+                                best_after_excess = cand_after.false_positive_vote_excess;
+                                best_gap = sel.selected_gap;
+                                best_flips = trial.flips;
+                        }
+                }
+
+                if (best_route != (size_t) -1) {
+                        d_family[spec_index].found_route = true;
+                        d_family[spec_index].route = best_route;
+                        d_family[spec_index].gap = best_gap;
+                        d_family[spec_index].before_dist = best_before_dist;
+                        d_family[spec_index].before_def = best_before_def;
+                        d_family[spec_index].before_excess = best_before_excess;
+                        d_family[spec_index].after_dist = best_after_dist;
+                        d_family[spec_index].after_def = best_after_def;
+                        d_family[spec_index].flips = best_flips;
+                        if (d_route == (size_t) -1 ||
+                            (best_before_def - best_after_def) > (rows[3].objective.false_negative_vote_deficit) ||
+                            ((best_before_def - best_after_def) == (rows[3].objective.false_negative_vote_deficit) &&
+                             best_before_dist - best_after_dist > rows[3].objective.selected_distance)) {
+                                if (input_d)
+                                        itty_bit_string_list_free (input_d);
+                                if (target_d)
+                                        itty_bit_string_free (target_d);
+                                if (probe_d)
+                                        itty_bit_string_free (probe_d);
+                                input_d = candidate_input;
+                                target_d = candidate_target;
+                                probe_d = candidate_probe;
+                                d_route = best_route;
+                                d_label = specs[spec_index].label;
+                                rows[3].training_flips = best_flips;
+                                rows[3].newly_allocated = true;
+                                rows[3].objective.selected_distance = best_before_dist - best_after_dist;
+                                rows[3].objective.false_negative_vote_deficit = best_before_def - best_after_def;
+                                continue;
+                        }
+                }
+                itty_bit_string_list_free (candidate_input);
+                itty_bit_string_free (candidate_target);
+                itty_bit_string_free (candidate_probe);
+        }
+
+        assert (d_route != (size_t) -1);
+
+        memset (d_choice, 0, sizeof d_choice);
+
+        for (size_t route = 0; route < nodes; route++) {
+                route_key_probe_summary_t sel = { 0 };
+                itty_feed_model_layer_state_snapshot_t *snapshot;
+                itty_feed_model_train_stats_t trial = { 0 };
+                itty_feed_model_decoder_objective_t d_after = { 0 };
+                itty_feed_model_decoder_objective_t a_after = { 0 };
+                itty_feed_model_decoder_objective_t b_after = { 0 };
+                itty_feed_model_decoder_objective_t c_after = { 0 };
+                size_t score = itty_bit_string_evaluate_similarity (probe_d, probe_d);
+                size_t runner = 0;
+                size_t comp = 0;
+
+                if (route == a_route || route == b_route || route == c_route)
+                        continue;
+                if (!itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                         input_d,
+                                                                         target_d,
+                                                                         route,
+                                                                         &candidate_routes[route]))
+                        continue;
+
+                for (size_t competitor = 0; competitor < nodes; competitor++) {
+                        size_t competitor_score;
+                        if (competitor == route)
+                                continue;
+                        competitor_score = itty_bit_string_evaluate_similarity (probe_d, route_keys[competitor]);
+                        if (competitor_score > runner) {
+                                runner = competitor_score;
+                                comp = competitor;
+                        }
+                }
+                sel.selected_route = score > runner ? route : comp;
+                sel.selected_gap = score - runner;
+                sel.nearest_competing_route = comp;
+
+                d_audit[route].measured = true;
+                d_audit[route].before_dist = candidate_routes[route].selected_distance;
+                d_audit[route].before_def = candidate_routes[route].false_negative_vote_deficit;
+                d_audit[route].before_excess = candidate_routes[route].false_positive_vote_excess;
+                d_audit[route].before_zero_safety = candidate_routes[route].target_zero_safety_min;
+                d_choice[route].route = route;
+                d_choice[route].gap = sel.selected_gap;
+                d_choice[route].before_dist = d_audit[route].before_dist;
+                d_choice[route].before_def = d_audit[route].before_def;
+                d_choice[route].before_excess = d_audit[route].before_excess;
+
+                snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                assert (snapshot);
+                if (itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model,
+                                                                                   input_d,
+                                                                                   target_d,
+                                                                                   route,
+                                                                                   &oracle_options,
+                                                                                   &trial) &&
+                    itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_a, target_a, a_route, &a_after) &&
+                    itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_b, target_b, b_route, &b_after) &&
+                    itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_c, target_c, c_route, &c_after) &&
+                    itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_d, target_d, route, &d_after)) {
+                        d_audit[route].replay_safe_flips = trial.flips;
+                        d_audit[route].replay_safe_after_dist = d_after.selected_distance;
+                        d_audit[route].replay_safe_after_def = d_after.false_negative_vote_deficit;
+                        d_audit[route].replay_safe_after_excess = d_after.false_positive_vote_excess;
+                        d_audit[route].replay_safe_after_zero_safety = d_after.target_zero_safety_min;
+                        d_audit[route].replay_safe_kept_owners =
+                                a_after.selected_distance == 0 &&
+                                b_after.selected_distance <= obj_b.selected_distance + 1 &&
+                                c_after.selected_distance <= obj_c.selected_distance + 1;
+                        d_choice[route].admitted =
+                                sel.selected_route == route &&
+                                sel.selected_gap > 0 &&
+                                d_audit[route].replay_safe_kept_owners;
+                        d_choice[route].after_dist = d_after.selected_distance;
+                        d_choice[route].after_def = d_after.false_negative_vote_deficit;
+                        d_choice[route].after_excess = d_after.false_positive_vote_excess;
+                        d_choice[route].flips = trial.flips;
+                        d_choice[route].replay_safe = d_choice[route].admitted;
+                        if (trial.flips == 0)
+                                d_audit[route].replay_safe_reason = "no-effect";
+                        else if (!d_audit[route].replay_safe_kept_owners)
+                                d_audit[route].replay_safe_reason = "replay-rejected";
+                        else if (d_after.selected_distance < d_audit[route].before_dist)
+                                d_audit[route].replay_safe_reason = "distance-helpful";
+                        else if (d_after.false_negative_vote_deficit < d_audit[route].before_def)
+                                d_audit[route].replay_safe_reason = "deficit-helpful";
+                        else if (d_after.false_positive_vote_excess < d_audit[route].before_excess)
+                                d_audit[route].replay_safe_reason = "excess-helpful";
+                        else if (d_after.target_zero_safety_min > d_audit[route].before_zero_safety)
+                                d_audit[route].replay_safe_reason = "zero-safety-helpful";
+                        else
+                                d_audit[route].replay_safe_reason = "local-only";
+                }
+                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+
+                snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                assert (snapshot);
+                memset (&trial, 0, sizeof trial);
+                memset (&d_after, 0, sizeof d_after);
+                if (itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model,
+                                                                                   input_d,
+                                                                                   target_d,
+                                                                                   route,
+                                                                                   &oracle_options,
+                                                                                   &trial) &&
+                    itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_d, target_d, route, &d_after)) {
+                        d_audit[route].no_replay_flips = trial.flips;
+                        d_audit[route].no_replay_after_dist = d_after.selected_distance;
+                        d_audit[route].no_replay_after_def = d_after.false_negative_vote_deficit;
+                        d_audit[route].no_replay_after_excess = d_after.false_positive_vote_excess;
+                        d_audit[route].no_replay_after_zero_safety = d_after.target_zero_safety_min;
+                        if (trial.flips == 0)
+                                d_audit[route].no_replay_reason = "no-effect";
+                        else if (d_after.selected_distance < d_audit[route].before_dist)
+                                d_audit[route].no_replay_reason = "distance-helpful";
+                        else if (d_after.false_negative_vote_deficit < d_audit[route].before_def)
+                                d_audit[route].no_replay_reason = "deficit-helpful";
+                        else if (d_after.false_positive_vote_excess < d_audit[route].before_excess)
+                                d_audit[route].no_replay_reason = "excess-helpful";
+                        else if (d_after.target_zero_safety_min > d_audit[route].before_zero_safety)
+                                d_audit[route].no_replay_reason = "zero-safety-helpful";
+                        else
+                                d_audit[route].no_replay_reason = "local-only";
+                }
+                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+        }
+
+        for (size_t mode_index = 0; mode_index < sizeof (d_modes) / sizeof (d_modes[0]); mode_index++) {
+                static itty_feed_model_final_repair_mode_t const modes[] = {
+                        ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY,
+                        ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY,
+                        ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+                };
+                itty_feed_model_layer_state_snapshot_t *snapshot;
+                itty_feed_model_train_stats_t trial = { 0 };
+                itty_feed_model_final_repair_mode_summary_t mode_summary = { 0 };
+                itty_feed_model_decoder_objective_t before = { 0 };
+                itty_feed_model_decoder_objective_t after = { 0 };
+
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_d,
+                                                                            target_d,
+                                                                            d_route,
+                                                                            &before));
+                snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                assert (snapshot);
+                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                            input_d,
+                                                                                            target_d,
+                                                                                            d_route,
+                                                                                            &oracle_options,
+                                                                                            modes[mode_index],
+                                                                                            &trial,
+                                                                                            &mode_summary));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_d,
+                                                                            target_d,
+                                                                            d_route,
+                                                                            &after));
+                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+
+                d_modes[mode_index].candidate_count = mode_summary.candidate_count;
+                d_modes[mode_index].accepted_candidates = mode_summary.accepted_candidates;
+                d_modes[mode_index].distance_delta = (ptrdiff_t) after.selected_distance - (ptrdiff_t) before.selected_distance;
+                d_modes[mode_index].deficit_delta = (ptrdiff_t) after.false_negative_vote_deficit - (ptrdiff_t) before.false_negative_vote_deficit;
+                d_modes[mode_index].excess_delta = (ptrdiff_t) after.false_positive_vote_excess - (ptrdiff_t) before.false_positive_vote_excess;
+                d_modes[mode_index].target_one_margin_delta = (ptrdiff_t) after.target_one_margin - (ptrdiff_t) before.target_one_margin;
+                d_modes[mode_index].target_zero_safety_delta = (ptrdiff_t) after.target_zero_safety_min - (ptrdiff_t) before.target_zero_safety_min;
+                d_modes[mode_index].flips = trial.flips;
+
+                if (mode_summary.candidate_count == 0)
+                        d_modes[mode_index].stop_reason = "no-candidates";
+                else if (mode_summary.accepted_candidates == 0)
+                        d_modes[mode_index].stop_reason = "no-accepted-candidates";
+                else if (trial.flips == 0)
+                        d_modes[mode_index].stop_reason = "no-effect";
+                else if (after.selected_distance < before.selected_distance)
+                        d_modes[mode_index].stop_reason = "distance-helpful";
+                else if (after.false_negative_vote_deficit < before.false_negative_vote_deficit &&
+                         after.false_positive_vote_excess > before.false_positive_vote_excess)
+                        d_modes[mode_index].stop_reason = "deficit-vs-excess-fight";
+                else if (after.false_positive_vote_excess < before.false_positive_vote_excess &&
+                         after.false_negative_vote_deficit > before.false_negative_vote_deficit)
+                        d_modes[mode_index].stop_reason = "excess-vs-deficit-fight";
+                else if (after.false_negative_vote_deficit < before.false_negative_vote_deficit)
+                        d_modes[mode_index].stop_reason = "deficit-helpful";
+                else if (after.false_positive_vote_excess < before.false_positive_vote_excess)
+                        d_modes[mode_index].stop_reason = "excess-helpful";
+                else if (after.target_one_margin > before.target_one_margin)
+                        d_modes[mode_index].stop_reason = "target-one-margin-helpful";
+                else if (after.target_zero_safety_min > before.target_zero_safety_min)
+                        d_modes[mode_index].stop_reason = "zero-safety-helpful";
+                else
+                        d_modes[mode_index].stop_reason = "local-only";
+        }
+
+        for (size_t budget_index = 0; budget_index < sizeof (d_budgets) / sizeof (d_budgets[0]); budget_index++) {
+                itty_feed_model_layer_state_snapshot_t *snapshot;
+                itty_feed_model_train_stats_t trial = { 0 };
+                itty_feed_model_final_repair_mode_summary_t mode_summary = { 0 };
+                itty_feed_model_decoder_objective_t before = { 0 };
+                itty_feed_model_decoder_objective_t after = { 0 };
+                itty_feed_model_decoder_objective_t a_after = { 0 };
+                itty_feed_model_decoder_objective_t b_after = { 0 };
+                itty_feed_model_decoder_objective_t c_after = { 0 };
+                itty_feed_model_train_options_t budget_options = oracle_options;
+
+                budget_options.max_flips = d_budgets[budget_index].max_flips;
+
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_d,
+                                                                            target_d,
+                                                                            d_route,
+                                                                            &before));
+                snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                assert (snapshot);
+                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                            input_d,
+                                                                                            target_d,
+                                                                                            d_route,
+                                                                                            &budget_options,
+                                                                                            ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+                                                                                            &trial,
+                                                                                            &mode_summary));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_a,
+                                                                            target_a,
+                                                                            a_route,
+                                                                            &a_after));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_b,
+                                                                            target_b,
+                                                                            b_route,
+                                                                            &b_after));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_c,
+                                                                            target_c,
+                                                                            c_route,
+                                                                            &c_after));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_d,
+                                                                            target_d,
+                                                                            d_route,
+                                                                            &after));
+                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+
+                d_budgets[budget_index].candidate_count = mode_summary.candidate_count;
+                d_budgets[budget_index].accepted_candidates = mode_summary.accepted_candidates;
+                d_budgets[budget_index].positive_repairs =
+                        mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY ?
+                        mode_summary.accepted_candidates : 0;
+                d_budgets[budget_index].zero_repairs =
+                        mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY ?
+                        mode_summary.accepted_candidates : 0;
+                d_budgets[budget_index].mixed_repairs =
+                        mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ?
+                        mode_summary.accepted_candidates : 0;
+                d_budgets[budget_index].uncategorized_repairs =
+                        mode_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY &&
+                        mode_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY &&
+                        mode_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ?
+                        mode_summary.accepted_candidates : 0;
+                d_budgets[budget_index].distance_delta = (ptrdiff_t) after.selected_distance - (ptrdiff_t) before.selected_distance;
+                d_budgets[budget_index].deficit_delta = (ptrdiff_t) after.false_negative_vote_deficit - (ptrdiff_t) before.false_negative_vote_deficit;
+                d_budgets[budget_index].excess_delta = (ptrdiff_t) after.false_positive_vote_excess - (ptrdiff_t) before.false_positive_vote_excess;
+                d_budgets[budget_index].flips = trial.flips;
+                d_budgets[budget_index].owners_kept =
+                        a_after.selected_distance == 0 &&
+                        b_after.selected_distance <= obj_b.selected_distance + 1 &&
+                        c_after.selected_distance <= obj_c.selected_distance + 1;
+
+                if (mode_summary.candidate_count == 0)
+                        d_budgets[budget_index].stop_reason = "no-candidates";
+                else if (mode_summary.accepted_candidates == 0)
+                        d_budgets[budget_index].stop_reason = "no-accepted-candidates";
+                else if (!d_budgets[budget_index].owners_kept)
+                        d_budgets[budget_index].stop_reason = "replay-rejected";
+                else if (trial.flips == 0)
+                        d_budgets[budget_index].stop_reason = "no-effect";
+                else if (after.selected_distance < before.selected_distance)
+                        d_budgets[budget_index].stop_reason = "distance-helpful";
+                else if (after.false_positive_vote_excess < before.false_positive_vote_excess)
+                        d_budgets[budget_index].stop_reason = "excess-helpful";
+                else if (after.false_negative_vote_deficit < before.false_negative_vote_deficit)
+                        d_budgets[budget_index].stop_reason = "deficit-helpful";
+                else
+                        d_budgets[budget_index].stop_reason = "local-only";
+        }
+
+        d_commit_options = oracle_options;
+        if (d_audit[d_route].before_dist >= 16 &&
+            d_audit[d_route].before_def >= 16 &&
+            d_audit[d_route].before_excess >= 16) {
+                d_commit_options.max_flips = 64;
+                d_commit_budget_class = D_BUDGET_CLASS_MIXED_TARGET;
+                d_commit_budget_label = "mixed-target";
+        } else if (d_audit[d_route].before_excess > d_audit[d_route].before_def) {
+                d_commit_options.max_flips = 16;
+                d_commit_budget_class = D_BUDGET_CLASS_ZERO_SIDE;
+                d_commit_budget_label = "zero-side";
+        } else {
+                d_commit_budget_class = D_BUDGET_CLASS_POSITIVE;
+                d_commit_budget_label = "positive";
+        }
+        d_commit_budget = d_commit_options.max_flips;
+
+        itty_bit_string_free (route_keys[d_route]);
+        route_keys[d_route] = itty_bit_string_clone (probe_d);
+        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node (decoder_model, input_d, target_d, d_route, &d_commit_options, &stats_d));
+
+        {
+                char const *labels[4] = { "A", "B", "C", "D" };
+                itty_bit_string_list_t *inputs[4] = { input_a, input_b, input_c, input_d };
+                itty_bit_string_t *targets[4] = { target_a, target_b, target_c, target_d };
+                itty_bit_string_t *probes[4] = { probe_a, probe_b, probe_c, probe_d };
+                size_t routes[4] = { a_route, b_route, c_route, d_route };
+                itty_feed_model_train_stats_t *chain_stats[4] = { &chain_a, &chain_b, &chain_c, &chain_d };
+                char const *committed_budget_labels[4] = { "positive", "positive", "positive", d_commit_budget_label };
+                size_t committed_budgets[4] = { oracle_options.max_flips, oracle_options.max_flips, oracle_options.max_flips, d_commit_budget };
+
+                for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                    inputs[owner_index],
+                                                                                    targets[owner_index],
+                                                                                    routes[owner_index],
+                                                                                    &committed_objectives[owner_index]));
+                }
+
+                for (size_t replay_index = 0; replay_index < 4; replay_index++) {
+                        itty_feed_model_layer_state_snapshot_t *snapshot;
+                        itty_feed_model_train_options_t replay_options = oracle_options;
+                        itty_feed_model_final_repair_mode_summary_t replay_mode_summary = { 0 };
+                        itty_feed_model_decoder_objective_t after_objectives[4] = { 0 };
+                        char const *budget_class = committed_budget_labels[replay_index];
+
+                        replay_options.max_flips = committed_budgets[replay_index];
+
+                        snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                        assert (snapshot);
+                        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                    inputs[replay_index],
+                                                                                                    targets[replay_index],
+                                                                                                    routes[replay_index],
+                                                                                                    &replay_options,
+                                                                                                    ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+                                                                                                    chain_stats[replay_index],
+                                                                                                    &replay_mode_summary));
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            inputs[owner_index],
+                                                                                            targets[owner_index],
+                                                                                            routes[owner_index],
+                                                                                            &after_objectives[owner_index]));
+                        }
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                if (!route_objective_not_worse_than_committed (&after_objectives[owner_index],
+                                                                              &committed_objectives[owner_index])) {
+                                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                                        memset (chain_stats[replay_index], 0, sizeof *chain_stats[replay_index]);
+                                        memset (&replay_mode_summary, 0, sizeof replay_mode_summary);
+                                        memcpy (after_objectives, committed_objectives, sizeof committed_objectives);
+                                        break;
+                                }
+                        }
+                        replay_steps[replay_index].label = labels[replay_index];
+                        replay_steps[replay_index].budget_class = budget_class;
+                        replay_steps[replay_index].budget = replay_options.max_flips;
+                        replay_steps[replay_index].replay_flips = chain_stats[replay_index]->flips;
+                        replay_steps[replay_index].selector = measure_route_key_selection_for_probe (route_keys,
+                                                                                                      nodes,
+                                                                                                      probes[replay_index]);
+                        replay_steps[replay_index].objective = after_objectives[replay_index];
+                        replay_steps[replay_index].positive_repairs =
+                                replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY ?
+                                replay_mode_summary.accepted_candidates : 0;
+                        replay_steps[replay_index].zero_repairs =
+                                replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY ?
+                                replay_mode_summary.accepted_candidates : 0;
+                        replay_steps[replay_index].mixed_repairs =
+                                replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ?
+                                replay_mode_summary.accepted_candidates : 0;
+                        replay_steps[replay_index].uncategorized_repairs =
+                                replay_mode_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY &&
+                                replay_mode_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY &&
+                                replay_mode_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ?
+                                replay_mode_summary.accepted_candidates : 0;
+                        memcpy (committed_objectives, after_objectives, sizeof committed_objectives);
+                }
+        }
+
+        for (size_t improvement_index = 0; improvement_index < sizeof (d_improvements) / sizeof (d_improvements[0]); improvement_index++) {
+                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                itty_feed_model_train_stats_t first_stats = { 0 };
+                itty_feed_model_train_stats_t second_stats = { 0 };
+                itty_feed_model_train_stats_t third_stats = { 0 };
+                itty_feed_model_final_repair_mode_summary_t first_summary = { 0 };
+                itty_feed_model_final_repair_mode_summary_t second_summary = { 0 };
+                itty_feed_model_final_repair_mode_summary_t third_summary = { 0 };
+                itty_feed_model_train_options_t first_options = oracle_options;
+                itty_feed_model_train_options_t second_options = oracle_options;
+                itty_feed_model_train_options_t third_options = oracle_options;
+                itty_feed_model_decoder_objective_t candidate_objectives[4] = { 0 };
+                bool accepted = true;
+
+                assert (snapshot);
+                switch (improvement_index) {
+                case 0:
+                        first_options.max_flips = 64;
+                        d_improvements[improvement_index].first_budget = 64;
+                        d_improvements[improvement_index].first_class = "mixed-target";
+                        break;
+                case 1:
+                        first_options.max_flips = 128;
+                        d_improvements[improvement_index].first_budget = 128;
+                        d_improvements[improvement_index].first_class = "mixed-target";
+                        break;
+                case 2:
+                        first_options.max_flips = 64;
+                        second_options.max_flips = 16;
+                        d_improvements[improvement_index].first_budget = 64;
+                        d_improvements[improvement_index].first_class = "mixed-target";
+                        d_improvements[improvement_index].second_budget = 16;
+                        d_improvements[improvement_index].second_class = "zero-side";
+                        break;
+                case 3:
+                        first_options.max_flips = 8;
+                        second_options.max_flips = 64;
+                        d_improvements[improvement_index].first_budget = 8;
+                        d_improvements[improvement_index].first_class = "positive";
+                        d_improvements[improvement_index].second_budget = 64;
+                        d_improvements[improvement_index].second_class = "mixed-target";
+                        break;
+                case 4:
+                        first_options.max_flips = 64;
+                        second_options.max_flips = 8;
+                        d_improvements[improvement_index].first_budget = 64;
+                        d_improvements[improvement_index].first_class = "mixed-target";
+                        d_improvements[improvement_index].second_budget = 8;
+                        d_improvements[improvement_index].second_class = "positive";
+                        break;
+                case 5:
+                        first_options.max_flips = 64;
+                        second_options.max_flips = 16;
+                        d_improvements[improvement_index].first_budget = 64;
+                        d_improvements[improvement_index].first_class = "mixed-target";
+                        d_improvements[improvement_index].second_budget = 16;
+                        d_improvements[improvement_index].second_class = "zero-side-selected-objective";
+                        break;
+                }
+
+                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                            input_d,
+                                                                                            target_d,
+                                                                                            d_route,
+                                                                                            &first_options,
+                                                                                            improvement_index == 3 ? ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY :
+                                                                                                                     ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+                                                                                            &first_stats,
+                                                                                            &first_summary));
+                if (improvement_index == 2 || improvement_index == 3 || improvement_index == 4 || improvement_index == 5) {
+                        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                    input_d,
+                                                                                                    target_d,
+                                                                                                    d_route,
+                                                                                                    &second_options,
+                                                                                                    improvement_index == 2 ? ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY :
+                                                                                                                             improvement_index == 5 ? ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY :
+                                                                                                                             improvement_index == 3 ? ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED :
+                                                                                                                                                      ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY,
+                                                                                                    &second_stats,
+                                                                                                    &second_summary));
+                }
+
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_a, target_a, a_route, &candidate_objectives[0]));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_b, target_b, b_route, &candidate_objectives[1]));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_c, target_c, c_route, &candidate_objectives[2]));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_d, target_d, d_route, &candidate_objectives[3]));
+
+                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                        if (!route_objective_not_worse_than_committed (&candidate_objectives[owner_index],
+                                                                      &committed_objectives[owner_index])) {
+                                accepted = false;
+                                break;
+                        }
+                }
+                if (improvement_index == 5) {
+                        if (!route_objective_not_worse_than_committed (&candidate_objectives[3], &d_improvements[0].objective))
+                                accepted = false;
+                        if (!route_objective_improves_excess_cleanup_baseline (&candidate_objectives[3], &d_improvements[0].objective))
+                                accepted = false;
+                } else if (!route_objective_improves_on_committed (&candidate_objectives[3], &committed_objectives[3]))
+                        accepted = false;
+
+                d_improvements[improvement_index].accepted = accepted;
+                d_improvements[improvement_index].replay_flips = first_stats.flips + second_stats.flips + third_stats.flips;
+                d_improvements[improvement_index].objective = candidate_objectives[3];
+                d_improvements[improvement_index].selector = measure_route_key_selection_for_probe (route_keys, nodes, probe_d);
+                if (d_improvements[improvement_index].selector.selected_route != d_route ||
+                    d_improvements[improvement_index].selector.selected_gap < 1)
+                        d_improvements[improvement_index].accepted = false;
+                d_improvements[improvement_index].positive_repairs =
+                        (first_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY ? first_summary.accepted_candidates : 0) +
+                        (second_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY ? second_summary.accepted_candidates : 0) +
+                        (third_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY ? third_summary.accepted_candidates : 0);
+                d_improvements[improvement_index].zero_repairs =
+                        (first_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY ? first_summary.accepted_candidates : 0) +
+                        (second_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY ? second_summary.accepted_candidates : 0) +
+                        (third_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY ? third_summary.accepted_candidates : 0);
+                d_improvements[improvement_index].mixed_repairs =
+                        (first_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ? first_summary.accepted_candidates : 0) +
+                        (second_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ? second_summary.accepted_candidates : 0) +
+                        (third_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ? third_summary.accepted_candidates : 0);
+                d_improvements[improvement_index].uncategorized_repairs =
+                        (first_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY &&
+                         first_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY &&
+                         first_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ? first_summary.accepted_candidates : 0) +
+                        (second_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY &&
+                         second_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY &&
+                         second_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ? second_summary.accepted_candidates : 0) +
+                        (third_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY &&
+                         third_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY &&
+                         third_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ? third_summary.accepted_candidates : 0);
+
+                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+        }
+
+        {
+                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                itty_feed_model_train_options_t excess_options = oracle_options;
+                itty_bit_string_list_t *owner_inputs[3] = { input_a, input_b, input_c };
+                itty_bit_string_t *owner_targets[3] = { target_a, target_b, target_c };
+                assert (snapshot);
+                excess_options.max_flips = d_excess_budget;
+                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                            input_d,
+                                                                                            target_d,
+                                                                                            d_route,
+                                                                                            &excess_options,
+                                                                                            ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+                                                                                            &d_excess_prepare_stats,
+                                                                                            &d_excess_prepare_summary));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_d,
+                                                                            target_d,
+                                                                            d_route,
+                                                                            &d_excess_objective));
+                assert (d_excess_objective.selected_distance == d_improvements[0].objective.selected_distance);
+                assert (d_excess_objective.false_negative_vote_deficit == d_improvements[0].objective.false_negative_vote_deficit);
+                assert (d_excess_objective.false_positive_vote_excess == d_improvements[0].objective.false_positive_vote_excess);
+
+                assert (itty_feed_model_measure_final_layer_restore_failure (decoder_model,
+                                                                             input_d,
+                                                                             target_d,
+                                                                             input_a,
+                                                                             target_a,
+                                                                             &excess_options,
+                                                                             0,
+                                                                             false,
+                                                                             &d_excess_free));
+                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                        assert (itty_feed_model_measure_final_layer_restore_failure (decoder_model,
+                                                                                     input_d,
+                                                                                     target_d,
+                                                                                     owner_inputs[owner_index],
+                                                                                     owner_targets[owner_index],
+                                                                                     &excess_options,
+                                                                                     0,
+                                                                                     true,
+                                                                                     &d_excess_owner[owner_index]));
+                }
+
+                for (size_t trace_index = 0;
+                     trace_index < d_excess_free.trace_count && d_excess_row_count < ITTY_FEED_MODEL_RESTORE_TRACE_LIMIT;
+                     trace_index++) {
+                        itty_feed_model_restore_failure_trace_t const *free_trace = &d_excess_free.traces[trace_index];
+                        d_excess_audit_row_t *row = &d_excess_rows[d_excess_row_count++];
+
+                        row->measured = true;
+                        row->decoded_bit = free_trace->decoded_bit;
+                        row->intended_node_before = free_trace->final_selected_node_before;
+                        row->selected_node_after = free_trace->final_selected_node_after;
+                        row->current_ones = free_trace->current_ones;
+                        row->threshold = free_trace->threshold;
+                        row->max_zero = free_trace->max_ones_for_zero;
+                        row->excess = free_trace->excess;
+                        row->clearable_final_segment_votes = free_trace->clearable_segment_votes;
+                        row->candidate_negative_quota_repairs = free_trace->direct_candidate_changed ? 1 : 0;
+                        row->mask_flips = free_trace->candidate_mask_flips;
+                        row->actual_cleared_votes = count_cleared_votes_for_decoded_bit (&d_excess_free,
+                                                                                         free_trace->decoded_bit);
+                        row->intended_node_distance_after = free_trace->forced_node_distance_after;
+                        row->intended_node_deficit_after = free_trace->forced_node_false_negative_deficit_after;
+                        row->intended_node_excess_after = free_trace->forced_node_false_positive_excess_after;
+                        row->selected_node_distance_after = free_trace->selected_node_distance_after;
+                        row->selected_node_deficit_after = free_trace->selected_node_false_negative_deficit_after;
+                        row->selected_node_excess_after = free_trace->selected_node_false_positive_excess_after;
+                        row->distance_delta =
+                                (ptrdiff_t) free_trace->forced_node_distance_after -
+                                (ptrdiff_t) free_trace->forced_node_distance_before;
+                        row->excess_delta =
+                                (ptrdiff_t) free_trace->forced_node_false_positive_excess_after -
+                                (ptrdiff_t) free_trace->forced_node_false_positive_excess_before;
+                        row->free_reason = restore_rejection_reason_to_string (free_trace->rejection_reason);
+                        row->propagation = restore_propagation_failure_to_string (free_trace->propagation_failure);
+
+                        for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                itty_feed_model_restore_failure_trace_t const *owner_trace =
+                                        find_restore_trace_for_decoded_bit (&d_excess_owner[owner_index],
+                                                                            free_trace->decoded_bit);
+                                if (!owner_trace) {
+                                        row->owner_accepted[owner_index] = false;
+                                        row->owner_reason[owner_index] = "missing";
+                                        row->replay_owner_rejections++;
+                                        continue;
+                                }
+
+                                row->owner_accepted[owner_index] = owner_trace->accepted;
+                                row->owner_reason[owner_index] =
+                                        restore_rejection_reason_to_string (owner_trace->rejection_reason);
+                                row->owner_distance_after[owner_index] = owner_trace->replay_example_distance_after;
+                                row->owner_deficit_after[owner_index] = owner_trace->replay_example_false_negative_deficit_after;
+                                row->owner_excess_after[owner_index] = owner_trace->replay_example_false_positive_excess_after;
+                                if (!owner_trace->accepted)
+                                        row->replay_owner_rejections++;
+                        }
+
+                        row->classification =
+                                classify_excess_audit_trace (free_trace, row->replay_owner_rejections);
+
+                        row->parity_baseline_guard = true;
+                        for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                itty_feed_model_decoder_objective_t owner_after = {
+                                        .selected_distance = row->owner_distance_after[owner_index],
+                                        .false_negative_vote_deficit = row->owner_deficit_after[owner_index],
+                                        .false_positive_vote_excess = row->owner_excess_after[owner_index]
+                                };
+                                if (!route_objective_not_worse_than_committed (&owner_after,
+                                                                              &committed_objectives[owner_index])) {
+                                        row->parity_baseline_guard = false;
+                                        break;
+                                }
+                        }
+                        if (measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route)
+                                row->parity_reason = "route-key-switch";
+                        else if (!row->parity_baseline_guard)
+                                row->parity_reason = "owner-baseline-guard";
+                        else if (row->selected_node_distance_after < d_excess_objective.selected_distance ||
+                                 (row->selected_node_distance_after == d_excess_objective.selected_distance &&
+                                  row->selected_node_excess_after < d_excess_objective.false_positive_vote_excess))
+                                row->parity_reason = "selected-objective-accept";
+                        else
+                                row->parity_reason = "selected-objective-reject";
+
+                        row->selected_objective_not_worse =
+                                row->selected_node_distance_after <= d_excess_objective.selected_distance &&
+                                row->selected_node_deficit_after <= d_excess_objective.false_negative_vote_deficit &&
+                                row->selected_node_excess_after <= d_excess_objective.false_positive_vote_excess;
+                        row->selected_objective_improves =
+                                route_objective_improves_excess_cleanup_baseline (
+                                        &(itty_feed_model_decoder_objective_t) {
+                                                .selected_distance = row->selected_node_distance_after,
+                                                .false_negative_vote_deficit = row->selected_node_deficit_after,
+                                                .false_positive_vote_excess = row->selected_node_excess_after,
+                                                .target_zero_safety = 0
+                                        },
+                                        &d_excess_objective);
+                        row->direct_selected_node_improvement =
+                                row->selected_node_after == row->intended_node_before &&
+                                row->selected_objective_improves &&
+                                row->parity_baseline_guard;
+
+                        if (row->selected_objective_not_worse)
+                                d_internal_search.selected_objective_not_worse++;
+                        if (row->selected_objective_improves)
+                                d_internal_search.selected_objective_improves++;
+                        if (row->direct_selected_node_improvement)
+                                d_internal_search.direct_selected_node_improvements++;
+                        if (row->selected_node_after != row->intended_node_before) {
+                                if (row->selected_objective_improves && row->parity_baseline_guard) {
+                                        row->selected_switch_class = "helpful";
+                                        d_internal_search.internal_switch_helpful++;
+                                } else if (row->selected_objective_not_worse && row->parity_baseline_guard) {
+                                        row->selected_switch_class = "neutral";
+                                        d_internal_search.internal_switch_neutral++;
+                                } else {
+                                        row->selected_switch_class = "harmful";
+                                        d_internal_search.internal_switch_harmful++;
+                                }
+                        } else if (row->direct_selected_node_improvement) {
+                                row->selected_switch_class = "direct-selected-node-improvement";
+                        } else {
+                                row->selected_switch_class = "direct-selected-node-no-improvement";
+                        }
+
+                        d_conflict.route_id = d_route;
+                        d_conflict.entries++;
+                        if (row->distance_delta < 0 || row->excess_delta < 0)
+                                d_conflict.local_intended_helpful++;
+                        if (row->selected_objective_improves && row->parity_baseline_guard) {
+                                d_conflict.selected_objective_helpful++;
+                                d_conflict.accepted_count++;
+                                d_conflict.pressure_score += 2;
+                        } else {
+                                d_conflict.rejected_count++;
+                                d_conflict.pressure_score -= 1;
+                        }
+                        if (!row->selected_objective_not_worse || !row->parity_baseline_guard)
+                                d_conflict.selected_objective_harmful++;
+                        if (row->replay_owner_rejections > 0)
+                                d_conflict.replay_conflicting++;
+                        if (row->selected_node_after != row->intended_node_before &&
+                            (!row->selected_objective_not_worse || !row->parity_baseline_guard))
+                                d_conflict.internal_switch_harmful++;
+
+                        d_internal.route_id = d_route;
+                        d_internal.committed_internal_node = free_trace->final_selected_node_before;
+                        d_internal.current_internal_node = free_trace->final_selected_node_after;
+                        if (row->selected_node_after != row->intended_node_before)
+                                d_internal.switch_count++;
+                        if (measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route)
+                                d_internal.zero_route_key_switch++;
+                        if (row->replay_owner_rejections > 0)
+                                d_internal.zero_replay_rejected++;
+                        if (row->actual_cleared_votes > 0 &&
+                            row->distance_delta < 0 &&
+                            row->replay_owner_rejections == 0 &&
+                            row->selected_node_after == row->intended_node_before)
+                                d_internal.zero_direct_clear_helpful++;
+                        if (row->selected_node_after != row->intended_node_before) {
+                                if (row->distance_delta < 0 && row->replay_owner_rejections == 0)
+                                        d_internal.zero_internal_switch_helpful++;
+                                else if (row->distance_delta > 0 || row->excess_delta > 0)
+                                        d_internal.zero_internal_switch_harmful++;
+                                else
+                                        d_internal.zero_internal_switch_neutral++;
+                        }
+
+                }
+
+                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+        }
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_a, target_a, a_route, &rows[0].objective));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_b, target_b, b_route, &rows[1].objective));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_c, target_c, c_route, &rows[2].objective));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_d, target_d, d_route, &rows[3].objective));
+
+        rows[0].label = "A";
+        rows[0].assigned_route = a_route;
+        rows[0].selector = measure_route_key_selection_for_probe (route_keys, nodes, probe_a);
+        rows[0].training_flips = stats_a.flips;
+        rows[0].replay_flips = replay_steps[0].replay_flips;
+        rows[0].newly_allocated = true;
+        rows[0].committed_budget_class = "positive";
+        rows[0].committed_budget = oracle_options.max_flips;
+        rows[0].committed_baseline = committed_objectives[0];
+        rows[1].label = "B";
+        rows[1].assigned_route = b_route;
+        rows[1].selector = measure_route_key_selection_for_probe (route_keys, nodes, probe_b);
+        rows[1].training_flips = stats_b.flips;
+        rows[1].replay_flips = replay_steps[1].replay_flips;
+        rows[1].newly_allocated = true;
+        rows[1].committed_budget_class = "positive";
+        rows[1].committed_budget = oracle_options.max_flips;
+        rows[1].committed_baseline = committed_objectives[1];
+        rows[2].label = "C";
+        rows[2].assigned_route = c_route;
+        rows[2].selector = measure_route_key_selection_for_probe (route_keys, nodes, probe_c);
+        rows[2].replay_flips = replay_steps[2].replay_flips;
+        rows[2].committed_budget_class = "positive";
+        rows[2].committed_budget = oracle_options.max_flips;
+        rows[2].committed_baseline = committed_objectives[2];
+        rows[3].label = "D";
+        rows[3].assigned_route = d_route;
+        rows[3].selector = measure_route_key_selection_for_probe (route_keys, nodes, probe_d);
+        rows[3].replay_flips = replay_steps[3].replay_flips;
+        rows[3].committed_budget_class = d_commit_budget_label;
+        rows[3].committed_budget = d_commit_budget;
+        rows[3].committed_baseline = committed_objectives[3];
+
+        for (size_t i = 0; i < 4; i++) {
+                assert (rows[i].selector.selected_route == rows[i].assigned_route);
+                assert (rows[i].selector.selected_gap >= 1);
+        }
+        assert (rows[0].objective.selected_distance == 0);
+        assert (rows[2].objective.selected_distance == 0);
+        assert (rows[1].objective.selected_distance <= rows[1].committed_baseline.selected_distance);
+        assert (route_objective_not_worse_than_committed (&rows[3].objective, &rows[3].committed_baseline));
+        assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                input_d,
+                                                                target_d,
+                                                                &d_profile_committed_selection));
+        assert (itty_feed_model_measure_segment_vote_profile_for_node (decoder_model,
+                                                                       input_d,
+                                                                       target_d,
+                                                                       d_profile_committed_selection.selected_by_popcount,
+                                                                       &d_profile_committed));
+
+        {
+                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                itty_feed_model_train_options_t profile_options = oracle_options;
+                itty_feed_model_train_stats_t profile_stats = { 0 };
+                itty_feed_model_final_repair_mode_summary_t profile_summary = { 0 };
+
+                assert (snapshot);
+                profile_options.max_flips = 64;
+                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                            input_d,
+                                                                                            target_d,
+                                                                                            d_route,
+                                                                                            &profile_options,
+                                                                                            ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+                                                                                            &profile_stats,
+                                                                                            &profile_summary));
+                assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                        input_d,
+                                                                        target_d,
+                                                                        &d_profile_improved_selection));
+                assert (itty_feed_model_measure_segment_vote_profile_for_node (decoder_model,
+                                                                               input_d,
+                                                                               target_d,
+                                                                               d_profile_improved_selection.selected_by_popcount,
+                                                                               &d_profile_improved));
+
+                for (size_t family_index = 0; family_index < sizeof (d_families) / sizeof (d_families[0]); family_index++) {
+                        itty_feed_model_layer_state_snapshot_t *family_snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                        itty_feed_model_train_options_t family_first = oracle_options;
+                        itty_feed_model_train_options_t family_second = oracle_options;
+                        itty_feed_model_train_stats_t family_first_stats = { 0 };
+                        itty_feed_model_train_stats_t family_second_stats = { 0 };
+                        itty_feed_model_final_repair_mode_summary_t family_first_summary = { 0 };
+                        itty_feed_model_final_repair_mode_summary_t family_second_summary = { 0 };
+                        itty_feed_model_segment_node_selection_summary_t family_selection = { 0 };
+                        itty_feed_model_decoder_objective_t family_selected_objective = { 0 };
+                        itty_feed_model_decoder_objective_t family_owner_objectives[4] = { 0 };
+                        size_t target_node = d_route;
+                        bool selected_safe = true;
+                        bool improves_distance = false;
+                        bool improves_excess = false;
+
+                        assert (family_snapshot);
+                        switch (family_index) {
+                        case 0:
+                                target_node = d_route;
+                                family_first.max_flips = 16;
+                                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                            input_d,
+                                                                                                            target_d,
+                                                                                                            target_node,
+                                                                                                            &family_first,
+                                                                                                            ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY,
+                                                                                                            &family_first_stats,
+                                                                                                            &family_first_summary));
+                                d_families[family_index].candidate_count = family_first_summary.candidate_count;
+                                break;
+                        case 1:
+                                target_node = d_internal.current_internal_node;
+                                family_first.max_flips = 16;
+                                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                            input_d,
+                                                                                                            target_d,
+                                                                                                            target_node,
+                                                                                                            &family_first,
+                                                                                                            ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY,
+                                                                                                            &family_first_stats,
+                                                                                                            &family_first_summary));
+                                d_families[family_index].candidate_count = family_first_summary.candidate_count;
+                                break;
+                        case 2:
+                                target_node = d_route;
+                                family_first.max_flips = 16;
+                                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                            input_d,
+                                                                                                            target_d,
+                                                                                                            target_node,
+                                                                                                            &family_first,
+                                                                                                            ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY,
+                                                                                                            &family_first_stats,
+                                                                                                            &family_first_summary));
+                                d_families[family_index].candidate_count = family_first_summary.candidate_count;
+                                break;
+                        case 3:
+                                target_node = d_route;
+                                family_first.max_flips = 16;
+                                family_second.max_flips = 8;
+                                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                            input_d,
+                                                                                                            target_d,
+                                                                                                            target_node,
+                                                                                                            &family_first,
+                                                                                                            ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY,
+                                                                                                            &family_first_stats,
+                                                                                                            &family_first_summary));
+                                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                            input_d,
+                                                                                                            target_d,
+                                                                                                            d_internal.current_internal_node,
+                                                                                                            &family_second,
+                                                                                                            ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+                                                                                                            &family_second_stats,
+                                                                                                            &family_second_summary));
+                                d_families[family_index].candidate_count =
+                                        family_first_summary.candidate_count + family_second_summary.candidate_count;
+                                break;
+                        }
+
+                        assert (measure_selected_node_objective (decoder_model,
+                                                                input_d,
+                                                                target_d,
+                                                                &family_selection,
+                                                                &family_selected_objective));
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            owner_index == 0 ? input_a :
+                                                                                            owner_index == 1 ? input_b :
+                                                                                            owner_index == 2 ? input_c :
+                                                                                                               input_d,
+                                                                                            owner_index == 0 ? target_a :
+                                                                                            owner_index == 1 ? target_b :
+                                                                                            owner_index == 2 ? target_c :
+                                                                                                               target_d,
+                                                                                            owner_index == 0 ? a_route :
+                                                                                            owner_index == 1 ? b_route :
+                                                                                            owner_index == 2 ? c_route :
+                                                                                                               d_route,
+                                                                                            &family_owner_objectives[owner_index]));
+                        }
+                        for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                if (!route_objective_not_worse_than_committed (&family_owner_objectives[owner_index],
+                                                                              &committed_objectives[owner_index])) {
+                                        selected_safe = false;
+                                        break;
+                                }
+                        }
+                        if (measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route)
+                                selected_safe = false;
+                        if (!route_objective_not_worse_than_committed (&family_selected_objective,
+                                                                      &d_improvements[0].objective))
+                                selected_safe = false;
+                        if (family_index == 2 && family_selection.selected_by_popcount != d_route)
+                                selected_safe = false;
+
+                        improves_distance =
+                                family_selected_objective.selected_distance < d_improvements[0].objective.selected_distance;
+                        improves_excess =
+                                family_selected_objective.selected_distance == d_improvements[0].objective.selected_distance &&
+                                family_selected_objective.false_positive_vote_excess < d_improvements[0].objective.false_positive_vote_excess;
+
+                        d_families[family_index].target_node = target_node;
+                        d_families[family_index].selected_safe = selected_safe ? 1 : 0;
+                        d_families[family_index].improves_distance = improves_distance ? 1 : 0;
+                        d_families[family_index].improves_excess = improves_excess ? 1 : 0;
+                        d_families[family_index].selected_node_after = family_selection.selected_by_popcount;
+                        d_families[family_index].selected_gap_after = family_selection.popcount_gap;
+                        d_families[family_index].selected_objective_after = family_selected_objective;
+
+                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, family_snapshot);
+                }
+                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+        }
+
+        {
+                block_step_specs[0] = (d_block_step_spec_t) { .label = "route-balanced-8", .target_node = d_route, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, .max_flips = 8 };
+                block_step_specs[1] = (d_block_step_spec_t) { .label = "route-balanced-16", .target_node = d_route, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, .max_flips = 16 };
+                block_step_specs[2] = (d_block_step_spec_t) { .label = "route-positive-8", .target_node = d_route, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY, .max_flips = 8 };
+                block_step_specs[3] = (d_block_step_spec_t) { .label = "selected-zero-16", .target_node = d_profile_improved_selection.selected_by_popcount, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY, .max_flips = 16 };
+                block_step_specs[4] = (d_block_step_spec_t) { .label = "selected-balanced-16", .target_node = d_profile_improved_selection.selected_by_popcount, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, .max_flips = 16 };
+                block_step_specs[5] = (d_block_step_spec_t) { .label = "contender-zero-16", .target_node = d_internal.current_internal_node, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY, .max_flips = 16 };
+                block_step_specs[6] = (d_block_step_spec_t) { .label = "contender-balanced-16", .target_node = d_internal.current_internal_node, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, .max_flips = 16 };
+
+                for (size_t first_index = 0; first_index < sizeof (block_step_specs) / sizeof (block_step_specs[0]); first_index++) {
+                        for (size_t second_index = 0;
+                             second_index <= sizeof (block_step_specs) / sizeof (block_step_specs[0]);
+                             second_index++) {
+                                for (size_t third_index = 0;
+                                     third_index <= sizeof (block_step_specs) / sizeof (block_step_specs[0]);
+                                     third_index++) {
+                                itty_feed_model_layer_state_snapshot_t *snapshot;
+                                route_key_probe_summary_t block_route_key;
+                                itty_feed_model_segment_node_selection_summary_t block_selection = { 0 };
+                                itty_feed_model_decoder_objective_t block_selected_objective = { 0 };
+                                itty_feed_model_decoder_objective_t block_owner_objectives[3] = { 0 };
+                                bool selected_safe = true;
+                                bool improves = false;
+                                size_t total_flips = 0;
+                                size_t step_indices[3] = { first_index, second_index, third_index };
+                                size_t step_count = 1;
+                                char label[128];
+
+                                snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                assert (snapshot);
+                                snprintf (label, sizeof label, "%s", block_step_specs[first_index].label);
+                                if (second_index < sizeof (block_step_specs) / sizeof (block_step_specs[0])) {
+                                        step_count = 2;
+                                        snprintf (label + strlen (label),
+                                                  sizeof label - strlen (label),
+                                                  " -> %s",
+                                                  block_step_specs[second_index].label);
+                                }
+                                if (third_index < sizeof (block_step_specs) / sizeof (block_step_specs[0])) {
+                                        if (step_count == 1) {
+                                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                                                continue;
+                                        }
+                                        step_count = 3;
+                                        snprintf (label + strlen (label),
+                                                  sizeof label - strlen (label),
+                                                  " -> %s",
+                                                  block_step_specs[third_index].label);
+                                }
+
+                                for (size_t step_index = 0; step_index < step_count; step_index++) {
+                                        d_block_step_spec_t const *step = &block_step_specs[step_indices[step_index]];
+                                        itty_feed_model_train_options_t block_options = oracle_options;
+                                        itty_feed_model_train_stats_t block_stats = { 0 };
+                                        itty_feed_model_final_repair_mode_summary_t block_summary = { 0 };
+
+                                        block_options.max_flips = step->max_flips;
+                                        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                                    input_d,
+                                                                                                                    target_d,
+                                                                                                                    step->target_node,
+                                                                                                                    &block_options,
+                                                                                                                    step->mode,
+                                                                                                                    &block_stats,
+                                                                                                                    &block_summary));
+                                        total_flips += block_stats.flips;
+                                }
+
+                                assert (measure_selected_node_objective (decoder_model,
+                                                                        input_d,
+                                                                        target_d,
+                                                                        &block_selection,
+                                                                        &block_selected_objective));
+                                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                    owner_index == 0 ? input_a :
+                                                                                                    owner_index == 1 ? input_b :
+                                                                                                                       input_c,
+                                                                                                    owner_index == 0 ? target_a :
+                                                                                                    owner_index == 1 ? target_b :
+                                                                                                                       target_c,
+                                                                                                    owner_index == 0 ? a_route :
+                                                                                                    owner_index == 1 ? b_route :
+                                                                                                                       c_route,
+                                                                                                    &block_owner_objectives[owner_index]));
+                                        if (!route_objective_not_worse_than_committed (&block_owner_objectives[owner_index],
+                                                                                      &committed_objectives[owner_index]))
+                                                selected_safe = false;
+                                }
+                                block_route_key = measure_route_key_selection_for_probe (route_keys, nodes, probe_d);
+                                if (block_route_key.selected_route != d_route || block_route_key.selected_gap == 0)
+                                        selected_safe = false;
+                                if (!route_objective_not_worse_than_committed (&block_selected_objective,
+                                                                              &d_improvements[0].objective))
+                                        selected_safe = false;
+
+                                improves = selected_safe &&
+                                           route_objective_improves_on_committed (&block_selected_objective,
+                                                                                 &d_improvements[0].objective);
+
+                                d_block_search.blocks_tested++;
+                                if (selected_safe) {
+                                        d_block_search.selected_safe_blocks++;
+                                }
+                                        if (selected_safe && improves) {
+                                                d_block_search.improving_blocks++;
+                                                if (!d_block_search.best_found ||
+                                                    route_objective_improves_on_committed (&block_selected_objective,
+                                                                                  &d_block_search.best_objective)) {
+                                                        d_block_search.best_found = true;
+                                                        memcpy (d_block_search.best_step_indices,
+                                                                step_indices,
+                                                                sizeof d_block_search.best_step_indices);
+                                                        d_block_search.best_step_count = step_count;
+                                                        d_block_search.best_selected_node = block_selection.selected_by_popcount;
+                                                        d_block_search.best_selected_gap = block_selection.popcount_gap;
+                                                        d_block_search.best_total_flips = total_flips;
+                                                        d_block_search.best_objective = block_selected_objective;
+                                                        snprintf (d_block_search.best_label,
+                                                          sizeof d_block_search.best_label,
+                                                          "%s",
+                                                          label);
+                                        }
+                                }
+
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                        }
+                        }
+                }
+        }
+
+        if (d_block_search.best_found) {
+                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                replay_step_summary_t old_replay_steps[4];
+                itty_feed_model_decoder_objective_t promoted_objectives[4] = { 0 };
+                itty_feed_model_decoder_objective_t old_committed_objectives[4];
+                itty_feed_model_decoder_objective_t final_objectives[4] = { 0 };
+                char const *old_commit_budget_label = d_commit_budget_label;
+                size_t old_commit_budget = d_commit_budget;
+                bool old_commit_uses_block = d_commit_uses_block;
+                bool old_commit_uses_trace_block = d_commit_uses_trace_block;
+                size_t old_commit_block_step_indices[3] = {
+                        d_commit_block_step_indices[0],
+                        d_commit_block_step_indices[1],
+                        d_commit_block_step_indices[2]
+                };
+                size_t old_commit_block_step_count = d_commit_block_step_count;
+                itty_feed_model_mask_flip_trace_t old_commit_trace_block[16] = { 0 };
+                size_t old_commit_trace_block_count = d_commit_trace_block_count;
+                bool selected_safe = true;
+                bool final_stable = true;
+
+                assert (snapshot);
+                memcpy (old_committed_objectives, committed_objectives, sizeof committed_objectives);
+                memcpy (old_replay_steps, replay_steps, sizeof replay_steps);
+                memcpy (old_commit_trace_block, d_commit_trace_block, sizeof old_commit_trace_block);
+                for (size_t step_index = 0; step_index < d_block_search.best_step_count; step_index++) {
+                        size_t spec_index = d_block_search.best_step_indices[step_index];
+                        itty_feed_model_train_options_t step_options = oracle_options;
+                        itty_feed_model_train_stats_t step_stats = { 0 };
+                        itty_feed_model_final_repair_mode_summary_t step_summary = { 0 };
+                        d_block_step_spec_t const *step = &block_step_specs[spec_index];
+
+                        step_options.max_flips = step->max_flips;
+                        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                    input_d,
+                                                                                                    target_d,
+                                                                                                    step->target_node,
+                                                                                                    &step_options,
+                                                                                                    step->mode,
+                                                                                                    &step_stats,
+                                                                                                    &step_summary));
+                }
+                for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                    owner_index == 0 ? input_a :
+                                                                                    owner_index == 1 ? input_b :
+                                                                                    owner_index == 2 ? input_c :
+                                                                                                       input_d,
+                                                                                    owner_index == 0 ? target_a :
+                                                                                    owner_index == 1 ? target_b :
+                                                                                    owner_index == 2 ? target_c :
+                                                                                                       target_d,
+                                                                                    owner_index == 0 ? a_route :
+                                                                                    owner_index == 1 ? b_route :
+                                                                                    owner_index == 2 ? c_route :
+                                                                                                       d_route,
+                                                                                    &promoted_objectives[owner_index]));
+                        if (!route_objective_not_worse_than_committed (&promoted_objectives[owner_index],
+                                                                      &committed_objectives[owner_index]))
+                                selected_safe = false;
+                }
+                if (measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route ||
+                    measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap == 0)
+                        selected_safe = false;
+                if (!route_objective_improves_on_committed (&promoted_objectives[3], &committed_objectives[3]))
+                        selected_safe = false;
+
+                if (!selected_safe) {
+                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                } else {
+                        memcpy (committed_objectives, promoted_objectives, sizeof committed_objectives);
+                        d_commit_uses_block = true;
+                        d_commit_uses_trace_block = false;
+                        d_commit_block_step_count = d_block_search.best_step_count;
+                        memcpy (d_commit_block_step_indices,
+                                d_block_search.best_step_indices,
+                                sizeof d_commit_block_step_indices);
+                        d_commit_budget = d_block_search.best_total_flips;
+                        d_commit_budget_label =
+                                d_block_search.best_step_count == 3 ?
+                                "three-step-route-balanced-block" :
+                                "two-step-route-balanced-block";
+
+                        {
+                                char const *labels[4] = { "A", "B", "C", "D" };
+                                itty_bit_string_list_t *inputs[4] = { input_a, input_b, input_c, input_d };
+                                itty_bit_string_t *targets[4] = { target_a, target_b, target_c, target_d };
+                                size_t routes[4] = { a_route, b_route, c_route, d_route };
+                                itty_feed_model_train_stats_t *chain_stats[4] = { &chain_a, &chain_b, &chain_c, &chain_d };
+                                char const *committed_budget_labels[4] = { "positive", "positive", "positive", d_commit_budget_label };
+                                size_t committed_budgets[4] = { oracle_options.max_flips, oracle_options.max_flips, oracle_options.max_flips, d_commit_budget };
+
+                                memset (&chain_a, 0, sizeof chain_a);
+                                memset (&chain_b, 0, sizeof chain_b);
+                                memset (&chain_c, 0, sizeof chain_c);
+                                memset (&chain_d, 0, sizeof chain_d);
+                                memset (replay_steps, 0, sizeof replay_steps);
+
+                                for (size_t replay_index = 0; replay_index < 4; replay_index++) {
+                                        itty_feed_model_layer_state_snapshot_t *replay_snapshot;
+                                        itty_feed_model_train_options_t replay_options = oracle_options;
+                                        itty_feed_model_final_repair_mode_summary_t replay_mode_summary = { 0 };
+                                        itty_feed_model_decoder_objective_t after_objectives[4] = { 0 };
+                                        char const *budget_class = committed_budget_labels[replay_index];
+
+                                        replay_options.max_flips = committed_budgets[replay_index];
+                                        replay_snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                        assert (replay_snapshot);
+                                        if (replay_index == 3 && d_commit_uses_trace_block) {
+                                                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                                             d_commit_trace_block,
+                                                                                                             d_commit_trace_block_count));
+                                                chain_stats[replay_index]->flips = d_commit_trace_block_count;
+                                        } else if (replay_index == 3 && d_commit_uses_block) {
+                                                size_t total_flips = 0;
+                                                memset (chain_stats[replay_index], 0, sizeof *chain_stats[replay_index]);
+                                                for (size_t step_index = 0; step_index < d_commit_block_step_count; step_index++) {
+                                                        size_t spec_index = d_commit_block_step_indices[step_index];
+                                                        d_block_step_spec_t const *step = &block_step_specs[spec_index];
+                                                        itty_feed_model_train_options_t step_options = oracle_options;
+                                                        itty_feed_model_train_stats_t step_stats = { 0 };
+                                                        itty_feed_model_final_repair_mode_summary_t step_summary = { 0 };
+
+                                                        step_options.max_flips = step->max_flips;
+                                                        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                                                    inputs[replay_index],
+                                                                                                                                    targets[replay_index],
+                                                                                                                                    step->target_node,
+                                                                                                                                    &step_options,
+                                                                                                                                    step->mode,
+                                                                                                                                    &step_stats,
+                                                                                                                                    &step_summary));
+                                                        total_flips += step_stats.flips;
+                                                }
+                                                chain_stats[replay_index]->flips = total_flips;
+                                        } else {
+                                                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                                            inputs[replay_index],
+                                                                                                                            targets[replay_index],
+                                                                                                                            routes[replay_index],
+                                                                                                                            &replay_options,
+                                                                                                                            ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+                                                                                                                            chain_stats[replay_index],
+                                                                                                                            &replay_mode_summary));
+                                        }
+                                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                            inputs[owner_index],
+                                                                                                            targets[owner_index],
+                                                                                                            routes[owner_index],
+                                                                                                            &after_objectives[owner_index]));
+                                        }
+                                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                                if (!route_objective_not_worse_than_committed (&after_objectives[owner_index],
+                                                                                              &committed_objectives[owner_index])) {
+                                                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, replay_snapshot);
+                                                        memset (chain_stats[replay_index], 0, sizeof *chain_stats[replay_index]);
+                                                        memcpy (after_objectives, committed_objectives, sizeof committed_objectives);
+                                                        break;
+                                                }
+                                        }
+                                        replay_steps[replay_index].label = labels[replay_index];
+                                        replay_steps[replay_index].budget_class = budget_class;
+                                        replay_steps[replay_index].budget = replay_options.max_flips;
+                                        replay_steps[replay_index].replay_flips = chain_stats[replay_index]->flips;
+                                        replay_steps[replay_index].selector = measure_route_key_selection_for_probe (route_keys,
+                                                                                                                      nodes,
+                                                                                                                      replay_index == 0 ? probe_a :
+                                                                                                                      replay_index == 1 ? probe_b :
+                                                                                                                      replay_index == 2 ? probe_c :
+                                                                                                                                         probe_d);
+                                        replay_steps[replay_index].objective = after_objectives[replay_index];
+                                        replay_steps[replay_index].positive_repairs =
+                                                replay_index == 3 && (d_commit_uses_block || d_commit_uses_trace_block) ? 0 :
+                                                (replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY ?
+                                                replay_mode_summary.accepted_candidates : 0);
+                                        replay_steps[replay_index].zero_repairs =
+                                                replay_index == 3 && (d_commit_uses_block || d_commit_uses_trace_block) ? 0 :
+                                                (replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY ?
+                                                replay_mode_summary.accepted_candidates : 0);
+                                        replay_steps[replay_index].mixed_repairs =
+                                                replay_index == 3 && d_commit_uses_trace_block ? d_commit_trace_block_count :
+                                                replay_index == 3 && d_commit_uses_block ? d_commit_block_step_count :
+                                                (replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ?
+                                                replay_mode_summary.accepted_candidates : 0);
+                                        replay_steps[replay_index].uncategorized_repairs =
+                                                replay_index == 3 && (d_commit_uses_block || d_commit_uses_trace_block) ? 0 :
+                                                (replay_mode_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY &&
+                                                 replay_mode_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY &&
+                                                 replay_mode_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ?
+                                                 replay_mode_summary.accepted_candidates : 0);
+                                        memcpy (committed_objectives, after_objectives, sizeof committed_objectives);
+                                }
+                        }
+
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            owner_index == 0 ? input_a :
+                                                                                            owner_index == 1 ? input_b :
+                                                                                            owner_index == 2 ? input_c :
+                                                                                                               input_d,
+                                                                                            owner_index == 0 ? target_a :
+                                                                                            owner_index == 1 ? target_b :
+                                                                                            owner_index == 2 ? target_c :
+                                                                                                               target_d,
+                                                                                            owner_index == 0 ? a_route :
+                                                                                            owner_index == 1 ? b_route :
+                                                                                            owner_index == 2 ? c_route :
+                                                                                                               d_route,
+                                                                                            &final_objectives[owner_index]));
+                                if (!route_objective_not_worse_than_committed (&final_objectives[owner_index],
+                                                                              &committed_objectives[owner_index]))
+                                        final_stable = false;
+                        }
+                        if (measure_route_key_selection_for_probe (route_keys, nodes, probe_a).selected_route != a_route ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_a).selected_gap == 0 ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_b).selected_route != b_route ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_b).selected_gap == 0 ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_c).selected_route != c_route ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_c).selected_gap == 0 ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap == 0)
+                                final_stable = false;
+
+                        if (!final_stable) {
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                                memcpy (committed_objectives, old_committed_objectives, sizeof committed_objectives);
+                                memcpy (replay_steps, old_replay_steps, sizeof replay_steps);
+                                d_commit_budget_label = old_commit_budget_label;
+                                d_commit_budget = old_commit_budget;
+                                d_commit_uses_block = old_commit_uses_block;
+                                d_commit_uses_trace_block = old_commit_uses_trace_block;
+                                memcpy (d_commit_block_step_indices,
+                                        old_commit_block_step_indices,
+                                        sizeof d_commit_block_step_indices);
+                                d_commit_block_step_count = old_commit_block_step_count;
+                                memcpy (d_commit_trace_block, old_commit_trace_block, sizeof d_commit_trace_block);
+                                d_commit_trace_block_count = old_commit_trace_block_count;
+                        }
+                }
+        }
+
+        if (d_expanded_best_found) {
+                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                replay_step_summary_t old_replay_steps[4];
+                itty_feed_model_decoder_objective_t promoted_objectives[4] = { 0 };
+                itty_feed_model_decoder_objective_t old_committed_objectives[4];
+                itty_feed_model_decoder_objective_t final_objectives[4] = { 0 };
+                char const *old_commit_budget_label = d_commit_budget_label;
+                size_t old_commit_budget = d_commit_budget;
+                bool old_commit_uses_block = d_commit_uses_block;
+                bool old_commit_uses_trace_block = d_commit_uses_trace_block;
+                size_t old_commit_block_step_indices[3] = {
+                        d_commit_block_step_indices[0],
+                        d_commit_block_step_indices[1],
+                        d_commit_block_step_indices[2]
+                };
+                size_t old_commit_block_step_count = d_commit_block_step_count;
+                itty_feed_model_mask_flip_trace_t old_commit_trace_block[16] = { 0 };
+                size_t old_commit_trace_block_count = d_commit_trace_block_count;
+                bool selected_safe = true;
+                bool final_stable = true;
+
+                assert (snapshot);
+                memcpy (old_committed_objectives, committed_objectives, sizeof committed_objectives);
+                memcpy (old_replay_steps, replay_steps, sizeof replay_steps);
+                memcpy (old_commit_trace_block, d_commit_trace_block, sizeof old_commit_trace_block);
+
+                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                             d_expanded_best_trace_block,
+                                                                             d_expanded_best_trace_block_count));
+                d_trace_commit_probe.measured = true;
+                d_trace_commit_probe.flips = d_expanded_best_trace_block_count;
+                for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                    owner_index == 0 ? input_a :
+                                                                                    owner_index == 1 ? input_b :
+                                                                                    owner_index == 2 ? input_c :
+                                                                                                       input_d,
+                                                                                    owner_index == 0 ? target_a :
+                                                                                    owner_index == 1 ? target_b :
+                                                                                    owner_index == 2 ? target_c :
+                                                                                                       target_d,
+                                                                                    owner_index == 0 ? a_route :
+                                                                                    owner_index == 1 ? b_route :
+                                                                                    owner_index == 2 ? c_route :
+                                                                                                       d_route,
+                                                                                    &promoted_objectives[owner_index]));
+                        if (!route_objective_not_worse_than_committed (&promoted_objectives[owner_index],
+                                                                      &committed_objectives[owner_index]))
+                                selected_safe = false;
+                }
+                if (measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route ||
+                    measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap == 0)
+                        selected_safe = false;
+                if (!route_objective_improves_on_committed (&promoted_objectives[3], &committed_objectives[3]))
+                        selected_safe = false;
+                d_trace_commit_probe.selected_after = measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route;
+                d_trace_commit_probe.gap_after = measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap;
+                d_trace_commit_probe.objective_after = promoted_objectives[3];
+                d_trace_commit_probe.selected_safe = selected_safe;
+                d_trace_commit_probe.improves = route_objective_improves_on_committed (&promoted_objectives[3], &committed_objectives[3]);
+
+                if (!selected_safe) {
+                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                } else {
+                        memcpy (committed_objectives, promoted_objectives, sizeof committed_objectives);
+                        d_commit_uses_block = false;
+                        d_commit_uses_trace_block = true;
+                        d_commit_trace_block_count = d_expanded_best_trace_block_count;
+                        memcpy (d_commit_trace_block, d_expanded_best_trace_block, sizeof d_commit_trace_block);
+                        d_commit_budget = d_expanded_best_trace_block_count;
+                        d_commit_budget_label = "expanded-structural-trace-block";
+
+                        {
+                                char const *labels[4] = { "A", "B", "C", "D" };
+                                itty_bit_string_list_t *inputs[4] = { input_a, input_b, input_c, input_d };
+                                itty_bit_string_t *targets[4] = { target_a, target_b, target_c, target_d };
+                                size_t routes[4] = { a_route, b_route, c_route, d_route };
+                                itty_feed_model_train_stats_t *chain_stats[4] = { &chain_a, &chain_b, &chain_c, &chain_d };
+                                char const *committed_budget_labels[4] = { "positive", "positive", "positive", d_commit_budget_label };
+                                size_t committed_budgets[4] = { oracle_options.max_flips, oracle_options.max_flips, oracle_options.max_flips, d_commit_budget };
+
+                                memset (&chain_a, 0, sizeof chain_a);
+                                memset (&chain_b, 0, sizeof chain_b);
+                                memset (&chain_c, 0, sizeof chain_c);
+                                memset (&chain_d, 0, sizeof chain_d);
+                                memset (replay_steps, 0, sizeof replay_steps);
+
+                                for (size_t replay_index = 0; replay_index < 4; replay_index++) {
+                                        itty_feed_model_layer_state_snapshot_t *replay_snapshot;
+                                        itty_feed_model_train_options_t replay_options = oracle_options;
+                                        itty_feed_model_final_repair_mode_summary_t replay_mode_summary = { 0 };
+                                        itty_feed_model_decoder_objective_t after_objectives[4] = { 0 };
+                                        char const *budget_class = committed_budget_labels[replay_index];
+
+                                        replay_options.max_flips = committed_budgets[replay_index];
+                                        replay_snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                        assert (replay_snapshot);
+                                        if (replay_index == 3 && d_commit_uses_trace_block) {
+                                                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                                             d_commit_trace_block,
+                                                                                                             d_commit_trace_block_count));
+                                                chain_stats[replay_index]->flips = d_commit_trace_block_count;
+                                        } else if (replay_index == 3 && d_commit_uses_block) {
+                                                size_t total_flips = 0;
+                                                memset (chain_stats[replay_index], 0, sizeof *chain_stats[replay_index]);
+                                                for (size_t step_index = 0; step_index < d_commit_block_step_count; step_index++) {
+                                                        size_t spec_index = d_commit_block_step_indices[step_index];
+                                                        d_block_step_spec_t const *step = &block_step_specs[spec_index];
+                                                        itty_feed_model_train_options_t step_options = oracle_options;
+                                                        itty_feed_model_train_stats_t step_stats = { 0 };
+                                                        itty_feed_model_final_repair_mode_summary_t step_summary = { 0 };
+
+                                                        step_options.max_flips = step->max_flips;
+                                                        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                                                    inputs[replay_index],
+                                                                                                                                    targets[replay_index],
+                                                                                                                                    step->target_node,
+                                                                                                                                    &step_options,
+                                                                                                                                    step->mode,
+                                                                                                                                    &step_stats,
+                                                                                                                                    &step_summary));
+                                                        total_flips += step_stats.flips;
+                                                }
+                                                chain_stats[replay_index]->flips = total_flips;
+                                        } else {
+                                                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                                            inputs[replay_index],
+                                                                                                                            targets[replay_index],
+                                                                                                                            routes[replay_index],
+                                                                                                                            &replay_options,
+                                                                                                                            ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+                                                                                                                            chain_stats[replay_index],
+                                                                                                                            &replay_mode_summary));
+                                        }
+                                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                            inputs[owner_index],
+                                                                                                            targets[owner_index],
+                                                                                                            routes[owner_index],
+                                                                                                            &after_objectives[owner_index]));
+                                        }
+                                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                                if (!route_objective_not_worse_than_committed (&after_objectives[owner_index],
+                                                                                              &committed_objectives[owner_index])) {
+                                                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, replay_snapshot);
+                                                        memset (chain_stats[replay_index], 0, sizeof *chain_stats[replay_index]);
+                                                        memcpy (after_objectives, committed_objectives, sizeof committed_objectives);
+                                                        break;
+                                                }
+                                        }
+                                        replay_steps[replay_index].label = labels[replay_index];
+                                        replay_steps[replay_index].budget_class = budget_class;
+                                        replay_steps[replay_index].budget = replay_options.max_flips;
+                                        replay_steps[replay_index].replay_flips = chain_stats[replay_index]->flips;
+                                        replay_steps[replay_index].selector = measure_route_key_selection_for_probe (route_keys,
+                                                                                                                      nodes,
+                                                                                                                      replay_index == 0 ? probe_a :
+                                                                                                                      replay_index == 1 ? probe_b :
+                                                                                                                      replay_index == 2 ? probe_c :
+                                                                                                                                         probe_d);
+                                        replay_steps[replay_index].objective = after_objectives[replay_index];
+                                        replay_steps[replay_index].positive_repairs =
+                                                replay_index == 3 && (d_commit_uses_block || d_commit_uses_trace_block) ? 0 :
+                                                (replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY ?
+                                                replay_mode_summary.accepted_candidates : 0);
+                                        replay_steps[replay_index].zero_repairs =
+                                                replay_index == 3 && (d_commit_uses_block || d_commit_uses_trace_block) ? 0 :
+                                                (replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY ?
+                                                replay_mode_summary.accepted_candidates : 0);
+                                        replay_steps[replay_index].mixed_repairs =
+                                                replay_index == 3 && d_commit_uses_trace_block ? d_commit_trace_block_count :
+                                                replay_index == 3 && d_commit_uses_block ? d_commit_block_step_count :
+                                                (replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ?
+                                                replay_mode_summary.accepted_candidates : 0);
+                                        replay_steps[replay_index].uncategorized_repairs =
+                                                replay_index == 3 && (d_commit_uses_block || d_commit_uses_trace_block) ? 0 :
+                                                (replay_mode_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY &&
+                                                 replay_mode_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY &&
+                                                 replay_mode_summary.chosen_mode != ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ?
+                                                 replay_mode_summary.accepted_candidates : 0);
+                                        memcpy (committed_objectives, after_objectives, sizeof committed_objectives);
+                                }
+                        }
+
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            owner_index == 0 ? input_a :
+                                                                                            owner_index == 1 ? input_b :
+                                                                                            owner_index == 2 ? input_c :
+                                                                                                               input_d,
+                                                                                            owner_index == 0 ? target_a :
+                                                                                            owner_index == 1 ? target_b :
+                                                                                            owner_index == 2 ? target_c :
+                                                                                                               target_d,
+                                                                                            owner_index == 0 ? a_route :
+                                                                                            owner_index == 1 ? b_route :
+                                                                                            owner_index == 2 ? c_route :
+                                                                                                               d_route,
+                                                                                            &final_objectives[owner_index]));
+                                if (!route_objective_not_worse_than_committed (&final_objectives[owner_index],
+                                                                              &committed_objectives[owner_index]))
+                                        final_stable = false;
+                        }
+                        if (measure_route_key_selection_for_probe (route_keys, nodes, probe_a).selected_route != a_route ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_a).selected_gap == 0 ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_b).selected_route != b_route ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_b).selected_gap == 0 ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_c).selected_route != c_route ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_c).selected_gap == 0 ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap == 0)
+                                final_stable = false;
+
+                        if (!final_stable) {
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                                memcpy (committed_objectives, old_committed_objectives, sizeof committed_objectives);
+                                memcpy (replay_steps, old_replay_steps, sizeof replay_steps);
+                                d_commit_budget_label = old_commit_budget_label;
+                                d_commit_budget = old_commit_budget;
+                                d_commit_uses_block = old_commit_uses_block;
+                                d_commit_uses_trace_block = old_commit_uses_trace_block;
+                                memcpy (d_commit_block_step_indices,
+                                        old_commit_block_step_indices,
+                                        sizeof d_commit_block_step_indices);
+                                d_commit_block_step_count = old_commit_block_step_count;
+                                memcpy (d_commit_trace_block, old_commit_trace_block, sizeof d_commit_trace_block);
+                                d_commit_trace_block_count = old_commit_trace_block_count;
+                        }
+                        d_trace_commit_probe.final_stable = final_stable;
+                }
+        }
+
+        {
+                d_block_matrix_step_spec_t const matrix_step_specs[] = {
+                        { .label = "balanced-8", .target_kind = D_BLOCK_TARGET_ROUTE, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, .max_flips = 8, .require_selected_node_stable = false },
+                        { .label = "selected-zero-8", .target_kind = D_BLOCK_TARGET_CURRENT_SELECTED, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY, .max_flips = 8, .require_selected_node_stable = false },
+                        { .label = "selected-positive-8", .target_kind = D_BLOCK_TARGET_CURRENT_SELECTED, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY, .max_flips = 8, .require_selected_node_stable = false },
+                        { .label = "internal-selection-stabilizer", .target_kind = D_BLOCK_TARGET_CURRENT_SELECTED, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, .max_flips = 8, .require_selected_node_stable = true },
+                };
+                size_t const matrix_sequences[7][2] = {
+                        { 0, 0 },
+                        { 0, 1 },
+                        { 1, 0 },
+                        { 0, 2 },
+                        { 2, 0 },
+                        { 0, 3 },
+                        { 3, 1 },
+                };
+
+                for (size_t sequence_index = 0; sequence_index < sizeof (d_block_matrix) / sizeof (d_block_matrix[0]); sequence_index++) {
+                        itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                        bool selected_safe = true;
+                        bool improves = false;
+                        char const *reason = "no-improvement";
+                        size_t total_flips = 0;
+                        itty_feed_model_segment_node_selection_summary_t matrix_selection = { 0 };
+                        itty_feed_model_decoder_objective_t matrix_selected_objective = { 0 };
+                        itty_feed_model_decoder_objective_t matrix_owner_objectives[3] = { 0 };
+
+                        assert (snapshot);
+                        for (size_t step_index = 0; step_index < 2; step_index++) {
+                                d_block_matrix_step_spec_t const *step = &matrix_step_specs[matrix_sequences[sequence_index][step_index]];
+                                itty_feed_model_segment_node_selection_summary_t before_selection = { 0 };
+                                itty_feed_model_segment_node_selection_summary_t after_selection = { 0 };
+                                itty_feed_model_train_options_t step_options = oracle_options;
+                                itty_feed_model_train_stats_t step_stats = { 0 };
+                                itty_feed_model_final_repair_mode_summary_t step_summary = { 0 };
+                                size_t target_node = d_route;
+
+                                if (step->target_kind == D_BLOCK_TARGET_CURRENT_SELECTED) {
+                                        assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                                               input_d,
+                                                                                               target_d,
+                                                                                               &before_selection));
+                                        target_node = before_selection.selected_by_popcount;
+                                }
+                                step_options.max_flips = step->max_flips;
+                                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                            input_d,
+                                                                                                            target_d,
+                                                                                                            target_node,
+                                                                                                            &step_options,
+                                                                                                            step->mode,
+                                                                                                            &step_stats,
+                                                                                                            &step_summary));
+                                total_flips += step_stats.flips;
+
+                                if (step->require_selected_node_stable) {
+                                        assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                                               input_d,
+                                                                                               target_d,
+                                                                                               &after_selection));
+                                        if (after_selection.selected_by_popcount != before_selection.selected_by_popcount) {
+                                                selected_safe = false;
+                                                reason = "selected-node-switch";
+                                                break;
+                                        }
+                                }
+                        }
+
+                        assert (measure_selected_node_objective (decoder_model,
+                                                                input_d,
+                                                                target_d,
+                                                                &matrix_selection,
+                                                                &matrix_selected_objective));
+                        for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            owner_index == 0 ? input_a :
+                                                                                            owner_index == 1 ? input_b :
+                                                                                                               input_c,
+                                                                                            owner_index == 0 ? target_a :
+                                                                                            owner_index == 1 ? target_b :
+                                                                                                               target_c,
+                                                                                            owner_index == 0 ? a_route :
+                                                                                            owner_index == 1 ? b_route :
+                                                                                                               c_route,
+                                                                                            &matrix_owner_objectives[owner_index]));
+                                if (!route_objective_not_worse_than_committed (&matrix_owner_objectives[owner_index],
+                                                                              &committed_objectives[owner_index])) {
+                                        selected_safe = false;
+                                        reason = "owner-baseline-guard";
+                                }
+                        }
+                        if (measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap == 0) {
+                                selected_safe = false;
+                                reason = "route-key-guard";
+                        }
+                        if (!route_objective_not_worse_than_committed (&matrix_selected_objective,
+                                                                      &committed_objectives[3])) {
+                                selected_safe = false;
+                                reason = "selected-objective-guard";
+                        }
+
+                        improves = selected_safe &&
+                                   route_objective_improves_on_committed (&matrix_selected_objective,
+                                                                         &committed_objectives[3]);
+                        if (selected_safe && improves)
+                                reason = "improves";
+
+                        d_block_matrix[sequence_index].selected_safe = selected_safe;
+                        d_block_matrix[sequence_index].improves = improves;
+                        d_block_matrix[sequence_index].reason = reason;
+                        d_block_matrix[sequence_index].selected_after = matrix_selection.selected_by_popcount;
+                        d_block_matrix[sequence_index].gap_after = matrix_selection.popcount_gap;
+                        d_block_matrix[sequence_index].total_flips = total_flips;
+                        d_block_matrix[sequence_index].selected_objective_after = matrix_selected_objective;
+
+                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                }
+        }
+        {
+                d_block_matrix_step_spec_t const exact_zero_step_specs[] = {
+                        { .label = "selected-exact-zero", .target_kind = D_BLOCK_TARGET_CURRENT_SELECTED, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY, .max_flips = 8, .require_selected_node_stable = false },
+                        { .label = "internal-selection-stabilizer", .target_kind = D_BLOCK_TARGET_CURRENT_SELECTED, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, .max_flips = 8, .require_selected_node_stable = true },
+                        { .label = "selected-positive", .target_kind = D_BLOCK_TARGET_CURRENT_SELECTED, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY, .max_flips = 8, .require_selected_node_stable = false },
+                        { .label = "route-balanced-8", .target_kind = D_BLOCK_TARGET_ROUTE, .mode = ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, .max_flips = 8, .require_selected_node_stable = false },
+                };
+                size_t const exact_zero_sequences[5][2] = {
+                        { 0, 0 },
+                        { 0, 1 },
+                        { 1, 0 },
+                        { 0, 2 },
+                        { 0, 3 },
+                };
+
+                for (size_t sequence_index = 0; sequence_index < sizeof (d_exact_zero_blocks) / sizeof (d_exact_zero_blocks[0]); sequence_index++) {
+                        itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                        bool selected_safe = true;
+                        bool improves = false;
+                        char const *reason = "no-improvement";
+                        size_t total_flips = 0;
+                        itty_feed_model_segment_node_selection_summary_t matrix_selection = { 0 };
+                        itty_feed_model_decoder_objective_t matrix_selected_objective = { 0 };
+                        itty_feed_model_decoder_objective_t matrix_owner_objectives[3] = { 0 };
+
+                        assert (snapshot);
+                        for (size_t step_index = 0; step_index < 2; step_index++) {
+                                d_block_matrix_step_spec_t const *step = &exact_zero_step_specs[exact_zero_sequences[sequence_index][step_index]];
+                                itty_feed_model_segment_node_selection_summary_t before_selection = { 0 };
+                                itty_feed_model_segment_node_selection_summary_t after_selection = { 0 };
+                                itty_feed_model_train_options_t step_options = oracle_options;
+                                itty_feed_model_train_stats_t step_stats = { 0 };
+                                itty_feed_model_final_repair_mode_summary_t step_summary = { 0 };
+                                size_t target_node = d_route;
+
+                                if (step->target_kind == D_BLOCK_TARGET_CURRENT_SELECTED) {
+                                        assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                                               input_d,
+                                                                                               target_d,
+                                                                                               &before_selection));
+                                        target_node = before_selection.selected_by_popcount;
+                                }
+                                step_options.max_flips = step->max_flips;
+                                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                            input_d,
+                                                                                                            target_d,
+                                                                                                            target_node,
+                                                                                                            &step_options,
+                                                                                                            step->mode,
+                                                                                                            &step_stats,
+                                                                                                            &step_summary));
+                                total_flips += step_stats.flips;
+                                if (step->require_selected_node_stable) {
+                                        assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                                               input_d,
+                                                                                               target_d,
+                                                                                               &after_selection));
+                                        if (after_selection.selected_by_popcount != before_selection.selected_by_popcount) {
+                                                selected_safe = false;
+                                                reason = "selected-node-switch";
+                                                break;
+                                        }
+                                }
+                        }
+
+                        assert (measure_selected_node_objective (decoder_model,
+                                                                input_d,
+                                                                target_d,
+                                                                &matrix_selection,
+                                                                &matrix_selected_objective));
+                        for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            owner_index == 0 ? input_a :
+                                                                                            owner_index == 1 ? input_b :
+                                                                                                               input_c,
+                                                                                            owner_index == 0 ? target_a :
+                                                                                            owner_index == 1 ? target_b :
+                                                                                                               target_c,
+                                                                                            owner_index == 0 ? a_route :
+                                                                                            owner_index == 1 ? b_route :
+                                                                                                               c_route,
+                                                                                            &matrix_owner_objectives[owner_index]));
+                                if (!route_objective_not_worse_than_committed (&matrix_owner_objectives[owner_index],
+                                                                              &committed_objectives[owner_index])) {
+                                        selected_safe = false;
+                                        reason = "owner-baseline-guard";
+                                }
+                        }
+                        if (measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap == 0) {
+                                selected_safe = false;
+                                reason = "route-key-guard";
+                        }
+                        if (!route_objective_not_worse_than_committed (&matrix_selected_objective,
+                                                                      &committed_objectives[3])) {
+                                selected_safe = false;
+                                reason = "selected-objective-guard";
+                        }
+
+                        improves = selected_safe &&
+                                   route_objective_improves_on_committed (&matrix_selected_objective,
+                                                                         &committed_objectives[3]);
+                        if (selected_safe && improves)
+                                reason = "improves";
+
+                        d_exact_zero_blocks[sequence_index].selected_safe = selected_safe;
+                        d_exact_zero_blocks[sequence_index].improves = improves;
+                        d_exact_zero_blocks[sequence_index].reason = reason;
+                        d_exact_zero_blocks[sequence_index].selected_after = matrix_selection.selected_by_popcount;
+                        d_exact_zero_blocks[sequence_index].gap_after = matrix_selection.popcount_gap;
+                        d_exact_zero_blocks[sequence_index].total_flips = total_flips;
+                        d_exact_zero_blocks[sequence_index].selected_objective_after = matrix_selected_objective;
+
+                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                }
+        }
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_a, target_a, a_route, &rows[0].objective));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_b, target_b, b_route, &rows[1].objective));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_c, target_c, c_route, &rows[2].objective));
+        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model, input_d, target_d, d_route, &rows[3].objective));
+        rows[0].selector = measure_route_key_selection_for_probe (route_keys, nodes, probe_a);
+        rows[1].selector = measure_route_key_selection_for_probe (route_keys, nodes, probe_b);
+        rows[2].selector = measure_route_key_selection_for_probe (route_keys, nodes, probe_c);
+        rows[3].selector = measure_route_key_selection_for_probe (route_keys, nodes, probe_d);
+        rows[0].replay_flips = replay_steps[0].replay_flips;
+        rows[1].replay_flips = replay_steps[1].replay_flips;
+        rows[2].replay_flips = replay_steps[2].replay_flips;
+        rows[3].replay_flips = replay_steps[3].replay_flips;
+        rows[0].committed_baseline = committed_objectives[0];
+        rows[1].committed_baseline = committed_objectives[1];
+        rows[2].committed_baseline = committed_objectives[2];
+        rows[3].committed_baseline = committed_objectives[3];
+        rows[3].committed_budget = d_commit_budget;
+        rows[3].committed_budget_class = d_commit_budget_label;
+
+        printf ("---route-key-selector-d-begin\n");
+        printf ("---c_label=%s\n", c_label);
+        printf ("---d_label=%s\n", d_label);
+        printf ("---d_commit_budget=%zu\n", d_commit_budget);
+        printf ("---d_commit_budget_class=%s\n", d_commit_budget_label);
+        for (size_t i = 0; i < 4; i++) {
+                printf ("---row_%s_assigned_route=%zu\n", rows[i].label, rows[i].assigned_route);
+                printf ("---row_%s_selected_route=%zu\n", rows[i].label, rows[i].selector.selected_route);
+                printf ("---row_%s_selected_gap=%zu\n", rows[i].label, rows[i].selector.selected_gap);
+                printf ("---row_%s_nearest_competitor=%zu\n", rows[i].label, rows[i].selector.nearest_competing_route);
+                printf ("---row_%s_forced_dist=%zu\n", rows[i].label, rows[i].objective.selected_distance);
+                printf ("---row_%s_forced_def=%zu\n", rows[i].label, rows[i].objective.false_negative_vote_deficit);
+                printf ("---row_%s_forced_excess=%zu\n", rows[i].label, rows[i].objective.false_positive_vote_excess);
+                printf ("---row_%s_training_flips=%zu\n", rows[i].label, rows[i].training_flips);
+                printf ("---row_%s_replay_flips=%zu\n", rows[i].label, rows[i].replay_flips);
+                printf ("---row_%s_newly_allocated=%s\n", rows[i].label, rows[i].newly_allocated ? "yes" : "no");
+        }
+        for (size_t replay_index = 0; replay_index < sizeof (replay_steps) / sizeof (replay_steps[0]); replay_index++) {
+                printf ("---replay_%s_selected_route=%zu\n",
+                        replay_steps[replay_index].label,
+                        replay_steps[replay_index].selector.selected_route);
+                printf ("---replay_%s_selected_gap=%zu\n",
+                        replay_steps[replay_index].label,
+                        replay_steps[replay_index].selector.selected_gap);
+                printf ("---replay_%s_forced_dist=%zu\n",
+                        replay_steps[replay_index].label,
+                        replay_steps[replay_index].objective.selected_distance);
+                printf ("---replay_%s_forced_def=%zu\n",
+                        replay_steps[replay_index].label,
+                        replay_steps[replay_index].objective.false_negative_vote_deficit);
+                printf ("---replay_%s_forced_excess=%zu\n",
+                        replay_steps[replay_index].label,
+                        replay_steps[replay_index].objective.false_positive_vote_excess);
+                printf ("---replay_%s_budget=%zu\n",
+                        replay_steps[replay_index].label,
+                        replay_steps[replay_index].budget);
+                printf ("---replay_%s_budget_class=%s\n",
+                        replay_steps[replay_index].label,
+                        replay_steps[replay_index].budget_class);
+                printf ("---replay_%s_flips=%zu\n",
+                        replay_steps[replay_index].label,
+                        replay_steps[replay_index].replay_flips);
+                printf ("---replay_%s_positive=%zu\n",
+                        replay_steps[replay_index].label,
+                        replay_steps[replay_index].positive_repairs);
+                printf ("---replay_%s_zero=%zu\n",
+                        replay_steps[replay_index].label,
+                        replay_steps[replay_index].zero_repairs);
+                printf ("---replay_%s_mixed=%zu\n",
+                        replay_steps[replay_index].label,
+                        replay_steps[replay_index].mixed_repairs);
+                printf ("---replay_%s_uncategorized=%zu\n",
+                        replay_steps[replay_index].label,
+                        replay_steps[replay_index].uncategorized_repairs);
+        }
+        for (size_t improvement_index = 0; improvement_index < sizeof (d_improvements) / sizeof (d_improvements[0]); improvement_index++) {
+                printf ("---improve_%s_accepted=%s\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].accepted ? "yes" : "no");
+                printf ("---improve_%s_selected_route=%zu\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].selector.selected_route);
+                printf ("---improve_%s_selected_gap=%zu\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].selector.selected_gap);
+                printf ("---improve_%s_forced_dist=%zu\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].objective.selected_distance);
+                printf ("---improve_%s_forced_def=%zu\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].objective.false_negative_vote_deficit);
+                printf ("---improve_%s_forced_excess=%zu\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].objective.false_positive_vote_excess);
+                printf ("---improve_%s_first_budget=%zu\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].first_budget);
+                printf ("---improve_%s_first_class=%s\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].first_class ? d_improvements[improvement_index].first_class : "none");
+                printf ("---improve_%s_second_budget=%zu\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].second_budget);
+                printf ("---improve_%s_second_class=%s\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].second_class ? d_improvements[improvement_index].second_class : "none");
+                printf ("---improve_%s_flips=%zu\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].replay_flips);
+                printf ("---improve_%s_positive=%zu\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].positive_repairs);
+                printf ("---improve_%s_zero=%zu\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].zero_repairs);
+                printf ("---improve_%s_mixed=%zu\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].mixed_repairs);
+                printf ("---improve_%s_uncategorized=%zu\n",
+                        d_improvements[improvement_index].label,
+                        d_improvements[improvement_index].uncategorized_repairs);
+        }
+        for (size_t route = 0; route < nodes; route++) {
+                if (!d_choice[route].admitted)
+                        continue;
+                printf ("---d_choice_route_%zu gap=%zu before=%zu/%zu excess=%zu after=%zu/%zu excess=%zu flips=%zu replay_safe=%s\n",
+                        route,
+                        d_choice[route].gap,
+                        d_choice[route].before_dist,
+                        d_choice[route].before_def,
+                        d_choice[route].before_excess,
+                        d_choice[route].after_dist,
+                        d_choice[route].after_def,
+                        d_choice[route].after_excess,
+                        d_choice[route].flips,
+                        d_choice[route].replay_safe ? "yes" : "no");
+        }
+        for (size_t route = 0; route < nodes; route++) {
+                if (!d_audit[route].measured)
+                        continue;
+                printf ("---d_audit_route_%zu_before=%zu/%zu excess=%zu safety=%zu\n",
+                        route,
+                        d_audit[route].before_dist,
+                        d_audit[route].before_def,
+                        d_audit[route].before_excess,
+                        d_audit[route].before_zero_safety);
+                printf ("---d_audit_route_%zu_replay_safe=%zu/%zu flips=%zu kept=%s\n",
+                        route,
+                        d_audit[route].replay_safe_after_dist,
+                        d_audit[route].replay_safe_after_def,
+                        d_audit[route].replay_safe_flips,
+                        d_audit[route].replay_safe_kept_owners ? "yes" : "no");
+                printf ("---d_audit_route_%zu_replay_safe_excess=%zu safety=%zu reason=%s\n",
+                        route,
+                        d_audit[route].replay_safe_after_excess,
+                        d_audit[route].replay_safe_after_zero_safety,
+                        d_audit[route].replay_safe_reason ? d_audit[route].replay_safe_reason : "unmeasured");
+                printf ("---d_audit_route_%zu_no_replay=%zu/%zu flips=%zu\n",
+                        route,
+                        d_audit[route].no_replay_after_dist,
+                        d_audit[route].no_replay_after_def,
+                        d_audit[route].no_replay_flips);
+                printf ("---d_audit_route_%zu_no_replay_excess=%zu safety=%zu reason=%s\n",
+                        route,
+                        d_audit[route].no_replay_after_excess,
+                        d_audit[route].no_replay_after_zero_safety,
+                        d_audit[route].no_replay_reason ? d_audit[route].no_replay_reason : "unmeasured");
+        }
+        for (size_t spec_index = 0; spec_index < sizeof (d_family) / sizeof (d_family[0]); spec_index++) {
+                if (!d_family[spec_index].found_route) {
+                        printf ("---d_family_%s=unallocated\n", d_family[spec_index].label);
+                        continue;
+                }
+                printf ("---d_family_%s route=%zu gap=%zu before=%zu/%zu excess=%zu after=%zu/%zu flips=%zu\n",
+                        d_family[spec_index].label,
+                        d_family[spec_index].route,
+                        d_family[spec_index].gap,
+                        d_family[spec_index].before_dist,
+                        d_family[spec_index].before_def,
+                        d_family[spec_index].before_excess,
+                        d_family[spec_index].after_dist,
+                        d_family[spec_index].after_def,
+                        d_family[spec_index].flips);
+        }
+        for (size_t mode_index = 0; mode_index < sizeof (d_modes) / sizeof (d_modes[0]); mode_index++) {
+                printf ("---d_mode_%s candidates=%zu accepted=%zu dist_delta=%td deficit_delta=%td excess_delta=%td target_one_margin_delta=%td target_zero_safety_delta=%td flips=%zu stop=%s\n",
+                        d_modes[mode_index].label,
+                        d_modes[mode_index].candidate_count,
+                        d_modes[mode_index].accepted_candidates,
+                        d_modes[mode_index].distance_delta,
+                        d_modes[mode_index].deficit_delta,
+                        d_modes[mode_index].excess_delta,
+                        d_modes[mode_index].target_one_margin_delta,
+                        d_modes[mode_index].target_zero_safety_delta,
+                        d_modes[mode_index].flips,
+                        d_modes[mode_index].stop_reason);
+        }
+        for (size_t budget_index = 0; budget_index < sizeof (d_budgets) / sizeof (d_budgets[0]); budget_index++) {
+                printf ("---d_budget_%zu candidates=%zu accepted=%zu positive=%zu zero=%zu mixed=%zu uncategorized=%zu dist_delta=%td deficit_delta=%td excess_delta=%td flips=%zu owners_kept=%s stop=%s\n",
+                        d_budgets[budget_index].max_flips,
+                        d_budgets[budget_index].candidate_count,
+                        d_budgets[budget_index].accepted_candidates,
+                        d_budgets[budget_index].positive_repairs,
+                        d_budgets[budget_index].zero_repairs,
+                        d_budgets[budget_index].mixed_repairs,
+                        d_budgets[budget_index].uncategorized_repairs,
+                        d_budgets[budget_index].distance_delta,
+                        d_budgets[budget_index].deficit_delta,
+                        d_budgets[budget_index].excess_delta,
+                        d_budgets[budget_index].flips,
+                        d_budgets[budget_index].owners_kept ? "yes" : "no",
+                        d_budgets[budget_index].stop_reason);
+        }
+        printf ("---d_excess_prepare_budget=%zu\n", d_excess_budget);
+        printf ("---d_excess_prepare_flips=%zu\n", d_excess_prepare_stats.flips);
+        printf ("---d_excess_prepare_dist=%zu\n", d_excess_objective.selected_distance);
+        printf ("---d_excess_prepare_def=%zu\n", d_excess_objective.false_negative_vote_deficit);
+        printf ("---d_excess_prepare_excess=%zu\n", d_excess_objective.false_positive_vote_excess);
+        printf ("---d_excess_prepare_route_key_route=%zu\n",
+                measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route);
+        printf ("---d_excess_prepare_route_key_gap=%zu\n",
+                measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap);
+        printf ("---d_internal_route=%zu\n", d_internal.route_id);
+        printf ("---d_internal_committed_node=%zu\n", d_internal.committed_internal_node);
+        printf ("---d_internal_current_node=%zu\n", d_internal.current_internal_node);
+        printf ("---d_internal_switch_count=%zu\n", d_internal.switch_count);
+        printf ("---d_internal_zero_direct_clear_helpful=%zu\n", d_internal.zero_direct_clear_helpful);
+        printf ("---d_internal_zero_internal_switch_helpful=%zu\n", d_internal.zero_internal_switch_helpful);
+        printf ("---d_internal_zero_internal_switch_harmful=%zu\n", d_internal.zero_internal_switch_harmful);
+        printf ("---d_internal_zero_internal_switch_neutral=%zu\n", d_internal.zero_internal_switch_neutral);
+        printf ("---d_internal_zero_route_key_switch=%zu\n", d_internal.zero_route_key_switch);
+        printf ("---d_internal_zero_replay_rejected=%zu\n", d_internal.zero_replay_rejected);
+        printf ("---d_conflict_route=%zu\n", d_conflict.route_id);
+        printf ("---d_conflict_entries=%zu\n", d_conflict.entries);
+        printf ("---d_conflict_local_intended_helpful=%zu\n", d_conflict.local_intended_helpful);
+        printf ("---d_conflict_selected_objective_helpful=%zu\n", d_conflict.selected_objective_helpful);
+        printf ("---d_conflict_selected_objective_harmful=%zu\n", d_conflict.selected_objective_harmful);
+        printf ("---d_conflict_replay_conflicting=%zu\n", d_conflict.replay_conflicting);
+        printf ("---d_conflict_internal_switch_harmful=%zu\n", d_conflict.internal_switch_harmful);
+        printf ("---d_conflict_accepted=%zu\n", d_conflict.accepted_count);
+        printf ("---d_conflict_rejected=%zu\n", d_conflict.rejected_count);
+        printf ("---d_conflict_pressure_score=%td\n", d_conflict.pressure_score);
+        printf ("---d_internal_search_selected_objective_not_worse=%zu\n",
+                d_internal_search.selected_objective_not_worse);
+        printf ("---d_internal_search_selected_objective_improves=%zu\n",
+                d_internal_search.selected_objective_improves);
+        printf ("---d_internal_search_direct_selected_node_improvements=%zu\n",
+                d_internal_search.direct_selected_node_improvements);
+        printf ("---d_internal_search_switch_helpful=%zu\n",
+                d_internal_search.internal_switch_helpful);
+        printf ("---d_internal_search_switch_neutral=%zu\n",
+                d_internal_search.internal_switch_neutral);
+        printf ("---d_internal_search_switch_harmful=%zu\n",
+                d_internal_search.internal_switch_harmful);
+        printf ("---d_profile_committed_selected_node=%zu\n",
+                d_profile_committed_selection.selected_by_popcount);
+        printf ("---d_profile_committed_gap=%zu\n",
+                d_profile_committed_selection.popcount_gap);
+        printf ("---d_profile_committed_segments=%zu threshold=%zu fp=%zu fn=%zu near_fp=%zu near_fn=%zu confident_fp=%zu confident_fn=%zu\n",
+                d_profile_committed.segments_per_bit,
+                d_profile_committed.threshold,
+                d_profile_committed.false_positive_bits,
+                d_profile_committed.false_negative_bits,
+                d_profile_committed.near_threshold_false_positive_bits,
+                d_profile_committed.near_threshold_false_negative_bits,
+                d_profile_committed.confident_false_positive_bits,
+                d_profile_committed.confident_false_negative_bits);
+        for (size_t trace_index = 0; trace_index < d_profile_committed.trace_count; trace_index++) {
+                itty_feed_model_segment_vote_trace_t const *trace = &d_profile_committed.traces[trace_index];
+                printf ("---d_profile_committed_bit_%zu target=%zu ones=%zu threshold=%zu max_zero=%zu deficit=%zu excess=%zu\n",
+                        trace->decoded_bit,
+                        (size_t) (trace->target_bit ? 1 : 0),
+                        trace->ones,
+                        trace->threshold,
+                        trace->max_zero,
+                        trace->deficit,
+                        trace->excess);
+        }
+        printf ("---d_profile_improved_selected_node=%zu\n",
+                d_profile_improved_selection.selected_by_popcount);
+        printf ("---d_profile_improved_gap=%zu\n",
+                d_profile_improved_selection.popcount_gap);
+        printf ("---d_profile_improved_segments=%zu threshold=%zu fp=%zu fn=%zu near_fp=%zu near_fn=%zu confident_fp=%zu confident_fn=%zu\n",
+                d_profile_improved.segments_per_bit,
+                d_profile_improved.threshold,
+                d_profile_improved.false_positive_bits,
+                d_profile_improved.false_negative_bits,
+                d_profile_improved.near_threshold_false_positive_bits,
+                d_profile_improved.near_threshold_false_negative_bits,
+                d_profile_improved.confident_false_positive_bits,
+                d_profile_improved.confident_false_negative_bits);
+        for (size_t trace_index = 0; trace_index < d_profile_improved.trace_count; trace_index++) {
+                itty_feed_model_segment_vote_trace_t const *trace = &d_profile_improved.traces[trace_index];
+                printf ("---d_profile_improved_bit_%zu target=%zu ones=%zu threshold=%zu max_zero=%zu deficit=%zu excess=%zu\n",
+                        trace->decoded_bit,
+                        (size_t) (trace->target_bit ? 1 : 0),
+                        trace->ones,
+                        trace->threshold,
+                        trace->max_zero,
+                        trace->deficit,
+                        trace->excess);
+        }
+        for (size_t family_index = 0; family_index < sizeof (d_families) / sizeof (d_families[0]); family_index++) {
+                printf ("---d_family_search_%s target_node=%zu candidates=%zu selected_safe=%zu improves_distance=%zu improves_excess=%zu selected_after=%zu gap_after=%zu selected_obj=%zu/%zu/%zu\n",
+                        d_families[family_index].label,
+                        d_families[family_index].target_node,
+                        d_families[family_index].candidate_count,
+                        d_families[family_index].selected_safe,
+                        d_families[family_index].improves_distance,
+                        d_families[family_index].improves_excess,
+                        d_families[family_index].selected_node_after,
+                        d_families[family_index].selected_gap_after,
+                        d_families[family_index].selected_objective_after.selected_distance,
+                        d_families[family_index].selected_objective_after.false_negative_vote_deficit,
+                        d_families[family_index].selected_objective_after.false_positive_vote_excess);
+        }
+        printf ("---d_block_search_blocks=%zu selected_safe=%zu improving=%zu best_found=%s\n",
+                d_block_search.blocks_tested,
+                d_block_search.selected_safe_blocks,
+                d_block_search.improving_blocks,
+                d_block_search.best_found ? "yes" : "no");
+        if (d_block_search.best_found) {
+            printf ("---d_block_search_best label=%s selected_after=%zu gap_after=%zu selected_obj=%zu/%zu/%zu flips=%zu\n",
+                    d_block_search.best_label,
+                    d_block_search.best_selected_node,
+                    d_block_search.best_selected_gap,
+                    d_block_search.best_objective.selected_distance,
+                    d_block_search.best_objective.false_negative_vote_deficit,
+                    d_block_search.best_objective.false_positive_vote_excess,
+                    d_block_search.best_total_flips);
+        }
+        for (size_t matrix_index = 0; matrix_index < sizeof (d_block_matrix) / sizeof (d_block_matrix[0]); matrix_index++) {
+                printf ("---d_block_matrix_%zu label=%s selected_safe=%s improves=%s reason=%s selected_after=%zu gap_after=%zu selected_obj=%zu/%zu/%zu flips=%zu\n",
+                        matrix_index,
+                        d_block_matrix[matrix_index].label,
+                        d_block_matrix[matrix_index].selected_safe ? "yes" : "no",
+                        d_block_matrix[matrix_index].improves ? "yes" : "no",
+                        d_block_matrix[matrix_index].reason,
+                        d_block_matrix[matrix_index].selected_after,
+                        d_block_matrix[matrix_index].gap_after,
+                        d_block_matrix[matrix_index].selected_objective_after.selected_distance,
+                        d_block_matrix[matrix_index].selected_objective_after.false_negative_vote_deficit,
+                        d_block_matrix[matrix_index].selected_objective_after.false_positive_vote_excess,
+                        d_block_matrix[matrix_index].total_flips);
+        }
+        {
+                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                itty_feed_model_restore_failure_summary_t residual_free = { 0 };
+                itty_feed_model_restore_failure_summary_t residual_owner[3] = { 0 };
+                itty_feed_model_train_options_t residual_options = oracle_options;
+                itty_bit_string_list_t *owner_inputs[3] = { input_a, input_b, input_c };
+                itty_bit_string_t *owner_targets[3] = { target_a, target_b, target_c };
+
+                assert (snapshot);
+                assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                        input_d,
+                                                                        target_d,
+                                                                        &d_profile_committed_selection));
+                assert (itty_feed_model_measure_segment_vote_profile_for_node (decoder_model,
+                                                                               input_d,
+                                                                               target_d,
+                                                                               d_profile_committed_selection.selected_by_popcount,
+                                                                               &d_profile_committed));
+                residual_options.max_flips = 8;
+                assert (itty_feed_model_measure_final_layer_restore_failure (decoder_model,
+                                                                             input_d,
+                                                                             target_d,
+                                                                             input_a,
+                                                                             target_a,
+                                                                             &residual_options,
+                                                                             0,
+                                                                             false,
+                                                                             &residual_free));
+                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                        assert (itty_feed_model_measure_final_layer_restore_failure (decoder_model,
+                                                                                     input_d,
+                                                                                     target_d,
+                                                                                     owner_inputs[owner_index],
+                                                                                     owner_targets[owner_index],
+                                                                                     &residual_options,
+                                                                                     0,
+                                                                                     true,
+                                                                                     &residual_owner[owner_index]));
+                }
+
+                for (size_t trace_index = 0;
+                     trace_index < d_profile_committed.trace_count &&
+                     d_residual_row_count < ITTY_FEED_MODEL_SEGMENT_VOTE_TRACE_LIMIT;
+                     trace_index++) {
+                        itty_feed_model_segment_vote_trace_t const *trace = &d_profile_committed.traces[trace_index];
+                        itty_feed_model_restore_failure_trace_t const *free_trace;
+                        d_residual_error_row_t *row;
+                        bool owner_guard_ok = true;
+                        bool selected_guard_ok = true;
+
+                        if (trace->target_bit || trace->excess == 0)
+                                continue;
+
+                        free_trace = find_restore_trace_for_decoded_bit (&residual_free, trace->decoded_bit);
+                        row = &d_residual_rows[d_residual_row_count++];
+                        row->measured = true;
+                        row->decoded_bit = trace->decoded_bit;
+                        row->target_bit = trace->target_bit ? 1 : 0;
+                        row->selected_internal_node = d_profile_committed_selection.selected_by_popcount;
+                        row->ones = trace->ones;
+                        row->threshold = trace->threshold;
+                        row->max_zero = trace->max_zero;
+                        row->deficit = trace->deficit;
+                        row->excess = trace->excess;
+                        row->candidate_final_votes = free_trace ? free_trace->clearable_segment_votes : 0;
+                        row->candidate_mask_flips = free_trace ? free_trace->candidate_mask_flips : 0;
+
+                        if (!free_trace) {
+                                row->reason = "no-candidate-trace";
+                                continue;
+                        }
+                        for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                itty_feed_model_restore_failure_trace_t const *owner_trace =
+                                        find_restore_trace_for_decoded_bit (&residual_owner[owner_index], trace->decoded_bit);
+                                if (!owner_trace || !owner_trace->accepted) {
+                                        owner_guard_ok = false;
+                                        break;
+                                }
+                                if (owner_trace->replay_example_distance_after > committed_objectives[owner_index].selected_distance ||
+                                    owner_trace->replay_example_false_negative_deficit_after > committed_objectives[owner_index].false_negative_vote_deficit ||
+                                    owner_trace->replay_example_false_positive_excess_after > committed_objectives[owner_index].false_positive_vote_excess) {
+                                        owner_guard_ok = false;
+                                        break;
+                                }
+                        }
+                        selected_guard_ok =
+                                free_trace->selected_node_distance_after <= committed_objectives[3].selected_distance &&
+                                free_trace->selected_node_false_negative_deficit_after <= committed_objectives[3].false_negative_vote_deficit &&
+                                free_trace->selected_node_false_positive_excess_after <= committed_objectives[3].false_positive_vote_excess;
+
+                        if (free_trace->rejection_reason == ITTY_FEED_MODEL_RESTORE_REJECTION_NO_CLEARABLE_SEGMENT_VOTES)
+                                row->reason = "no-clearable-final-votes";
+                        else if (free_trace->propagation_failure == ITTY_FEED_MODEL_RESTORE_PROPAGATION_DUPLICATE_CONDENSED_MAPPING)
+                                row->reason = "duplicate-condensed-mapping";
+                        else if (free_trace->propagation_failure == ITTY_FEED_MODEL_RESTORE_PROPAGATION_NO_MAJORITY_CROSSING)
+                                row->reason = "no-majority-crossing";
+                        else if (free_trace->candidate_mask_flips == 0 ||
+                                 free_trace->rejection_reason == ITTY_FEED_MODEL_RESTORE_REJECTION_NO_MASK_PROJECTION)
+                                row->reason = "no-mask-flips";
+                        else if (!free_trace->direct_candidate_changed)
+                                row->reason = "candidate-rejected-before-trace";
+                        else if (free_trace->final_selected_node_after != row->selected_internal_node)
+                                row->reason = "candidate-for-different-internal-node";
+                        else if (!owner_guard_ok)
+                                row->reason = "owner-baseline-guard";
+                        else if (!selected_guard_ok)
+                                row->reason = "selected-objective-guard";
+                        else
+                                row->reason = "no-selected-safe-improvement";
+                }
+
+                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+        }
+        {
+                size_t residual_bits[4] = { 0 };
+                size_t residual_bit_count = 0;
+
+                for (size_t row_index = 0; row_index < d_residual_row_count; row_index++) {
+                        d_residual_error_row_t const *row = &d_residual_rows[row_index];
+
+                        if (row->candidate_mask_flips == 0)
+                                continue;
+                        if (residual_bit_count < sizeof (residual_bits) / sizeof (residual_bits[0]))
+                                residual_bits[residual_bit_count++] = row->decoded_bit;
+                }
+
+                for (size_t subset_mask = 1;
+                     subset_mask < ((size_t) 1 << residual_bit_count) &&
+                     d_residual_set_count < sizeof (d_residual_sets) / sizeof (d_residual_sets[0]);
+                     subset_mask++) {
+                        d_residual_set_summary_t *set = &d_residual_sets[d_residual_set_count++];
+                        size_t subset_bits[4] = { 0 };
+                        size_t subset_count = 0;
+                        itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                        route_key_probe_summary_t route_key_after;
+                        itty_feed_model_selected_clear_set_summary_t direct_summary = { 0 };
+                        itty_feed_model_selected_clear_set_summary_t exact_summary = { 0 };
+                        itty_feed_model_train_options_t exact_options = oracle_options;
+                        itty_feed_model_decoder_objective_t owner_after[3] = { 0 };
+
+                        assert (snapshot);
+                        set->bit_mask = subset_mask;
+                        for (size_t bit_index = 0; bit_index < residual_bit_count; bit_index++) {
+                                if (!(subset_mask & ((size_t) 1 << bit_index)))
+                                        continue;
+                                subset_bits[subset_count++] = residual_bits[bit_index];
+                                if (set->label[0] != '\0')
+                                        strncat (set->label,
+                                                 "+",
+                                                 sizeof set->label - strlen (set->label) - 1);
+                                {
+                                        char bit_label[16];
+                                        snprintf (bit_label, sizeof bit_label, "%zu", residual_bits[bit_index]);
+                                        strncat (set->label,
+                                                 bit_label,
+                                                 sizeof set->label - strlen (set->label) - 1);
+                                }
+                        }
+                        set->bit_count = subset_count;
+
+                        set->direct_measured =
+                                itty_feed_model_measure_selected_node_direct_clear_set (decoder_model,
+                                                                                       input_d,
+                                                                                       target_d,
+                                                                                       subset_bits,
+                                                                                       subset_count,
+                                                                                       d_route,
+                                                                                       d_internal.current_internal_node,
+                                                                                       &direct_summary);
+                        if (set->direct_measured) {
+                                set->direct_selected_after = direct_summary.selected_node_after;
+                                set->direct_gap_after = direct_summary.selection_margin_after;
+                                set->direct_clear_votes = direct_summary.clear_vote_count;
+                                set->direct_objective_after = direct_summary.selected_objective_after;
+                                set->direct_improves =
+                                        route_objective_improves_on_committed (&direct_summary.selected_objective_after,
+                                                                              &committed_objectives[3]);
+                        }
+
+                        exact_options.max_flips = 32;
+                        set->exact_measured =
+                                itty_feed_model_train_selected_node_direct_clear_set (decoder_model,
+                                                                                     input_d,
+                                                                                     target_d,
+                                                                                     subset_bits,
+                                                                                     subset_count,
+                                                                                     d_route,
+                                                                                     d_internal.current_internal_node,
+                                                                                     &exact_options,
+                                                                                     &exact_summary);
+                        if (!set->exact_measured) {
+                                set->exact_reason = "solver-failed";
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                                continue;
+                        }
+
+                        set->exact_selected_after = exact_summary.selected_node_after;
+                        set->exact_gap_after = exact_summary.selection_margin_after;
+                        set->exact_flips = exact_summary.total_flips;
+                        set->exact_objective_after = exact_summary.selected_objective_after;
+                        set->exact_trace_count =
+                                itty_feed_model_collect_final_layer_mask_flip_traces (decoder_model,
+                                                                                      snapshot,
+                                                                                      set->exact_traces,
+                                                                                      sizeof set->exact_traces / sizeof (set->exact_traces[0]));
+
+                        route_key_after = measure_route_key_selection_for_probe (route_keys, nodes, probe_d);
+                        set->fail_route_change = route_key_after.selected_route != d_route;
+                        set->fail_gap_loss = route_key_after.selected_gap == 0;
+                        for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            owner_index == 0 ? input_a :
+                                                                                            owner_index == 1 ? input_b :
+                                                                                                               input_c,
+                                                                                            owner_index == 0 ? target_a :
+                                                                                            owner_index == 1 ? target_b :
+                                                                                                               target_c,
+                                                                                            owner_index == 0 ? a_route :
+                                                                                            owner_index == 1 ? b_route :
+                                                                                                               c_route,
+                                                                                            &owner_after[owner_index]));
+                        }
+                        set->fail_a_baseline =
+                                !route_objective_not_worse_than_committed (&owner_after[0], &committed_objectives[0]);
+                        set->fail_b_baseline =
+                                !route_objective_not_worse_than_committed (&owner_after[1], &committed_objectives[1]);
+                        set->fail_c_baseline =
+                                !route_objective_not_worse_than_committed (&owner_after[2], &committed_objectives[2]);
+                        set->fail_d_distance =
+                                exact_summary.selected_objective_after.selected_distance >
+                                committed_objectives[3].selected_distance;
+                        set->fail_d_deficit =
+                                exact_summary.selected_objective_after.false_negative_vote_deficit >
+                                committed_objectives[3].false_negative_vote_deficit;
+                        set->fail_d_excess =
+                                exact_summary.selected_objective_after.false_positive_vote_excess >
+                                committed_objectives[3].false_positive_vote_excess;
+                        set->fail_selected_switch_worse =
+                                exact_summary.selected_node_after != exact_summary.selected_node_before &&
+                                (set->fail_d_distance || set->fail_d_deficit || set->fail_d_excess);
+
+                        set->exact_selected_safe =
+                                !set->fail_route_change &&
+                                !set->fail_gap_loss &&
+                                !set->fail_a_baseline &&
+                                !set->fail_b_baseline &&
+                                !set->fail_c_baseline &&
+                                !set->fail_d_distance &&
+                                !set->fail_d_deficit &&
+                                !set->fail_d_excess;
+                        set->exact_improves =
+                                set->exact_selected_safe &&
+                                route_objective_improves_on_committed (&exact_summary.selected_objective_after,
+                                                                      &committed_objectives[3]);
+
+                        if (set->exact_selected_safe && set->exact_improves)
+                                set->exact_reason = "improves";
+                        else if (set->fail_route_change)
+                                set->exact_reason = "route-key-route-changed";
+                        else if (set->fail_gap_loss)
+                                set->exact_reason = "route-key-gap-lost";
+                        else if (set->fail_a_baseline)
+                                set->exact_reason = "A-baseline-regression";
+                        else if (set->fail_b_baseline)
+                                set->exact_reason = "B-baseline-regression";
+                        else if (set->fail_c_baseline)
+                                set->exact_reason = "C-baseline-regression";
+                        else if (set->fail_d_distance)
+                                set->exact_reason = "D-distance-regression";
+                        else if (set->fail_d_deficit)
+                                set->exact_reason = "D-deficit-regression";
+                        else if (set->fail_d_excess)
+                                set->exact_reason = "D-excess-regression";
+                        else if (set->fail_selected_switch_worse)
+                                set->exact_reason = "internal-selected-node-worse";
+                        else
+                                set->exact_reason = "no-improvement";
+
+                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                }
+        }
+        {
+                typedef struct {
+                        itty_feed_model_mask_flip_trace_t trace;
+                        char        label[48];
+                        bool        selected_safe;
+                        size_t      selected_distance;
+                        size_t      selected_excess;
+                        size_t      teacher_distance;
+                        ptrdiff_t   gap;
+                } baseline_effect_candidate_t;
+                size_t baseline_node_indices[2] = { d_route, d_internal.current_internal_node };
+                itty_feed_model_mask_flip_trace_t baseline_traces[512] = { 0 };
+                size_t baseline_trace_count =
+                        itty_feed_model_collect_final_layer_toggle_traces_for_nodes (decoder_model,
+                                                                                      baseline_node_indices,
+                                                                                      2,
+                                                                                      baseline_traces,
+                                                                                      sizeof baseline_traces / sizeof (baseline_traces[0]));
+
+                for (size_t set_index = 0; set_index < d_residual_set_count; set_index++) {
+                        d_residual_set_summary_t *set = &d_residual_sets[set_index];
+                        baseline_effect_candidate_t best_candidates[16] = { 0 };
+                        size_t best_candidate_count = 0;
+                        itty_bit_string_t *teacher_activation = NULL;
+
+                        if (!set->exact_measured || set->exact_trace_count == 0)
+                                continue;
+
+                        {
+                                size_t subset_bits[4] = { 0 };
+                                size_t subset_count = 0;
+                                char *cursor = set->label;
+
+                                while (*cursor && subset_count < 4) {
+                                        char *end = NULL;
+                                        subset_bits[subset_count++] = strtoul (cursor, &end, 10);
+                                        cursor = end;
+                                        if (*cursor == '+')
+                                                cursor++;
+                                }
+                                assert (build_selected_node_direct_clear_teacher (decoder_model,
+                                                                                 input_d,
+                                                                                 target_d,
+                                                                                 d_route,
+                                                                                 subset_bits,
+                                                                                 subset_count,
+                                                                                 &teacher_activation));
+                        }
+
+                        set->tx_pool_count = baseline_trace_count;
+                        for (size_t trace_index = 0; trace_index < baseline_trace_count; trace_index++) {
+                                itty_feed_model_layer_state_snapshot_t *snapshot =
+                                        itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                itty_feed_model_decoder_objective_t selected_objective = { 0 };
+                                itty_feed_model_decoder_objective_t node1_objective = { 0 };
+                                itty_feed_model_decoder_objective_t node6_objective = { 0 };
+                                itty_feed_model_segment_node_selection_summary_t selection = { 0 };
+                                bool selected_safe = true;
+                                baseline_effect_candidate_t candidate = {
+                                        .trace = baseline_traces[trace_index],
+                                };
+
+                                assert (snapshot);
+                                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                             &baseline_traces[trace_index],
+                                                                                             1));
+                                assert (measure_selected_node_objective (decoder_model,
+                                                                        input_d,
+                                                                        target_d,
+                                                                        &selection,
+                                                                        &selected_objective));
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            input_d,
+                                                                                            target_d,
+                                                                                            d_route,
+                                                                                            &node1_objective));
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            input_d,
+                                                                                            target_d,
+                                                                                            d_internal.current_internal_node,
+                                                                                            &node6_objective));
+                                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                        itty_feed_model_decoder_objective_t owner_after = { 0 };
+                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                    owner_index == 0 ? input_a :
+                                                                                                    owner_index == 1 ? input_b :
+                                                                                                                       input_c,
+                                                                                                    owner_index == 0 ? target_a :
+                                                                                                    owner_index == 1 ? target_b :
+                                                                                                                       target_c,
+                                                                                                    owner_index == 0 ? a_route :
+                                                                                                    owner_index == 1 ? b_route :
+                                                                                                                       c_route,
+                                                                                                    &owner_after));
+                                        if (!route_objective_not_worse_than_committed (&owner_after,
+                                                                                      &committed_objectives[owner_index]))
+                                                selected_safe = false;
+                                }
+                                if (node1_objective.selected_popcount <= node6_objective.selected_popcount)
+                                        selected_safe = false;
+                                if (selected_objective.false_negative_vote_deficit != 0)
+                                        selected_safe = false;
+                                if (!route_objective_not_worse_than_committed (&selected_objective, &committed_objectives[3]))
+                                        selected_safe = false;
+                                {
+                                        itty_bit_string_t *node1_activation = NULL;
+                                        assert (measure_output_activation_for_node (decoder_model,
+                                                                                   input_d,
+                                                                                   d_route,
+                                                                                   &node1_activation));
+                                        candidate.teacher_distance = measure_bit_string_distance (node1_activation, teacher_activation);
+                                        itty_bit_string_free (node1_activation);
+                                }
+                                candidate.selected_safe = selected_safe;
+                                candidate.selected_distance = selected_objective.selected_distance;
+                                candidate.selected_excess = selected_objective.false_positive_vote_excess;
+                                candidate.gap = (ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount;
+                                snprintf (candidate.label,
+                                          sizeof candidate.label,
+                                          "n%zu.i%zu.b%zu=%d",
+                                          candidate.trace.node_index,
+                                          candidate.trace.input_index,
+                                          candidate.trace.bit_index,
+                                          candidate.trace.value_after ? 1 : 0);
+                                {
+                                        bool interesting =
+                                                candidate.selected_safe ||
+                                                candidate.selected_distance <= committed_objectives[3].selected_distance ||
+                                                candidate.selected_excess <= committed_objectives[3].false_positive_vote_excess ||
+                                                candidate.gap > 0;
+
+                                        if (interesting) {
+                                                size_t insert_index = best_candidate_count;
+                                                for (size_t candidate_index = 0; candidate_index < best_candidate_count; candidate_index++) {
+                                                        bool better =
+                                                                (candidate.selected_safe && !best_candidates[candidate_index].selected_safe) ||
+                                                                (candidate.selected_safe == best_candidates[candidate_index].selected_safe &&
+                                                                 candidate.selected_distance < best_candidates[candidate_index].selected_distance) ||
+                                                                (candidate.selected_safe == best_candidates[candidate_index].selected_safe &&
+                                                                 candidate.selected_distance == best_candidates[candidate_index].selected_distance &&
+                                                                 candidate.selected_excess < best_candidates[candidate_index].selected_excess) ||
+                                                                (candidate.selected_safe == best_candidates[candidate_index].selected_safe &&
+                                                                 candidate.selected_distance == best_candidates[candidate_index].selected_distance &&
+                                                                 candidate.selected_excess == best_candidates[candidate_index].selected_excess &&
+                                                                 candidate.teacher_distance < best_candidates[candidate_index].teacher_distance) ||
+                                                                (candidate.selected_safe == best_candidates[candidate_index].selected_safe &&
+                                                                 candidate.selected_distance == best_candidates[candidate_index].selected_distance &&
+                                                                 candidate.selected_excess == best_candidates[candidate_index].selected_excess &&
+                                                                 candidate.teacher_distance == best_candidates[candidate_index].teacher_distance &&
+                                                                 candidate.gap > best_candidates[candidate_index].gap);
+                                                        if (better) {
+                                                                insert_index = candidate_index;
+                                                                break;
+                                                        }
+                                                }
+                                                if (insert_index < 16) {
+                                                        if (best_candidate_count < 16)
+                                                                best_candidate_count++;
+                                                        for (size_t move_index = best_candidate_count - 1; move_index > insert_index; move_index--)
+                                                                best_candidates[move_index] = best_candidates[move_index - 1];
+                                                        best_candidates[insert_index] = candidate;
+                                                }
+                                        }
+                                }
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                        }
+
+                        for (size_t first_index = 0; first_index < best_candidate_count; first_index++) {
+                                for (size_t second_index = first_index; second_index < best_candidate_count; second_index++) {
+                                        for (size_t third_index = second_index; third_index < best_candidate_count; third_index++) {
+                                                baseline_effect_candidate_t const *picked[3] = {
+                                                        &best_candidates[first_index],
+                                                        &best_candidates[second_index],
+                                                        &best_candidates[third_index],
+                                                };
+                                                itty_feed_model_mask_flip_trace_t combined_traces[32] = { 0 };
+                                                size_t combined_count = 0;
+                                                itty_feed_model_layer_state_snapshot_t *snapshot =
+                                                        itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                                itty_feed_model_decoder_objective_t selected_objective = { 0 };
+                                                itty_feed_model_decoder_objective_t node1_objective = { 0 };
+                                                itty_feed_model_decoder_objective_t node6_objective = { 0 };
+                                                itty_feed_model_segment_node_selection_summary_t selection = { 0 };
+                                                bool selected_safe = true;
+                                                bool improves;
+                                                size_t teacher_distance_after = 0;
+                                                char label[96] = { 0 };
+
+                                                assert (snapshot);
+                                                for (size_t trace_index = 0; trace_index < set->exact_trace_count; trace_index++)
+                                                        combined_traces[combined_count++] = set->exact_traces[trace_index];
+                                                for (size_t pick_index = 0; pick_index < 3; pick_index++) {
+                                                        bool duplicate = false;
+                                                        for (size_t existing_index = 0; existing_index < combined_count; existing_index++) {
+                                                                if (combined_traces[existing_index].node_index == picked[pick_index]->trace.node_index &&
+                                                                    combined_traces[existing_index].input_index == picked[pick_index]->trace.input_index &&
+                                                                    combined_traces[existing_index].bit_index == picked[pick_index]->trace.bit_index) {
+                                                                        combined_traces[existing_index].value_after = picked[pick_index]->trace.value_after;
+                                                                        duplicate = true;
+                                                                        break;
+                                                                }
+                                                        }
+                                                        if (!duplicate && combined_count < sizeof (combined_traces) / sizeof (combined_traces[0]))
+                                                                combined_traces[combined_count++] = picked[pick_index]->trace;
+                                                        if (strlen (label) == 0)
+                                                                snprintf (label, sizeof label, "%s", picked[pick_index]->label);
+                                                        else
+                                                                snprintf (label + strlen (label), sizeof label - strlen (label), "+%s", picked[pick_index]->label);
+                                                }
+
+                                                set->tx_tested++;
+                                                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                                             combined_traces,
+                                                                                                             combined_count));
+                                                assert (measure_selected_node_objective (decoder_model,
+                                                                                        input_d,
+                                                                                        target_d,
+                                                                                        &selection,
+                                                                                        &selected_objective));
+                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                            input_d,
+                                                                                                            target_d,
+                                                                                                            d_route,
+                                                                                                            &node1_objective));
+                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                            input_d,
+                                                                                                            target_d,
+                                                                                                            d_internal.current_internal_node,
+                                                                                                            &node6_objective));
+                                                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                                        itty_feed_model_decoder_objective_t owner_after = { 0 };
+                                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                                    owner_index == 0 ? input_a :
+                                                                                                                    owner_index == 1 ? input_b :
+                                                                                                                                       input_c,
+                                                                                                                    owner_index == 0 ? target_a :
+                                                                                                                    owner_index == 1 ? target_b :
+                                                                                                                                       target_c,
+                                                                                                                    owner_index == 0 ? a_route :
+                                                                                                                    owner_index == 1 ? b_route :
+                                                                                                                                       c_route,
+                                                                                                                    &owner_after));
+                                                        if (!route_objective_not_worse_than_committed (&owner_after,
+                                                                                                      &committed_objectives[owner_index]))
+                                                                selected_safe = false;
+                                                }
+                                                if (measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route ||
+                                                    measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap == 0)
+                                                        selected_safe = false;
+                                                if (selected_objective.selected_distance > committed_objectives[3].selected_distance ||
+                                                    selected_objective.false_negative_vote_deficit > committed_objectives[3].false_negative_vote_deficit ||
+                                                    selected_objective.false_positive_vote_excess > committed_objectives[3].false_positive_vote_excess)
+                                                        selected_safe = false;
+                                                if (node1_objective.selected_popcount <= node6_objective.selected_popcount)
+                                                        selected_safe = false;
+                                                {
+                                                        itty_bit_string_t *node1_activation = NULL;
+                                                        assert (measure_output_activation_for_node (decoder_model,
+                                                                                                   input_d,
+                                                                                                   d_route,
+                                                                                                   &node1_activation));
+                                                        teacher_distance_after = measure_bit_string_distance (node1_activation, teacher_activation);
+                                                        itty_bit_string_free (node1_activation);
+                                                }
+                                                improves = selected_safe &&
+                                                        route_objective_improves_on_committed (&selected_objective, &committed_objectives[3]);
+                                                if (selected_safe)
+                                                        set->tx_selected_safe++;
+                                                if (improves)
+                                                        set->tx_improving++;
+
+                                                if (selected_safe &&
+                                                    (!set->tx_found ||
+                                                     (improves && !route_objective_improves_on_committed (&set->tx_objective_after, &committed_objectives[3])) ||
+                                                     (improves == route_objective_improves_on_committed (&set->tx_objective_after, &committed_objectives[3]) &&
+                                                      route_objective_improves_on_committed (&selected_objective, &set->tx_objective_after)) ||
+                                                     (selected_objective.selected_distance == set->tx_objective_after.selected_distance &&
+                                                      selected_objective.false_positive_vote_excess == set->tx_objective_after.false_positive_vote_excess &&
+                                                      ((ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount) > set->tx_node1_vs_node6_gap_after) ||
+                                                     (selected_objective.selected_distance == set->tx_objective_after.selected_distance &&
+                                                      selected_objective.false_positive_vote_excess == set->tx_objective_after.false_positive_vote_excess &&
+                                                      ((ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount) == set->tx_node1_vs_node6_gap_after &&
+                                                      teacher_distance_after < set->tx_teacher_distance_after) ||
+                                                     (selected_objective.selected_distance == set->tx_objective_after.selected_distance &&
+                                                      selected_objective.false_positive_vote_excess == set->tx_objective_after.false_positive_vote_excess &&
+                                                      ((ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount) == set->tx_node1_vs_node6_gap_after &&
+                                                      teacher_distance_after == set->tx_teacher_distance_after &&
+                                                      combined_count < set->tx_flips))) {
+                                                        set->tx_found = true;
+                                                        snprintf (set->tx_label, sizeof set->tx_label, "%s", label);
+                                                        set->tx_flips = combined_count;
+                                                        set->tx_teacher_distance_after = teacher_distance_after;
+                                                        set->tx_selected_after = selection.selected_by_popcount;
+                                                        set->tx_node1_pop_after = node1_objective.selected_popcount;
+                                                        set->tx_node6_pop_after = node6_objective.selected_popcount;
+                                                        set->tx_node1_vs_node6_gap_after =
+                                                                (ptrdiff_t) node1_objective.selected_popcount -
+                                                                (ptrdiff_t) node6_objective.selected_popcount;
+                                                        set->tx_objective_after = selected_objective;
+                                                        set->tx_trace_count = combined_count;
+                                                        memcpy (set->tx_traces, combined_traces, sizeof set->tx_traces);
+                                                }
+
+                                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                                        }
+                                }
+                        }
+
+                        itty_bit_string_free (teacher_activation);
+                }
+        }
+        for (size_t compare_index = 0; compare_index < sizeof (d_residual_compare) / sizeof (d_residual_compare[0]); compare_index++) {
+                d_residual_compare_summary_t *cmp = &d_residual_compare[compare_index];
+                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                itty_feed_model_train_options_t exact_options = oracle_options;
+                itty_feed_model_selected_clear_set_summary_t direct_summary = { 0 };
+                itty_feed_model_selected_clear_set_summary_t condensed_summary = { 0 };
+                itty_feed_model_selected_clear_set_summary_t exact_summary = { 0 };
+                static struct {
+                        char const *label;
+                        itty_feed_model_final_repair_mode_t mode;
+                        size_t max_flips;
+                } const support_specs[] = {
+                        { "positive-1", ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY, 1 },
+                        { "positive-2", ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY, 2 },
+                        { "positive-4", ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY, 4 },
+                        { "positive-8", ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY, 8 },
+                        { "positive-16", ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY, 16 },
+                        { "balanced-4", ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, 4 },
+                        { "balanced-8", ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, 8 },
+                        { "balanced-16", ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, 16 },
+                };
+                itty_feed_model_segment_node_selection_summary_t selection_before = { 0 };
+                itty_feed_model_decoder_objective_t node1_before = { 0 }, node6_before = { 0 };
+                itty_feed_model_decoder_objective_t owner_after[3] = { 0 };
+                itty_bit_string_t *teacher_activation = NULL;
+                itty_bit_string_t *node1_activation = NULL;
+
+                assert (snapshot);
+                if (compare_index == 0)
+                        structural_flip_pool_count = 0;
+                assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                       input_d,
+                                                                       target_d,
+                                                                       &selection_before));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                           input_d,
+                                                                           target_d,
+                                                                           d_route,
+                                                                           &node1_before));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                           input_d,
+                                                                           target_d,
+                                                                           d_internal.current_internal_node,
+                                                                           &node6_before));
+                cmp->before_selected_node_direct = selection_before.selected_by_popcount;
+                cmp->before_selected_node_exact = selection_before.selected_by_popcount;
+                cmp->before_node1_popcount = node1_before.selected_popcount;
+                cmp->before_node6_popcount = node6_before.selected_popcount;
+                cmp->before_node1_vs_node6_gap = (ptrdiff_t) node1_before.selected_popcount -
+                                                 (ptrdiff_t) node6_before.selected_popcount;
+                assert (build_selected_node_direct_clear_teacher (decoder_model,
+                                                                 input_d,
+                                                                 target_d,
+                                                                 d_route,
+                                                                 cmp->bits,
+                                                                 cmp->bit_count,
+                                                                 &teacher_activation));
+                assert (measure_output_activation_for_node (decoder_model,
+                                                           input_d,
+                                                           d_route,
+                                                           &node1_activation));
+                cmp->teacher_requested_bits = cmp->bit_count;
+                cmp->teacher_distance_before = measure_bit_string_distance (node1_activation,
+                                                                           teacher_activation);
+                itty_bit_string_free (node1_activation);
+                node1_activation = NULL;
+
+                cmp->direct_measured =
+                        itty_feed_model_measure_selected_node_direct_clear_set (decoder_model,
+                                                                               input_d,
+                                                                               target_d,
+                                                                               cmp->bits,
+                                                                               cmp->bit_count,
+                                                                               d_route,
+                                                                               d_internal.current_internal_node,
+                                                                               &direct_summary);
+                if (cmp->direct_measured) {
+                        cmp->direct_selected_node_after = direct_summary.selected_node_after;
+                        cmp->direct_node1_popcount_after = direct_summary.compare_node_a_popcount_after;
+                        cmp->direct_node6_popcount_after = direct_summary.compare_node_b_popcount_after;
+                        cmp->direct_node1_vs_node6_gap_after = (ptrdiff_t) direct_summary.compare_node_a_popcount_after -
+                                                               (ptrdiff_t) direct_summary.compare_node_b_popcount_after;
+                }
+
+                cmp->condensed_measured =
+                        itty_feed_model_measure_selected_node_direct_condensed_clear_set (decoder_model,
+                                                                                         input_d,
+                                                                                         target_d,
+                                                                                         cmp->bits,
+                                                                                         cmp->bit_count,
+                                                                                         d_route,
+                                                                                         d_internal.current_internal_node,
+                                                                                         &condensed_summary);
+                if (cmp->condensed_measured) {
+                        cmp->condensed_selected_node_after = condensed_summary.selected_node_after;
+                        cmp->condensed_node1_popcount_after = condensed_summary.compare_node_a_popcount_after;
+                        cmp->condensed_node6_popcount_after = condensed_summary.compare_node_b_popcount_after;
+                        cmp->condensed_node1_vs_node6_gap_after = (ptrdiff_t) condensed_summary.compare_node_a_popcount_after -
+                                                                  (ptrdiff_t) condensed_summary.compare_node_b_popcount_after;
+                        cmp->condensed_selected_objective_after = condensed_summary.selected_objective_after;
+                }
+
+                exact_options.max_flips = 32;
+                cmp->exact_measured =
+                        itty_feed_model_train_selected_node_direct_clear_set (decoder_model,
+                                                                             input_d,
+                                                                             target_d,
+                                                                             cmp->bits,
+                                                                             cmp->bit_count,
+                                                                             d_route,
+                                                                             d_internal.current_internal_node,
+                                                                             &exact_options,
+                                                                             &exact_summary);
+                if (cmp->exact_measured) {
+                        cmp->exact_selected_node_after = exact_summary.selected_node_after;
+                        cmp->exact_node1_popcount_after = exact_summary.compare_node_a_popcount_after;
+                        cmp->exact_node6_popcount_after = exact_summary.compare_node_b_popcount_after;
+                        cmp->exact_node1_vs_node6_gap_after = (ptrdiff_t) exact_summary.compare_node_a_popcount_after -
+                                                              (ptrdiff_t) exact_summary.compare_node_b_popcount_after;
+
+                        if (compare_index == 0 && cmp->bit_count == 1) {
+                                d_exact_25_trace_block_count =
+                                        itty_feed_model_collect_final_layer_mask_flip_traces (decoder_model,
+                                                                                              snapshot,
+                                                                                              d_exact_25_trace_block,
+                                                                                              sizeof d_exact_25_trace_block / sizeof (d_exact_25_trace_block[0]));
+                        }
+
+                        {
+                                itty_feed_model_layer_state_snapshot_t *post_exact_snapshot =
+                                        itty_feed_model_snapshot_final_layer_state (decoder_model);
+
+                                assert (post_exact_snapshot);
+                                for (size_t spec_index = 0; spec_index < sizeof (support_specs) / sizeof (support_specs[0]); spec_index++) {
+                                        itty_feed_model_layer_state_snapshot_t *candidate_snapshot =
+                                                itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                        itty_feed_model_train_options_t support_options = oracle_options;
+                                        itty_feed_model_train_stats_t support_stats = { 0 };
+                                        itty_feed_model_final_repair_mode_summary_t support_summary = { 0 };
+                                        itty_feed_model_segment_node_selection_summary_t support_selection = { 0 };
+                                        itty_feed_model_decoder_objective_t support_selected_objective = { 0 };
+                                        itty_feed_model_decoder_objective_t support_node1_objective = { 0 };
+                                        itty_feed_model_decoder_objective_t support_node6_objective = { 0 };
+                                        bool owners_ok = true;
+                                        bool selected_safe;
+                                        bool improves;
+                                        itty_bit_string_t *support_node1_activation = NULL;
+                                        size_t teacher_distance_after = 0;
+
+                                        assert (candidate_snapshot);
+                                        support_options.max_flips = support_specs[spec_index].max_flips;
+                                        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                                    input_d,
+                                                                                                                    target_d,
+                                                                                                                    d_route,
+                                                                                                                    &support_options,
+                                                                                                                    support_specs[spec_index].mode,
+                                                                                                                    &support_stats,
+                                                                                                                    &support_summary));
+                                        assert (measure_selected_node_objective (decoder_model,
+                                                                                input_d,
+                                                                                target_d,
+                                                                                &support_selection,
+                                                                                &support_selected_objective));
+                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                    input_d,
+                                                                                                    target_d,
+                                                                                                    d_route,
+                                                                                                    &support_node1_objective));
+                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                    input_d,
+                                                                                                    target_d,
+                                                                                                    d_internal.current_internal_node,
+                                                                                                    &support_node6_objective));
+                                        assert (measure_output_activation_for_node (decoder_model,
+                                                                                   input_d,
+                                                                                   d_route,
+                                                                                   &support_node1_activation));
+                                        teacher_distance_after = measure_bit_string_distance (support_node1_activation,
+                                                                                              teacher_activation);
+                                        itty_bit_string_free (support_node1_activation);
+                                        for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                            owner_index == 0 ? input_a :
+                                                                                                            owner_index == 1 ? input_b :
+                                                                                                                               input_c,
+                                                                                                            owner_index == 0 ? target_a :
+                                                                                                            owner_index == 1 ? target_b :
+                                                                                                                               target_c,
+                                                                                                            owner_index == 0 ? a_route :
+                                                                                                            owner_index == 1 ? b_route :
+                                                                                                                               c_route,
+                                                                                                            &owner_after[owner_index]));
+                                                if (!route_objective_not_worse_than_committed (&owner_after[owner_index],
+                                                                                              &committed_objectives[owner_index]))
+                                                        owners_ok = false;
+                                        }
+
+                                        selected_safe =
+                                                measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route == d_route &&
+                                                support_node1_objective.selected_popcount > support_node6_objective.selected_popcount &&
+                                                owners_ok &&
+                                                support_selected_objective.false_negative_vote_deficit == 0 &&
+                                                route_objective_not_worse_than_committed (&support_selected_objective,
+                                                                                         &committed_objectives[3]);
+                                        improves =
+                                                selected_safe &&
+                                                route_objective_improves_on_committed (&support_selected_objective,
+                                                                                      &committed_objectives[3]);
+
+                                        if (selected_safe &&
+                                            teacher_distance_after < cmp->teacher_distance_before &&
+                                            (!cmp->support_found ||
+                                             teacher_distance_after < cmp->teacher_distance_after ||
+                                             (teacher_distance_after == cmp->teacher_distance_after &&
+                                              support_stats.flips < cmp->support_flips) ||
+                                             (teacher_distance_after == cmp->teacher_distance_after &&
+                                              support_stats.flips == cmp->support_flips &&
+                                              route_objective_improves_on_committed (&support_selected_objective,
+                                                                                    &cmp->support_selected_objective_after)))) {
+                                                cmp->support_found = true;
+                                                cmp->support_label = support_specs[spec_index].label;
+                                                cmp->support_budget = support_specs[spec_index].max_flips;
+                                                cmp->support_candidate_count = support_summary.candidate_count;
+                                                cmp->support_accepted_candidates = support_summary.accepted_candidates;
+                                                cmp->support_flips = support_stats.flips;
+                                                cmp->teacher_distance_after = teacher_distance_after;
+                                                cmp->support_a_ok = route_objective_not_worse_than_committed (&owner_after[0], &committed_objectives[0]);
+                                                cmp->support_b_ok = route_objective_not_worse_than_committed (&owner_after[1], &committed_objectives[1]);
+                                                cmp->support_c_ok = route_objective_not_worse_than_committed (&owner_after[2], &committed_objectives[2]);
+                                                cmp->support_selected_node_after = support_selection.selected_by_popcount;
+                                                cmp->support_node1_popcount_after = support_node1_objective.selected_popcount;
+                                                cmp->support_node6_popcount_after = support_node6_objective.selected_popcount;
+                                                cmp->support_node1_vs_node6_gap_after =
+                                                        (ptrdiff_t) support_node1_objective.selected_popcount -
+                                                        (ptrdiff_t) support_node6_objective.selected_popcount;
+                                                cmp->support_selected_objective_after = support_selected_objective;
+                                        }
+
+                                        if (compare_index == 0 && cmp->bit_count == 1 && support_stats.flips > 0) {
+                                                itty_feed_model_mask_flip_trace_t traces[64] = { 0 };
+                                                size_t trace_count =
+                                                        itty_feed_model_collect_final_layer_mask_flip_traces (decoder_model,
+                                                                                                              candidate_snapshot,
+                                                                                                              traces,
+                                                                                                              sizeof traces / sizeof (traces[0]));
+
+                                                for (size_t trace_index = 0; trace_index < trace_count; trace_index++) {
+                                                        bool duplicate = false;
+
+                                                        for (size_t pool_index = 0; pool_index < structural_flip_pool_count; pool_index++) {
+                                                                if (structural_flip_pool[pool_index].trace.node_index == traces[trace_index].node_index &&
+                                                                    structural_flip_pool[pool_index].trace.input_index == traces[trace_index].input_index &&
+                                                                    structural_flip_pool[pool_index].trace.bit_index == traces[trace_index].bit_index &&
+                                                                    structural_flip_pool[pool_index].trace.value_after == traces[trace_index].value_after) {
+                                                                        duplicate = true;
+                                                                        break;
+                                                                }
+                                                        }
+
+                                                        if (!duplicate && structural_flip_pool_count < sizeof (structural_flip_pool) / sizeof (structural_flip_pool[0])) {
+                                                                structural_flip_pool[structural_flip_pool_count].trace = traces[trace_index];
+                                                                snprintf (structural_flip_pool[structural_flip_pool_count].source,
+                                                                          sizeof structural_flip_pool[structural_flip_pool_count].source,
+                                                                          "support:%s",
+                                                                          support_specs[spec_index].label);
+                                                                structural_flip_pool_count++;
+                                                        }
+                                                }
+                                        }
+
+                                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, candidate_snapshot);
+                                }
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, post_exact_snapshot);
+                        }
+                        {
+                                itty_feed_model_layer_state_snapshot_t *post_exact_snapshot =
+                                        itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                struct {
+                                        char const *label;
+                                        size_t      target_node;
+                                        itty_feed_model_final_repair_mode_t mode;
+                                        size_t      max_flips;
+                                } const teacher_specs[] = {
+                                        { "node1-positive-4", d_route, ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY, 4 },
+                                        { "node1-positive-8", d_route, ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY, 8 },
+                                        { "node1-positive-16", d_route, ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY, 16 },
+                                        { "node1-balanced-8", d_route, ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, 8 },
+                                        { "node1-balanced-16", d_route, ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, 16 },
+                                        { "node6-zero-4", d_internal.current_internal_node, ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY, 4 },
+                                        { "node6-zero-8", d_internal.current_internal_node, ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY, 8 },
+                                        { "node6-zero-16", d_internal.current_internal_node, ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY, 16 },
+                                        { "node6-balanced-8", d_internal.current_internal_node, ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, 8 },
+                                        { "node6-balanced-16", d_internal.current_internal_node, ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED, 16 },
+                                };
+
+                                assert (post_exact_snapshot);
+                                for (size_t first_index = 0; first_index < sizeof (teacher_specs) / sizeof (teacher_specs[0]); first_index++) {
+                                        for (size_t second_index = 0;
+                                             second_index <= sizeof (teacher_specs) / sizeof (teacher_specs[0]);
+                                             second_index++) {
+                                                itty_feed_model_layer_state_snapshot_t *candidate_snapshot =
+                                                        itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                                itty_feed_model_decoder_objective_t candidate_owner_after[3] = { 0 };
+                                                itty_feed_model_decoder_objective_t candidate_selected_objective = { 0 };
+                                                itty_feed_model_decoder_objective_t candidate_node1 = { 0 };
+                                                itty_feed_model_decoder_objective_t candidate_node6 = { 0 };
+                                                itty_feed_model_segment_node_selection_summary_t candidate_selection = { 0 };
+                                                size_t teacher_distance_after = 0;
+                                                size_t total_flips = 0;
+                                                bool owners_ok = true;
+                                                bool selected_safe;
+                                                char label[96];
+
+                                                assert (candidate_snapshot);
+                                                snprintf (label, sizeof label, "%s", teacher_specs[first_index].label);
+                                                for (size_t step_index = 0; step_index < (second_index < sizeof (teacher_specs) / sizeof (teacher_specs[0]) ? 2 : 1); step_index++) {
+                                                        size_t spec_index = step_index == 0 ? first_index : second_index;
+                                                        itty_feed_model_train_options_t teacher_options = oracle_options;
+                                                        itty_feed_model_train_stats_t teacher_stats = { 0 };
+                                                        itty_feed_model_final_repair_mode_summary_t teacher_summary = { 0 };
+
+                                                        teacher_options.max_flips = teacher_specs[spec_index].max_flips;
+                                                        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                                                    input_d,
+                                                                                                                                    target_d,
+                                                                                                                                    teacher_specs[spec_index].target_node,
+                                                                                                                                    &teacher_options,
+                                                                                                                                    teacher_specs[spec_index].mode,
+                                                                                                                                    &teacher_stats,
+                                                                                                                                    &teacher_summary));
+                                                        total_flips += teacher_stats.flips;
+                                                        if (step_index == 1) {
+                                                                snprintf (label + strlen (label),
+                                                                          sizeof label - strlen (label),
+                                                                          " -> %s",
+                                                                          teacher_specs[spec_index].label);
+                                                        }
+                                                }
+
+                                                assert (measure_selected_node_objective (decoder_model,
+                                                                                        input_d,
+                                                                                        target_d,
+                                                                                        &candidate_selection,
+                                                                                        &candidate_selected_objective));
+                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                            input_d,
+                                                                                                            target_d,
+                                                                                                            d_route,
+                                                                                                            &candidate_node1));
+                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                            input_d,
+                                                                                                            target_d,
+                                                                                                            d_internal.current_internal_node,
+                                                                                                            &candidate_node6));
+                                                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                                    owner_index == 0 ? input_a :
+                                                                                                                    owner_index == 1 ? input_b :
+                                                                                                                                       input_c,
+                                                                                                                    owner_index == 0 ? target_a :
+                                                                                                                    owner_index == 1 ? target_b :
+                                                                                                                                       target_c,
+                                                                                                                    owner_index == 0 ? a_route :
+                                                                                                                    owner_index == 1 ? b_route :
+                                                                                                                                       c_route,
+                                                                                                                    &candidate_owner_after[owner_index]));
+                                                        if (!route_objective_not_worse_than_committed (&candidate_owner_after[owner_index],
+                                                                                                      &committed_objectives[owner_index]))
+                                                                owners_ok = false;
+                                                }
+                                                {
+                                                        itty_bit_string_t *candidate_node1_activation = NULL;
+                                                        assert (measure_output_activation_for_node (decoder_model,
+                                                                                                   input_d,
+                                                                                                   d_route,
+                                                                                                   &candidate_node1_activation));
+                                                        teacher_distance_after = measure_bit_string_distance (candidate_node1_activation,
+                                                                                                              teacher_activation);
+                                                        itty_bit_string_free (candidate_node1_activation);
+                                                }
+
+                                                selected_safe =
+                                                        measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route == d_route &&
+                                                        candidate_node1.selected_popcount > candidate_node6.selected_popcount &&
+                                                        owners_ok &&
+                                                        candidate_selected_objective.false_negative_vote_deficit == 0 &&
+                                                        route_objective_not_worse_than_committed (&candidate_selected_objective,
+                                                                                                 &committed_objectives[3]);
+
+                                                if (selected_safe &&
+                                                    teacher_distance_after < cmp->teacher_distance_before &&
+                                                    (!cmp->teacher_search_found ||
+                                                     route_objective_improves_on_committed (&candidate_selected_objective,
+                                                                                           &cmp->teacher_search_selected_objective_after) ||
+                                                     (candidate_selected_objective.selected_distance == cmp->teacher_search_selected_objective_after.selected_distance &&
+                                                      candidate_selected_objective.false_positive_vote_excess == cmp->teacher_search_selected_objective_after.false_positive_vote_excess &&
+                                                      teacher_distance_after < cmp->teacher_search_distance_after) ||
+                                                     (candidate_selected_objective.selected_distance == cmp->teacher_search_selected_objective_after.selected_distance &&
+                                                      candidate_selected_objective.false_positive_vote_excess == cmp->teacher_search_selected_objective_after.false_positive_vote_excess &&
+                                                      teacher_distance_after == cmp->teacher_search_distance_after &&
+                                                      total_flips < cmp->teacher_search_flips))) {
+                                                        cmp->teacher_search_found = true;
+                                                        snprintf (cmp->teacher_search_label,
+                                                                  sizeof cmp->teacher_search_label,
+                                                                  "%s",
+                                                                  label);
+                                                        cmp->teacher_search_flips = total_flips;
+                                                        cmp->teacher_search_selected_node_after = candidate_selection.selected_by_popcount;
+                                                        cmp->teacher_search_node1_popcount_after = candidate_node1.selected_popcount;
+                                                        cmp->teacher_search_node6_popcount_after = candidate_node6.selected_popcount;
+                                                        cmp->teacher_search_node1_vs_node6_gap_after =
+                                                                (ptrdiff_t) candidate_node1.selected_popcount -
+                                                                (ptrdiff_t) candidate_node6.selected_popcount;
+                                                        cmp->teacher_search_distance_after = teacher_distance_after;
+                                                        cmp->teacher_search_selected_objective_after = candidate_selected_objective;
+                                                }
+
+                                                if (compare_index == 0 && cmp->bit_count == 1 && total_flips > 0) {
+                                                        itty_feed_model_mask_flip_trace_t traces[64] = { 0 };
+                                                        size_t trace_count =
+                                                                itty_feed_model_collect_final_layer_mask_flip_traces (decoder_model,
+                                                                                                                      candidate_snapshot,
+                                                                                                                      traces,
+                                                                                                                      sizeof traces / sizeof (traces[0]));
+
+                                                        for (size_t trace_index = 0; trace_index < trace_count; trace_index++) {
+                                                                bool duplicate = false;
+
+                                                                for (size_t pool_index = 0; pool_index < structural_flip_pool_count; pool_index++) {
+                                                                        if (structural_flip_pool[pool_index].trace.node_index == traces[trace_index].node_index &&
+                                                                            structural_flip_pool[pool_index].trace.input_index == traces[trace_index].input_index &&
+                                                                            structural_flip_pool[pool_index].trace.bit_index == traces[trace_index].bit_index &&
+                                                                            structural_flip_pool[pool_index].trace.value_after == traces[trace_index].value_after) {
+                                                                                duplicate = true;
+                                                                                break;
+                                                                        }
+                                                                }
+
+                                                                if (!duplicate && structural_flip_pool_count < sizeof (structural_flip_pool) / sizeof (structural_flip_pool[0])) {
+                                                                        structural_flip_pool[structural_flip_pool_count].trace = traces[trace_index];
+                                                                        snprintf (structural_flip_pool[structural_flip_pool_count].source,
+                                                                                  sizeof structural_flip_pool[structural_flip_pool_count].source,
+                                                                                  "teacher:%s",
+                                                                                  label);
+                                                                        structural_flip_pool_count++;
+                                                                }
+                                                        }
+                                                }
+
+                                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, candidate_snapshot);
+                                        }
+                                }
+
+                                if (compare_index == 0 && cmp->bit_count == 1) {
+                                        cmp->structural_pool_count = structural_flip_pool_count;
+
+                                        for (size_t first_index = 0; first_index < structural_flip_pool_count; first_index++) {
+                                                for (size_t second_index = first_index;
+                                                     second_index < structural_flip_pool_count;
+                                                     second_index++) {
+                                                        for (size_t third_index = second_index;
+                                                             third_index < structural_flip_pool_count;
+                                                             third_index++) {
+                                                                itty_feed_model_mask_flip_trace_t candidate_traces[3] = { 0 };
+                                                                size_t candidate_trace_count = 0;
+                                                                size_t candidate_indices[3] = {
+                                                                        first_index,
+                                                                        second_index,
+                                                                        third_index,
+                                                                };
+                                                                itty_feed_model_layer_state_snapshot_t *candidate_snapshot =
+                                                                        itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                                                itty_feed_model_decoder_objective_t candidate_owner_after[3] = { 0 };
+                                                                itty_feed_model_decoder_objective_t candidate_selected_objective = { 0 };
+                                                                itty_feed_model_decoder_objective_t candidate_node1 = { 0 };
+                                                                itty_feed_model_decoder_objective_t candidate_node6 = { 0 };
+                                                                itty_feed_model_segment_node_selection_summary_t candidate_selection = { 0 };
+                                                                size_t teacher_distance_after = 0;
+                                                                bool owners_ok = true;
+                                                                bool selected_safe;
+                                                                bool improves;
+                                                                char label[96] = { 0 };
+
+                                                                assert (candidate_snapshot);
+                                                                for (size_t pick_index = 0; pick_index < 3; pick_index++) {
+                                                                        bool already_picked = false;
+
+                                                                        for (size_t existing_index = 0; existing_index < candidate_trace_count; existing_index++) {
+                                                                                if (candidate_indices[pick_index] == candidate_indices[existing_index]) {
+                                                                                        already_picked = true;
+                                                                                        break;
+                                                                                }
+                                                                        }
+                                                                        if (already_picked)
+                                                                                continue;
+
+                                                                        candidate_traces[candidate_trace_count] =
+                                                                                structural_flip_pool[candidate_indices[pick_index]].trace;
+                                                                        if (candidate_trace_count == 0) {
+                                                                                snprintf (label,
+                                                                                          sizeof label,
+                                                                                          "%s",
+                                                                                          structural_flip_pool[candidate_indices[pick_index]].source);
+                                                                        } else {
+                                                                                snprintf (label + strlen (label),
+                                                                                          sizeof label - strlen (label),
+                                                                                          "+%s",
+                                                                                          structural_flip_pool[candidate_indices[pick_index]].source);
+                                                                        }
+                                                                        candidate_trace_count++;
+                                                                }
+
+                                                                if (candidate_trace_count == 0) {
+                                                                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, candidate_snapshot);
+                                                                        continue;
+                                                                }
+
+                                                                cmp->structural_blocks_tested++;
+                                                                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                                                             candidate_traces,
+                                                                                                                             candidate_trace_count));
+                                                                assert (measure_selected_node_objective (decoder_model,
+                                                                                                        input_d,
+                                                                                                        target_d,
+                                                                                                        &candidate_selection,
+                                                                                                        &candidate_selected_objective));
+                                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                                            input_d,
+                                                                                                                            target_d,
+                                                                                                                            d_route,
+                                                                                                                            &candidate_node1));
+                                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                                            input_d,
+                                                                                                                            target_d,
+                                                                                                                            d_internal.current_internal_node,
+                                                                                                                            &candidate_node6));
+                                                                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                                                    owner_index == 0 ? input_a :
+                                                                                                                                    owner_index == 1 ? input_b :
+                                                                                                                                                       input_c,
+                                                                                                                                    owner_index == 0 ? target_a :
+                                                                                                                                    owner_index == 1 ? target_b :
+                                                                                                                                                       target_c,
+                                                                                                                                    owner_index == 0 ? a_route :
+                                                                                                                                    owner_index == 1 ? b_route :
+                                                                                                                                                       c_route,
+                                                                                                                                    &candidate_owner_after[owner_index]));
+                                                                        if (!route_objective_not_worse_than_committed (&candidate_owner_after[owner_index],
+                                                                                                                      &committed_objectives[owner_index]))
+                                                                                owners_ok = false;
+                                                                }
+                                                                {
+                                                                        itty_bit_string_t *candidate_node1_activation = NULL;
+                                                                        assert (measure_output_activation_for_node (decoder_model,
+                                                                                                                   input_d,
+                                                                                                                   d_route,
+                                                                                                                   &candidate_node1_activation));
+                                                                        teacher_distance_after = measure_bit_string_distance (candidate_node1_activation,
+                                                                                                                              teacher_activation);
+                                                                        itty_bit_string_free (candidate_node1_activation);
+                                                                }
+
+                                                                selected_safe =
+                                                                        candidate_node1.selected_popcount > candidate_node6.selected_popcount &&
+                                                                        owners_ok &&
+                                                                        candidate_selected_objective.false_negative_vote_deficit == 0 &&
+                                                                        route_objective_not_worse_than_committed (&candidate_selected_objective,
+                                                                                                                 &committed_objectives[3]);
+                                                                improves =
+                                                                        selected_safe &&
+                                                                        route_objective_improves_on_committed (&candidate_selected_objective,
+                                                                                                              &committed_objectives[3]);
+
+                                                                if (selected_safe)
+                                                                        cmp->structural_selected_safe_blocks++;
+                                                                if (improves)
+                                                                        cmp->structural_improving_blocks++;
+
+                                                                if (selected_safe &&
+                                                                    (!cmp->structural_found ||
+                                                                     (improves &&
+                                                                      !route_objective_improves_on_committed (&cmp->structural_selected_objective_after,
+                                                                                                             &committed_objectives[3])) ||
+                                                                     (improves ==
+                                                                      route_objective_improves_on_committed (&cmp->structural_selected_objective_after,
+                                                                                                           &committed_objectives[3]) &&
+                                                                      route_objective_improves_on_committed (&candidate_selected_objective,
+                                                                                                            &cmp->structural_selected_objective_after)) ||
+                                                                     (candidate_selected_objective.selected_distance == cmp->structural_selected_objective_after.selected_distance &&
+                                                                      candidate_selected_objective.false_positive_vote_excess == cmp->structural_selected_objective_after.false_positive_vote_excess &&
+                                                                      teacher_distance_after < cmp->structural_teacher_distance_after) ||
+                                                                     (candidate_selected_objective.selected_distance == cmp->structural_selected_objective_after.selected_distance &&
+                                                                      candidate_selected_objective.false_positive_vote_excess == cmp->structural_selected_objective_after.false_positive_vote_excess &&
+                                                                      teacher_distance_after == cmp->structural_teacher_distance_after &&
+                                                                      candidate_trace_count < cmp->structural_flips))) {
+                                                                        cmp->structural_found = true;
+                                                                        snprintf (cmp->structural_label,
+                                                                                  sizeof cmp->structural_label,
+                                                                                  "%s",
+                                                                                  label);
+                                                                        cmp->structural_flips = candidate_trace_count;
+                                                                        cmp->structural_teacher_distance_after = teacher_distance_after;
+                                                                        cmp->structural_selected_node_after = candidate_selection.selected_by_popcount;
+                                                                        cmp->structural_node1_popcount_after = candidate_node1.selected_popcount;
+                                                                        cmp->structural_node6_popcount_after = candidate_node6.selected_popcount;
+                                                                        cmp->structural_node1_vs_node6_gap_after =
+                                                                                (ptrdiff_t) candidate_node1.selected_popcount -
+                                                                                (ptrdiff_t) candidate_node6.selected_popcount;
+                                                                        cmp->structural_selected_objective_after = candidate_selected_objective;
+                                                                }
+
+                                                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, candidate_snapshot);
+                                                        }
+                                                }
+                                        }
+
+                                        {
+                                                typedef struct {
+                                                        itty_feed_model_mask_flip_trace_t trace;
+                                                        char        label[48];
+                                                        bool        owners_ok;
+                                                        bool        selected_safe;
+                                                        size_t      selected_distance;
+                                                        size_t      selected_excess;
+                                                        size_t      teacher_distance;
+                                                        ptrdiff_t   gap;
+                                                } expanded_effect_candidate_t;
+                                                size_t node_indices[2] = {
+                                                        d_route,
+                                                        d_internal.current_internal_node,
+                                                };
+                                                itty_feed_model_mask_flip_trace_t expanded_traces[512] = { 0 };
+                                                expanded_effect_candidate_t best_candidates[16] = { 0 };
+                                                size_t expanded_trace_count =
+                                                        itty_feed_model_collect_final_layer_toggle_traces_for_nodes (decoder_model,
+                                                                                                                      node_indices,
+                                                                                                                      2,
+                                                                                                                      expanded_traces,
+                                                                                                                      sizeof expanded_traces / sizeof (expanded_traces[0]));
+                                                size_t best_candidate_count = 0;
+
+                                                cmp->expanded_pool_count = expanded_trace_count;
+                                                for (size_t trace_index = 0; trace_index < expanded_trace_count; trace_index++) {
+                                                        itty_feed_model_layer_state_snapshot_t *candidate_snapshot =
+                                                                itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                                        itty_feed_model_decoder_objective_t candidate_owner_after[3] = { 0 };
+                                                        itty_feed_model_decoder_objective_t candidate_selected_objective = { 0 };
+                                                        itty_feed_model_decoder_objective_t candidate_node1 = { 0 };
+                                                        itty_feed_model_decoder_objective_t candidate_node6 = { 0 };
+                                                        itty_feed_model_segment_node_selection_summary_t candidate_selection = { 0 };
+                                                        expanded_effect_candidate_t candidate = {
+                                                                .trace = expanded_traces[trace_index],
+                                                        };
+                                                        bool interesting = false;
+
+                                                        assert (candidate_snapshot);
+                                                        assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                                                     &expanded_traces[trace_index],
+                                                                                                                     1));
+                                                        assert (measure_selected_node_objective (decoder_model,
+                                                                                                input_d,
+                                                                                                target_d,
+                                                                                                &candidate_selection,
+                                                                                                &candidate_selected_objective));
+                                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                                    input_d,
+                                                                                                                    target_d,
+                                                                                                                    d_route,
+                                                                                                                    &candidate_node1));
+                                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                                    input_d,
+                                                                                                                    target_d,
+                                                                                                                    d_internal.current_internal_node,
+                                                                                                                    &candidate_node6));
+                                                        candidate.owners_ok = true;
+                                                        for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                                            owner_index == 0 ? input_a :
+                                                                                                                            owner_index == 1 ? input_b :
+                                                                                                                                               input_c,
+                                                                                                                            owner_index == 0 ? target_a :
+                                                                                                                            owner_index == 1 ? target_b :
+                                                                                                                                               target_c,
+                                                                                                                            owner_index == 0 ? a_route :
+                                                                                                                            owner_index == 1 ? b_route :
+                                                                                                                                               c_route,
+                                                                                                                            &candidate_owner_after[owner_index]));
+                                                                if (!route_objective_not_worse_than_committed (&candidate_owner_after[owner_index],
+                                                                                                              &committed_objectives[owner_index]))
+                                                                        candidate.owners_ok = false;
+                                                        }
+                                                        {
+                                                                itty_bit_string_t *candidate_node1_activation = NULL;
+                                                                assert (measure_output_activation_for_node (decoder_model,
+                                                                                                           input_d,
+                                                                                                           d_route,
+                                                                                                           &candidate_node1_activation));
+                                                                candidate.teacher_distance = measure_bit_string_distance (candidate_node1_activation,
+                                                                                                                          teacher_activation);
+                                                                itty_bit_string_free (candidate_node1_activation);
+                                                        }
+                                                        candidate.selected_distance = candidate_selected_objective.selected_distance;
+                                                        candidate.selected_excess = candidate_selected_objective.false_positive_vote_excess;
+                                                        candidate.gap = (ptrdiff_t) candidate_node1.selected_popcount -
+                                                                        (ptrdiff_t) candidate_node6.selected_popcount;
+                                                        candidate.selected_safe =
+                                                                candidate.owners_ok &&
+                                                                candidate_node1.selected_popcount > candidate_node6.selected_popcount &&
+                                                                candidate_selected_objective.false_negative_vote_deficit == 0 &&
+                                                                route_objective_not_worse_than_committed (&candidate_selected_objective,
+                                                                                                         &committed_objectives[3]);
+                                                        interesting =
+                                                                candidate.selected_safe ||
+                                                                candidate.teacher_distance < cmp->teacher_distance_before ||
+                                                                candidate.gap > cmp->exact_node1_vs_node6_gap_after ||
+                                                                candidate.selected_distance < committed_objectives[3].selected_distance ||
+                                                                candidate.selected_excess < committed_objectives[3].false_positive_vote_excess;
+                                                        snprintf (candidate.label,
+                                                                  sizeof candidate.label,
+                                                                  "n%zu.i%zu.b%zu=%d",
+                                                                  candidate.trace.node_index,
+                                                                  candidate.trace.input_index,
+                                                                  candidate.trace.bit_index,
+                                                                  candidate.trace.value_after ? 1 : 0);
+
+                                                        if (interesting) {
+                                                                size_t insert_index = best_candidate_count;
+
+                                                                for (size_t candidate_index = 0; candidate_index < best_candidate_count; candidate_index++) {
+                                                                        bool better =
+                                                                                (candidate.selected_safe && !best_candidates[candidate_index].selected_safe) ||
+                                                                                (candidate.selected_safe == best_candidates[candidate_index].selected_safe &&
+                                                                                 candidate.selected_distance < best_candidates[candidate_index].selected_distance) ||
+                                                                                (candidate.selected_safe == best_candidates[candidate_index].selected_safe &&
+                                                                                 candidate.selected_distance == best_candidates[candidate_index].selected_distance &&
+                                                                                 candidate.selected_excess < best_candidates[candidate_index].selected_excess) ||
+                                                                                (candidate.selected_safe == best_candidates[candidate_index].selected_safe &&
+                                                                                 candidate.selected_distance == best_candidates[candidate_index].selected_distance &&
+                                                                                 candidate.selected_excess == best_candidates[candidate_index].selected_excess &&
+                                                                                 candidate.teacher_distance < best_candidates[candidate_index].teacher_distance) ||
+                                                                                (candidate.selected_safe == best_candidates[candidate_index].selected_safe &&
+                                                                                 candidate.selected_distance == best_candidates[candidate_index].selected_distance &&
+                                                                                 candidate.selected_excess == best_candidates[candidate_index].selected_excess &&
+                                                                                 candidate.teacher_distance == best_candidates[candidate_index].teacher_distance &&
+                                                                                 candidate.gap > best_candidates[candidate_index].gap);
+
+                                                                        if (better) {
+                                                                                insert_index = candidate_index;
+                                                                                break;
+                                                                        }
+                                                                }
+
+                                                                if (insert_index < 16) {
+                                                                        if (best_candidate_count < 16)
+                                                                                best_candidate_count++;
+                                                                        for (size_t move_index = best_candidate_count - 1;
+                                                                             move_index > insert_index;
+                                                                             move_index--)
+                                                                                best_candidates[move_index] = best_candidates[move_index - 1];
+                                                                        best_candidates[insert_index] = candidate;
+                                                                }
+                                                        }
+
+                                                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, candidate_snapshot);
+                                                }
+
+                                                for (size_t first_index = 0; first_index < best_candidate_count; first_index++) {
+                                                        for (size_t second_index = first_index;
+                                                             second_index < best_candidate_count;
+                                                             second_index++) {
+                                                                for (size_t third_index = second_index;
+                                                                     third_index < best_candidate_count;
+                                                                     third_index++) {
+                                                                        expanded_effect_candidate_t const *picked[3] = {
+                                                                                &best_candidates[first_index],
+                                                                                &best_candidates[second_index],
+                                                                                &best_candidates[third_index],
+                                                                        };
+                                                                        itty_feed_model_mask_flip_trace_t candidate_traces[3] = { 0 };
+                                                                        size_t candidate_trace_count = 0;
+                                                                        itty_feed_model_layer_state_snapshot_t *candidate_snapshot =
+                                                                                itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                                                        itty_feed_model_decoder_objective_t candidate_owner_after[3] = { 0 };
+                                                                        itty_feed_model_decoder_objective_t candidate_selected_objective = { 0 };
+                                                                        itty_feed_model_decoder_objective_t candidate_node1 = { 0 };
+                                                                        itty_feed_model_decoder_objective_t candidate_node6 = { 0 };
+                                                                        itty_feed_model_segment_node_selection_summary_t candidate_selection = { 0 };
+                                                                        size_t teacher_distance_after = 0;
+                                                                        bool owners_ok = true;
+                                                                        bool selected_safe;
+                                                                        bool improves;
+                                                                        char label[96] = { 0 };
+
+                                                                        assert (candidate_snapshot);
+                                                                        for (size_t pick_index = 0; pick_index < 3; pick_index++) {
+                                                                                bool already_picked = false;
+
+                                                                                for (size_t existing_index = 0; existing_index < candidate_trace_count; existing_index++) {
+                                                                                        if (candidate_traces[existing_index].node_index == picked[pick_index]->trace.node_index &&
+                                                                                            candidate_traces[existing_index].input_index == picked[pick_index]->trace.input_index &&
+                                                                                            candidate_traces[existing_index].bit_index == picked[pick_index]->trace.bit_index &&
+                                                                                            candidate_traces[existing_index].value_after == picked[pick_index]->trace.value_after) {
+                                                                                                already_picked = true;
+                                                                                                break;
+                                                                                        }
+                                                                                }
+                                                                                if (already_picked)
+                                                                                        continue;
+
+                                                                                candidate_traces[candidate_trace_count++] = picked[pick_index]->trace;
+                                                                                if (strlen (label) == 0)
+                                                                                        snprintf (label, sizeof label, "%s", picked[pick_index]->label);
+                                                                                else
+                                                                                        snprintf (label + strlen (label),
+                                                                                                  sizeof label - strlen (label),
+                                                                                                  "+%s",
+                                                                                                  picked[pick_index]->label);
+                                                                        }
+
+                                                                        if (candidate_trace_count == 0) {
+                                                                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, candidate_snapshot);
+                                                                                continue;
+                                                                        }
+
+                                                                        cmp->expanded_blocks_tested++;
+                                                                        assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                                                                     candidate_traces,
+                                                                                                                                     candidate_trace_count));
+                                                                        assert (measure_selected_node_objective (decoder_model,
+                                                                                                                input_d,
+                                                                                                                target_d,
+                                                                                                                &candidate_selection,
+                                                                                                                &candidate_selected_objective));
+                                                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                                                    input_d,
+                                                                                                                                    target_d,
+                                                                                                                                    d_route,
+                                                                                                                                    &candidate_node1));
+                                                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                                                    input_d,
+                                                                                                                                    target_d,
+                                                                                                                                    d_internal.current_internal_node,
+                                                                                                                                    &candidate_node6));
+                                                                        for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                                                            owner_index == 0 ? input_a :
+                                                                                                                                            owner_index == 1 ? input_b :
+                                                                                                                                                               input_c,
+                                                                                                                                            owner_index == 0 ? target_a :
+                                                                                                                                            owner_index == 1 ? target_b :
+                                                                                                                                                               target_c,
+                                                                                                                                            owner_index == 0 ? a_route :
+                                                                                                                                            owner_index == 1 ? b_route :
+                                                                                                                                                               c_route,
+                                                                                                                                            &candidate_owner_after[owner_index]));
+                                                                                if (!route_objective_not_worse_than_committed (&candidate_owner_after[owner_index],
+                                                                                                                              &committed_objectives[owner_index]))
+                                                                                        owners_ok = false;
+                                                                        }
+                                                                        {
+                                                                                itty_bit_string_t *candidate_node1_activation = NULL;
+                                                                                assert (measure_output_activation_for_node (decoder_model,
+                                                                                                                           input_d,
+                                                                                                                           d_route,
+                                                                                                                           &candidate_node1_activation));
+                                                                                teacher_distance_after = measure_bit_string_distance (candidate_node1_activation,
+                                                                                                                                      teacher_activation);
+                                                                                itty_bit_string_free (candidate_node1_activation);
+                                                                        }
+                                                                        selected_safe =
+                                                                                owners_ok &&
+                                                                                candidate_node1.selected_popcount > candidate_node6.selected_popcount &&
+                                                                                candidate_selected_objective.false_negative_vote_deficit == 0 &&
+                                                                                route_objective_not_worse_than_committed (&candidate_selected_objective,
+                                                                                                                         &committed_objectives[3]);
+                                                                        improves =
+                                                                                selected_safe &&
+                                                                                route_objective_improves_on_committed (&candidate_selected_objective,
+                                                                                                                      &committed_objectives[3]);
+
+                                                                        if (selected_safe)
+                                                                                cmp->expanded_selected_safe_blocks++;
+                                                                        if (improves)
+                                                                                cmp->expanded_improving_blocks++;
+
+                                                                        if (selected_safe &&
+                                                                            (!cmp->expanded_found ||
+                                                                             (improves &&
+                                                                              !route_objective_improves_on_committed (&cmp->expanded_selected_objective_after,
+                                                                                                                     &committed_objectives[3])) ||
+                                                                             (improves ==
+                                                                              route_objective_improves_on_committed (&cmp->expanded_selected_objective_after,
+                                                                                                                   &committed_objectives[3]) &&
+                                                                              route_objective_improves_on_committed (&candidate_selected_objective,
+                                                                                                                    &cmp->expanded_selected_objective_after)) ||
+                                                                             (candidate_selected_objective.selected_distance == cmp->expanded_selected_objective_after.selected_distance &&
+                                                                              candidate_selected_objective.false_positive_vote_excess == cmp->expanded_selected_objective_after.false_positive_vote_excess &&
+                                                                              teacher_distance_after < cmp->expanded_teacher_distance_after) ||
+                                                                             (candidate_selected_objective.selected_distance == cmp->expanded_selected_objective_after.selected_distance &&
+                                                                              candidate_selected_objective.false_positive_vote_excess == cmp->expanded_selected_objective_after.false_positive_vote_excess &&
+                                                                              teacher_distance_after == cmp->expanded_teacher_distance_after &&
+                                                                              candidate_trace_count < cmp->expanded_flips))) {
+                                                                                cmp->expanded_found = true;
+                                                                                snprintf (cmp->expanded_label,
+                                                                                          sizeof cmp->expanded_label,
+                                                                                          "%s",
+                                                                                          label);
+                                                                                cmp->expanded_flips = candidate_trace_count;
+                                                                                cmp->expanded_teacher_distance_after = teacher_distance_after;
+                                                                                cmp->expanded_selected_node_after = candidate_selection.selected_by_popcount;
+                                                                                cmp->expanded_node1_popcount_after = candidate_node1.selected_popcount;
+                                                                                cmp->expanded_node6_popcount_after = candidate_node6.selected_popcount;
+                                                                                cmp->expanded_node1_vs_node6_gap_after =
+                                                                                        (ptrdiff_t) candidate_node1.selected_popcount -
+                                                                                        (ptrdiff_t) candidate_node6.selected_popcount;
+                                                                                cmp->expanded_selected_objective_after = candidate_selected_objective;
+                                                                                if (compare_index == 0) {
+                                                                                        size_t combined_count = 0;
+                                                                                        d_expanded_best_found = true;
+                                                                                        memset (d_expanded_best_trace_block, 0, sizeof d_expanded_best_trace_block);
+                                                                                        for (size_t trace_index = 0; trace_index < d_exact_25_trace_block_count; trace_index++)
+                                                                                                d_expanded_best_trace_block[combined_count++] = d_exact_25_trace_block[trace_index];
+                                                                                        for (size_t trace_index = 0; trace_index < candidate_trace_count; trace_index++) {
+                                                                                                bool duplicate = false;
+                                                                                                for (size_t existing_index = 0; existing_index < combined_count; existing_index++) {
+                                                                                                        if (d_expanded_best_trace_block[existing_index].node_index == candidate_traces[trace_index].node_index &&
+                                                                                                            d_expanded_best_trace_block[existing_index].input_index == candidate_traces[trace_index].input_index &&
+                                                                                                            d_expanded_best_trace_block[existing_index].bit_index == candidate_traces[trace_index].bit_index) {
+                                                                                                                d_expanded_best_trace_block[existing_index].value_after = candidate_traces[trace_index].value_after;
+                                                                                                                duplicate = true;
+                                                                                                                break;
+                                                                                                        }
+                                                                                                }
+                                                                                                if (!duplicate && combined_count < sizeof d_expanded_best_trace_block / sizeof (d_expanded_best_trace_block[0]))
+                                                                                                        d_expanded_best_trace_block[combined_count++] = candidate_traces[trace_index];
+                                                                                        }
+                                                                                        d_expanded_best_trace_block_count = combined_count;
+                                                                                }
+                                                                        }
+
+                                                                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, candidate_snapshot);
+                                                                }
+                                                        }
+                                                }
+                                        }
+                                }
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, post_exact_snapshot);
+                        }
+                }
+
+                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                if (node1_activation)
+                        itty_bit_string_free (node1_activation);
+                if (teacher_activation)
+                        itty_bit_string_free (teacher_activation);
+        }
+        if (d_expanded_best_found) {
+                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                replay_step_summary_t old_replay_steps[4];
+                itty_feed_model_decoder_objective_t promoted_objectives[4] = { 0 };
+                itty_feed_model_decoder_objective_t old_committed_objectives[4];
+                route_table_row_t old_rows[4];
+                char const *old_commit_budget_label = d_commit_budget_label;
+                size_t old_commit_budget = d_commit_budget;
+                bool old_commit_uses_block = d_commit_uses_block;
+                bool old_commit_uses_trace_block = d_commit_uses_trace_block;
+                size_t old_commit_block_step_indices[3] = {
+                        d_commit_block_step_indices[0],
+                        d_commit_block_step_indices[1],
+                        d_commit_block_step_indices[2]
+                };
+                size_t old_commit_block_step_count = d_commit_block_step_count;
+                itty_feed_model_mask_flip_trace_t old_commit_trace_block[16] = { 0 };
+                size_t old_commit_trace_block_count = d_commit_trace_block_count;
+                bool selected_safe = true;
+                bool final_stable = true;
+
+                assert (snapshot);
+                memcpy (old_committed_objectives, committed_objectives, sizeof committed_objectives);
+                memcpy (old_replay_steps, replay_steps, sizeof replay_steps);
+                memcpy (old_rows, rows, sizeof rows);
+                memcpy (old_commit_trace_block, d_commit_trace_block, sizeof old_commit_trace_block);
+
+                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                             d_expanded_best_trace_block,
+                                                                             d_expanded_best_trace_block_count));
+                d_trace_commit_probe.measured = true;
+                d_trace_commit_probe.flips = d_expanded_best_trace_block_count;
+                for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                    owner_index == 0 ? input_a :
+                                                                                    owner_index == 1 ? input_b :
+                                                                                    owner_index == 2 ? input_c :
+                                                                                                       input_d,
+                                                                                    owner_index == 0 ? target_a :
+                                                                                    owner_index == 1 ? target_b :
+                                                                                    owner_index == 2 ? target_c :
+                                                                                                       target_d,
+                                                                                    owner_index == 0 ? a_route :
+                                                                                    owner_index == 1 ? b_route :
+                                                                                    owner_index == 2 ? c_route :
+                                                                                                       d_route,
+                                                                                    &promoted_objectives[owner_index]));
+                        if (!route_objective_not_worse_than_committed (&promoted_objectives[owner_index],
+                                                                      &committed_objectives[owner_index]))
+                                selected_safe = false;
+                }
+                {
+                        route_key_probe_summary_t probe_summary = measure_route_key_selection_for_probe (route_keys, nodes, probe_d);
+                        d_trace_commit_probe.selected_after = probe_summary.selected_route;
+                        d_trace_commit_probe.gap_after = probe_summary.selected_gap;
+                        if (probe_summary.selected_route != d_route || probe_summary.selected_gap == 0)
+                                selected_safe = false;
+                }
+                if (!route_objective_improves_on_committed (&promoted_objectives[3], &committed_objectives[3]))
+                        selected_safe = false;
+                d_trace_commit_probe.objective_after = promoted_objectives[3];
+                d_trace_commit_probe.selected_safe = selected_safe;
+                d_trace_commit_probe.improves = route_objective_improves_on_committed (&promoted_objectives[3], &committed_objectives[3]);
+
+                if (!selected_safe) {
+                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                } else {
+                        memcpy (committed_objectives, promoted_objectives, sizeof committed_objectives);
+                        d_commit_uses_block = false;
+                        d_commit_uses_trace_block = true;
+                        d_commit_trace_block_count = d_expanded_best_trace_block_count;
+                        memcpy (d_commit_trace_block, d_expanded_best_trace_block, sizeof d_commit_trace_block);
+                        d_commit_budget = d_expanded_best_trace_block_count;
+                        d_commit_budget_label = "expanded-structural-trace-block";
+
+                        {
+                                char const *labels[4] = { "A", "B", "C", "D" };
+                                itty_bit_string_list_t *inputs[4] = { input_a, input_b, input_c, input_d };
+                                itty_bit_string_t *targets[4] = { target_a, target_b, target_c, target_d };
+                                size_t routes[4] = { a_route, b_route, c_route, d_route };
+                                itty_feed_model_train_stats_t *chain_stats[4] = { &chain_a, &chain_b, &chain_c, &chain_d };
+                                char const *committed_budget_labels[4] = { "positive", "positive", "positive", d_commit_budget_label };
+                                size_t committed_budgets[4] = { oracle_options.max_flips, oracle_options.max_flips, oracle_options.max_flips, d_commit_budget };
+
+                                memset (&chain_a, 0, sizeof chain_a);
+                                memset (&chain_b, 0, sizeof chain_b);
+                                memset (&chain_c, 0, sizeof chain_c);
+                                memset (&chain_d, 0, sizeof chain_d);
+                                memset (replay_steps, 0, sizeof replay_steps);
+
+                                for (size_t replay_index = 0; replay_index < 4; replay_index++) {
+                                        itty_feed_model_layer_state_snapshot_t *replay_snapshot;
+                                        itty_feed_model_train_options_t replay_options = oracle_options;
+                                        itty_feed_model_final_repair_mode_summary_t replay_mode_summary = { 0 };
+                                        itty_feed_model_decoder_objective_t after_objectives[4] = { 0 };
+                                        char const *budget_class = committed_budget_labels[replay_index];
+
+                                        replay_options.max_flips = committed_budgets[replay_index];
+                                        replay_snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                        assert (replay_snapshot);
+                                        if (replay_index == 3) {
+                                                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                                             d_commit_trace_block,
+                                                                                                             d_commit_trace_block_count));
+                                                chain_stats[replay_index]->flips = d_commit_trace_block_count;
+                                        } else {
+                                                assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                                            inputs[replay_index],
+                                                                                                                            targets[replay_index],
+                                                                                                                            routes[replay_index],
+                                                                                                                            &replay_options,
+                                                                                                                            ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+                                                                                                                            chain_stats[replay_index],
+                                                                                                                            &replay_mode_summary));
+                                        }
+                                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                            inputs[owner_index],
+                                                                                                            targets[owner_index],
+                                                                                                            routes[owner_index],
+                                                                                                            &after_objectives[owner_index]));
+                                        }
+                                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                                if (!route_objective_not_worse_than_committed (&after_objectives[owner_index],
+                                                                                              &committed_objectives[owner_index])) {
+                                                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, replay_snapshot);
+                                                        memset (chain_stats[replay_index], 0, sizeof *chain_stats[replay_index]);
+                                                        memcpy (after_objectives, committed_objectives, sizeof committed_objectives);
+                                                        break;
+                                                }
+                                        }
+                                        replay_steps[replay_index].label = labels[replay_index];
+                                        replay_steps[replay_index].budget_class = budget_class;
+                                        replay_steps[replay_index].budget = replay_options.max_flips;
+                                        replay_steps[replay_index].replay_flips = chain_stats[replay_index]->flips;
+                                        replay_steps[replay_index].selector = measure_route_key_selection_for_probe (route_keys,
+                                                                                                                      nodes,
+                                                                                                                      replay_index == 0 ? probe_a :
+                                                                                                                      replay_index == 1 ? probe_b :
+                                                                                                                      replay_index == 2 ? probe_c :
+                                                                                                                                         probe_d);
+                                        replay_steps[replay_index].objective = after_objectives[replay_index];
+                                        replay_steps[replay_index].positive_repairs = replay_index == 3 ? 0 :
+                                                (replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY ?
+                                                replay_mode_summary.accepted_candidates : 0);
+                                        replay_steps[replay_index].zero_repairs = replay_index == 3 ? 0 :
+                                                (replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY ?
+                                                replay_mode_summary.accepted_candidates : 0);
+                                        replay_steps[replay_index].mixed_repairs = replay_index == 3 ? d_commit_trace_block_count :
+                                                (replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ?
+                                                replay_mode_summary.accepted_candidates : 0);
+                                        replay_steps[replay_index].uncategorized_repairs = 0;
+                                        memcpy (committed_objectives, after_objectives, sizeof committed_objectives);
+                                }
+                        }
+
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                route_key_probe_summary_t selector = measure_route_key_selection_for_probe (route_keys,
+                                                                                                             nodes,
+                                                                                                             owner_index == 0 ? probe_a :
+                                                                                                             owner_index == 1 ? probe_b :
+                                                                                                             owner_index == 2 ? probe_c :
+                                                                                                                                probe_d);
+                                if (!route_objective_not_worse_than_committed (&committed_objectives[owner_index],
+                                                                              &old_committed_objectives[owner_index]))
+                                        final_stable = false;
+                                if (selector.selected_gap == 0)
+                                        final_stable = false;
+                                rows[owner_index].selector = selector;
+                                rows[owner_index].objective = committed_objectives[owner_index];
+                                rows[owner_index].replay_flips = replay_steps[owner_index].replay_flips;
+                        }
+                        d_trace_commit_probe.final_stable = final_stable;
+
+                        if (!final_stable) {
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                                memcpy (committed_objectives, old_committed_objectives, sizeof committed_objectives);
+                                memcpy (replay_steps, old_replay_steps, sizeof replay_steps);
+                                memcpy (rows, old_rows, sizeof rows);
+                                d_commit_budget_label = old_commit_budget_label;
+                                d_commit_budget = old_commit_budget;
+                                d_commit_uses_block = old_commit_uses_block;
+                                d_commit_uses_trace_block = old_commit_uses_trace_block;
+                                memcpy (d_commit_block_step_indices,
+                                        old_commit_block_step_indices,
+                                        sizeof d_commit_block_step_indices);
+                                d_commit_block_step_count = old_commit_block_step_count;
+                                memcpy (d_commit_trace_block, old_commit_trace_block, sizeof d_commit_trace_block);
+                                d_commit_trace_block_count = old_commit_trace_block_count;
+                        }
+                }
+        }
+        if (d_exact_25_trace_block_count > 0 && d_expanded_best_found) {
+                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                itty_feed_model_decoder_objective_t owner_after[4] = { 0 };
+                itty_feed_model_segment_node_selection_summary_t selection_after = { 0 };
+                itty_feed_model_decoder_objective_t node1_after = { 0 };
+                itty_feed_model_decoder_objective_t node6_after = { 0 };
+                bool selected_safe = true;
+
+                assert (snapshot);
+                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                             d_exact_25_trace_block,
+                                                                             d_exact_25_trace_block_count));
+                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                             d_expanded_best_trace_block,
+                                                                             d_expanded_best_trace_block_count));
+                assert (measure_selected_node_objective (decoder_model,
+                                                        input_d,
+                                                        target_d,
+                                                        &selection_after,
+                                                        &owner_after[3]));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_d,
+                                                                            target_d,
+                                                                            d_route,
+                                                                            &node1_after));
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_d,
+                                                                            target_d,
+                                                                            d_internal.current_internal_node,
+                                                                            &node6_after));
+                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                    owner_index == 0 ? input_a :
+                                                                                    owner_index == 1 ? input_b :
+                                                                                                       input_c,
+                                                                                    owner_index == 0 ? target_a :
+                                                                                    owner_index == 1 ? target_b :
+                                                                                                       target_c,
+                                                                                    owner_index == 0 ? a_route :
+                                                                                    owner_index == 1 ? b_route :
+                                                                                                       c_route,
+                                                                                    &owner_after[owner_index]));
+                        if (!route_objective_not_worse_than_committed (&owner_after[owner_index],
+                                                                      &committed_objectives[owner_index]))
+                                selected_safe = false;
+                }
+                if (measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route ||
+                    measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap == 0)
+                        selected_safe = false;
+                if (node1_after.selected_popcount <= node6_after.selected_popcount)
+                        selected_safe = false;
+                if (!route_objective_not_worse_than_committed (&owner_after[3], &committed_objectives[3]))
+                        selected_safe = false;
+
+                d_trace_transaction_probe.measured = true;
+                d_trace_transaction_probe.selected_safe = selected_safe;
+                d_trace_transaction_probe.improves =
+                        selected_safe &&
+                        route_objective_improves_on_committed (&owner_after[3], &committed_objectives[3]);
+                d_trace_transaction_probe.flips = d_exact_25_trace_block_count + d_expanded_best_trace_block_count;
+                d_trace_transaction_probe.selected_after = selection_after.selected_by_popcount;
+                d_trace_transaction_probe.gap_after = measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap;
+                d_trace_transaction_probe.node1_pop_after = node1_after.selected_popcount;
+                d_trace_transaction_probe.node6_pop_after = node6_after.selected_popcount;
+                d_trace_transaction_probe.objective_after = owner_after[3];
+
+                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+        }
+        {
+                d_residual_set_summary_t const *best_tx_set = NULL;
+
+                for (size_t set_index = 0; set_index < d_residual_set_count; set_index++) {
+                        d_residual_set_summary_t const *set = &d_residual_sets[set_index];
+
+                        if (!set->tx_found)
+                                continue;
+                        if (!route_objective_improves_on_committed (&set->tx_objective_after, &committed_objectives[3]))
+                                continue;
+
+                        if (!best_tx_set ||
+                            route_objective_improves_on_committed (&set->tx_objective_after, &best_tx_set->tx_objective_after) ||
+                            (set->tx_objective_after.selected_distance == best_tx_set->tx_objective_after.selected_distance &&
+                             set->tx_objective_after.false_positive_vote_excess == best_tx_set->tx_objective_after.false_positive_vote_excess &&
+                             set->tx_node1_vs_node6_gap_after > best_tx_set->tx_node1_vs_node6_gap_after) ||
+                            (set->tx_objective_after.selected_distance == best_tx_set->tx_objective_after.selected_distance &&
+                             set->tx_objective_after.false_positive_vote_excess == best_tx_set->tx_objective_after.false_positive_vote_excess &&
+                             set->tx_node1_vs_node6_gap_after == best_tx_set->tx_node1_vs_node6_gap_after &&
+                             set->tx_teacher_distance_after < best_tx_set->tx_teacher_distance_after) ||
+                            (set->tx_objective_after.selected_distance == best_tx_set->tx_objective_after.selected_distance &&
+                             set->tx_objective_after.false_positive_vote_excess == best_tx_set->tx_objective_after.false_positive_vote_excess &&
+                             set->tx_node1_vs_node6_gap_after == best_tx_set->tx_node1_vs_node6_gap_after &&
+                             set->tx_teacher_distance_after == best_tx_set->tx_teacher_distance_after &&
+                             set->tx_flips < best_tx_set->tx_flips))
+                                best_tx_set = set;
+                }
+
+                if (best_tx_set) {
+                        itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                        replay_step_summary_t old_replay_steps[4];
+                        itty_feed_model_decoder_objective_t promoted_objectives[4] = { 0 };
+                        itty_feed_model_decoder_objective_t old_committed_objectives[4];
+                        route_table_row_t old_rows[4];
+                        char const *old_commit_budget_label = d_commit_budget_label;
+                        size_t old_commit_budget = d_commit_budget;
+                        bool old_commit_uses_block = d_commit_uses_block;
+                        bool old_commit_uses_trace_block = d_commit_uses_trace_block;
+                        size_t old_commit_block_step_indices[3] = {
+                                d_commit_block_step_indices[0],
+                                d_commit_block_step_indices[1],
+                                d_commit_block_step_indices[2]
+                        };
+                        size_t old_commit_block_step_count = d_commit_block_step_count;
+                        itty_feed_model_mask_flip_trace_t old_commit_trace_block[16] = { 0 };
+                        size_t old_commit_trace_block_count = d_commit_trace_block_count;
+                        bool selected_safe = true;
+                        bool final_stable = true;
+
+                        assert (snapshot);
+                        memcpy (old_committed_objectives, committed_objectives, sizeof committed_objectives);
+                        memcpy (old_replay_steps, replay_steps, sizeof replay_steps);
+                        memcpy (old_rows, rows, sizeof rows);
+                        memcpy (old_commit_trace_block, d_commit_trace_block, sizeof old_commit_trace_block);
+
+                        assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                     best_tx_set->tx_traces,
+                                                                                     best_tx_set->tx_trace_count));
+                        d_tx_commit_probe.measured = true;
+                        d_tx_commit_probe.flips = best_tx_set->tx_trace_count;
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            owner_index == 0 ? input_a :
+                                                                                            owner_index == 1 ? input_b :
+                                                                                            owner_index == 2 ? input_c :
+                                                                                                               input_d,
+                                                                                            owner_index == 0 ? target_a :
+                                                                                            owner_index == 1 ? target_b :
+                                                                                            owner_index == 2 ? target_c :
+                                                                                                               target_d,
+                                                                                            owner_index == 0 ? a_route :
+                                                                                            owner_index == 1 ? b_route :
+                                                                                            owner_index == 2 ? c_route :
+                                                                                                               d_route,
+                                                                                            &promoted_objectives[owner_index]));
+                                if (!route_objective_not_worse_than_committed (&promoted_objectives[owner_index],
+                                                                              &committed_objectives[owner_index]))
+                                        selected_safe = false;
+                        }
+                        if (measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route ||
+                            measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap == 0)
+                                selected_safe = false;
+                        if (!route_objective_improves_on_committed (&promoted_objectives[3], &committed_objectives[3]))
+                                selected_safe = false;
+                        d_tx_commit_probe.selected_after = measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route;
+                        d_tx_commit_probe.gap_after = measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap;
+                        d_tx_commit_probe.objective_after = promoted_objectives[3];
+                        d_tx_commit_probe.selected_safe = selected_safe;
+                        d_tx_commit_probe.improves = route_objective_improves_on_committed (&promoted_objectives[3], &committed_objectives[3]);
+
+                        if (!selected_safe) {
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                        } else {
+                                memcpy (committed_objectives, promoted_objectives, sizeof committed_objectives);
+                                d_commit_uses_block = false;
+                                d_commit_uses_trace_block = true;
+                                d_commit_trace_block_count = best_tx_set->tx_trace_count;
+                                memcpy (d_commit_trace_block, best_tx_set->tx_traces, sizeof d_commit_trace_block);
+                                d_commit_budget = best_tx_set->tx_flips;
+                                d_commit_budget_label = "baseline-structural-selected-objective-block";
+
+                                {
+                                        char const *labels[4] = { "A", "B", "C", "D" };
+                                        itty_bit_string_list_t *inputs[4] = { input_a, input_b, input_c, input_d };
+                                        itty_bit_string_t *targets[4] = { target_a, target_b, target_c, target_d };
+                                        size_t routes[4] = { a_route, b_route, c_route, d_route };
+                                        itty_feed_model_train_stats_t *chain_stats[4] = { &chain_a, &chain_b, &chain_c, &chain_d };
+                                        char const *committed_budget_labels[4] = { "positive", "positive", "positive", d_commit_budget_label };
+                                        size_t committed_budgets[4] = { oracle_options.max_flips, oracle_options.max_flips, oracle_options.max_flips, d_commit_budget };
+
+                                        memset (&chain_a, 0, sizeof chain_a);
+                                        memset (&chain_b, 0, sizeof chain_b);
+                                        memset (&chain_c, 0, sizeof chain_c);
+                                        memset (&chain_d, 0, sizeof chain_d);
+                                        memset (replay_steps, 0, sizeof replay_steps);
+
+                                        for (size_t replay_index = 0; replay_index < 4; replay_index++) {
+                                                itty_feed_model_layer_state_snapshot_t *replay_snapshot;
+                                                itty_feed_model_train_options_t replay_options = oracle_options;
+                                                itty_feed_model_final_repair_mode_summary_t replay_mode_summary = { 0 };
+                                                itty_feed_model_decoder_objective_t after_objectives[4] = { 0 };
+                                                char const *budget_class = committed_budget_labels[replay_index];
+
+                                                replay_options.max_flips = committed_budgets[replay_index];
+                                                replay_snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                                assert (replay_snapshot);
+                                                if (replay_index == 3) {
+                                                        assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                                                     d_commit_trace_block,
+                                                                                                                     d_commit_trace_block_count));
+                                                        chain_stats[replay_index]->flips = d_commit_trace_block_count;
+                                                } else {
+                                                        assert (itty_feed_model_train_final_layer_with_suffix_oracle_for_node_mode (decoder_model,
+                                                                                                                                    inputs[replay_index],
+                                                                                                                                    targets[replay_index],
+                                                                                                                                    routes[replay_index],
+                                                                                                                                    &replay_options,
+                                                                                                                                    ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED,
+                                                                                                                                    chain_stats[replay_index],
+                                                                                                                                    &replay_mode_summary));
+                                                }
+                                                for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                                    inputs[owner_index],
+                                                                                                                    targets[owner_index],
+                                                                                                                    routes[owner_index],
+                                                                                                                    &after_objectives[owner_index]));
+                                                }
+                                                for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                                        if (!route_objective_not_worse_than_committed (&after_objectives[owner_index],
+                                                                                                      &committed_objectives[owner_index])) {
+                                                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, replay_snapshot);
+                                                                memset (chain_stats[replay_index], 0, sizeof *chain_stats[replay_index]);
+                                                                memcpy (after_objectives, committed_objectives, sizeof committed_objectives);
+                                                                break;
+                                                        }
+                                                }
+                                                replay_steps[replay_index].label = labels[replay_index];
+                                                replay_steps[replay_index].budget_class = budget_class;
+                                                replay_steps[replay_index].budget = replay_options.max_flips;
+                                                replay_steps[replay_index].replay_flips = chain_stats[replay_index]->flips;
+                                                replay_steps[replay_index].selector = measure_route_key_selection_for_probe (route_keys,
+                                                                                                                              nodes,
+                                                                                                                              replay_index == 0 ? probe_a :
+                                                                                                                              replay_index == 1 ? probe_b :
+                                                                                                                              replay_index == 2 ? probe_c :
+                                                                                                                                                 probe_d);
+                                                replay_steps[replay_index].objective = after_objectives[replay_index];
+                                                replay_steps[replay_index].positive_repairs = replay_index == 3 ? 0 :
+                                                        (replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_POSITIVE_ONLY ?
+                                                        replay_mode_summary.accepted_candidates : 0);
+                                                replay_steps[replay_index].zero_repairs = replay_index == 3 ? 0 :
+                                                        (replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_ZERO_ONLY ?
+                                                        replay_mode_summary.accepted_candidates : 0);
+                                                replay_steps[replay_index].mixed_repairs = replay_index == 3 ? d_commit_trace_block_count :
+                                                        (replay_mode_summary.chosen_mode == ITTY_FEED_MODEL_FINAL_REPAIR_MODE_BALANCED ?
+                                                        replay_mode_summary.accepted_candidates : 0);
+                                                replay_steps[replay_index].uncategorized_repairs = 0;
+                                                memcpy (committed_objectives, after_objectives, sizeof committed_objectives);
+                                        }
+                                }
+
+                                for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                        route_key_probe_summary_t selector = measure_route_key_selection_for_probe (route_keys,
+                                                                                                                     nodes,
+                                                                                                                     owner_index == 0 ? probe_a :
+                                                                                                                     owner_index == 1 ? probe_b :
+                                                                                                                     owner_index == 2 ? probe_c :
+                                                                                                                                        probe_d);
+                                        if (!route_objective_not_worse_than_committed (&committed_objectives[owner_index],
+                                                                                      &old_committed_objectives[owner_index]))
+                                                final_stable = false;
+                                        if (selector.selected_gap == 0)
+                                                final_stable = false;
+                                        rows[owner_index].selector = selector;
+                                        rows[owner_index].objective = committed_objectives[owner_index];
+                                        rows[owner_index].replay_flips = replay_steps[owner_index].replay_flips;
+                                }
+
+                                d_tx_commit_probe.final_stable = final_stable;
+
+                                if (!final_stable) {
+                                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                                        memcpy (committed_objectives, old_committed_objectives, sizeof committed_objectives);
+                                        memcpy (replay_steps, old_replay_steps, sizeof replay_steps);
+                                        memcpy (rows, old_rows, sizeof rows);
+                                        d_commit_budget_label = old_commit_budget_label;
+                                        d_commit_budget = old_commit_budget;
+                                        d_commit_uses_block = old_commit_uses_block;
+                                        d_commit_uses_trace_block = old_commit_uses_trace_block;
+                                        memcpy (d_commit_block_step_indices,
+                                                old_commit_block_step_indices,
+                                                sizeof d_commit_block_step_indices);
+                                        d_commit_block_step_count = old_commit_block_step_count;
+                                        memcpy (d_commit_trace_block, old_commit_trace_block, sizeof d_commit_trace_block);
+                                        d_commit_trace_block_count = old_commit_trace_block_count;
+                                }
+                        }
+                }
+        }
+        {
+                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                itty_feed_model_restore_failure_summary_t residual_free = { 0 };
+                itty_feed_model_restore_failure_summary_t residual_owner[3] = { 0 };
+                itty_feed_model_train_options_t residual_options = oracle_options;
+                itty_bit_string_list_t *owner_inputs[3] = { input_a, input_b, input_c };
+                itty_bit_string_t *owner_targets[3] = { target_a, target_b, target_c };
+
+                assert (snapshot);
+                d_post_commit_residual_row_count = 0;
+                assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                        input_d,
+                                                                        target_d,
+                                                                        &d_profile_post_commit_selection));
+                assert (itty_feed_model_measure_node_condense_vote_histogram (decoder_model,
+                                                                              input_d,
+                                                                              1,
+                                                                              d_profile_post_commit_selection.selected_by_popcount,
+                                                                              d_post_commit_node_histogram,
+                                                                              sizeof d_post_commit_node_histogram / sizeof d_post_commit_node_histogram[0],
+                                                                              &d_post_commit_node_histogram_bits));
+                assert (itty_feed_model_measure_segment_vote_profile_for_node (decoder_model,
+                                                                               input_d,
+                                                                               target_d,
+                                                                               d_profile_post_commit_selection.selected_by_popcount,
+                                                                               &d_profile_post_commit));
+                residual_options.max_flips = 8;
+                assert (itty_feed_model_measure_final_layer_restore_failure (decoder_model,
+                                                                             input_d,
+                                                                             target_d,
+                                                                             input_a,
+                                                                             target_a,
+                                                                             &residual_options,
+                                                                             0,
+                                                                             false,
+                                                                             &residual_free));
+                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                        assert (itty_feed_model_measure_final_layer_restore_failure (decoder_model,
+                                                                                     input_d,
+                                                                                     target_d,
+                                                                                     owner_inputs[owner_index],
+                                                                                     owner_targets[owner_index],
+                                                                                     &residual_options,
+                                                                                     0,
+                                                                                     true,
+                                                                                     &residual_owner[owner_index]));
+                }
+
+                for (size_t trace_index = 0;
+                     trace_index < d_profile_post_commit.trace_count &&
+                     d_post_commit_residual_row_count < ITTY_FEED_MODEL_SEGMENT_VOTE_TRACE_LIMIT;
+                     trace_index++) {
+                        itty_feed_model_segment_vote_trace_t const *trace = &d_profile_post_commit.traces[trace_index];
+                        itty_feed_model_restore_failure_trace_t const *free_trace;
+                        d_residual_error_row_t *row;
+                        bool owner_guard_ok = true;
+                        bool selected_guard_ok = true;
+
+                        if (trace->target_bit || trace->excess == 0)
+                                continue;
+
+                        free_trace = find_restore_trace_for_decoded_bit (&residual_free, trace->decoded_bit);
+                        row = &d_post_commit_residual_rows[d_post_commit_residual_row_count++];
+                        row->measured = true;
+                        row->decoded_bit = trace->decoded_bit;
+                        row->target_bit = trace->target_bit ? 1 : 0;
+                        row->selected_internal_node = d_profile_post_commit_selection.selected_by_popcount;
+                        row->ones = trace->ones;
+                        row->threshold = trace->threshold;
+                        row->max_zero = trace->max_zero;
+                        row->deficit = trace->deficit;
+                        row->excess = trace->excess;
+                        row->candidate_final_votes = free_trace ? free_trace->clearable_segment_votes : 0;
+                        row->candidate_mask_flips = free_trace ? free_trace->candidate_mask_flips : 0;
+
+                        if (!free_trace) {
+                                row->reason = "no-candidate-trace";
+                                continue;
+                        }
+                        for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                itty_feed_model_restore_failure_trace_t const *owner_trace =
+                                        find_restore_trace_for_decoded_bit (&residual_owner[owner_index], trace->decoded_bit);
+                                if (!owner_trace || !owner_trace->accepted) {
+                                        owner_guard_ok = false;
+                                        break;
+                                }
+                                if (owner_trace->replay_example_distance_after > committed_objectives[owner_index].selected_distance ||
+                                    owner_trace->replay_example_false_negative_deficit_after > committed_objectives[owner_index].false_negative_vote_deficit ||
+                                    owner_trace->replay_example_false_positive_excess_after > committed_objectives[owner_index].false_positive_vote_excess) {
+                                        owner_guard_ok = false;
+                                        break;
+                                }
+                        }
+                        selected_guard_ok =
+                                free_trace->selected_node_distance_after <= committed_objectives[3].selected_distance &&
+                                free_trace->selected_node_false_negative_deficit_after <= committed_objectives[3].false_negative_vote_deficit &&
+                                free_trace->selected_node_false_positive_excess_after <= committed_objectives[3].false_positive_vote_excess;
+
+                        if (free_trace->rejection_reason == ITTY_FEED_MODEL_RESTORE_REJECTION_NO_CLEARABLE_SEGMENT_VOTES)
+                                row->reason = "no-clearable-final-votes";
+                        else if (free_trace->propagation_failure == ITTY_FEED_MODEL_RESTORE_PROPAGATION_DUPLICATE_CONDENSED_MAPPING)
+                                row->reason = "duplicate-condensed-mapping";
+                        else if (free_trace->propagation_failure == ITTY_FEED_MODEL_RESTORE_PROPAGATION_NO_MAJORITY_CROSSING)
+                                row->reason = "no-majority-crossing";
+                        else if (free_trace->candidate_mask_flips == 0 ||
+                                 free_trace->rejection_reason == ITTY_FEED_MODEL_RESTORE_REJECTION_NO_MASK_PROJECTION)
+                                row->reason = "no-mask-flips";
+                        else if (!free_trace->direct_candidate_changed)
+                                row->reason = "candidate-rejected-before-trace";
+                        else if (free_trace->final_selected_node_after != row->selected_internal_node)
+                                row->reason = "candidate-for-different-internal-node";
+                        else if (!owner_guard_ok)
+                                row->reason = "owner-baseline-guard";
+                        else if (!selected_guard_ok)
+                                row->reason = "selected-objective-guard";
+                        else
+                                row->reason = "no-selected-safe-improvement";
+                }
+
+                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+        }
+        {
+                size_t residual_bits[4] = { 0 };
+                size_t residual_bit_count = 0;
+
+                d_post_commit_residual_set_count = 0;
+                for (size_t row_index = 0; row_index < d_post_commit_residual_row_count; row_index++) {
+                        d_residual_error_row_t const *row = &d_post_commit_residual_rows[row_index];
+
+                        if (row->candidate_mask_flips == 0)
+                                continue;
+                        if (residual_bit_count < sizeof (residual_bits) / sizeof (residual_bits[0]))
+                                residual_bits[residual_bit_count++] = row->decoded_bit;
+                }
+
+                for (size_t subset_mask = 1;
+                     subset_mask < ((size_t) 1 << residual_bit_count) &&
+                     d_post_commit_residual_set_count < sizeof (d_post_commit_residual_sets) / sizeof (d_post_commit_residual_sets[0]);
+                     subset_mask++) {
+                        d_residual_set_summary_t *set = &d_post_commit_residual_sets[d_post_commit_residual_set_count++];
+                        size_t subset_bits[4] = { 0 };
+                        size_t subset_count = 0;
+                        itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                        itty_feed_model_selected_clear_set_summary_t exact_summary = { 0 };
+                        itty_feed_model_train_options_t exact_options = oracle_options;
+                        route_key_probe_summary_t route_key_after;
+                        itty_feed_model_decoder_objective_t owner_after[3] = { 0 };
+
+                        assert (snapshot);
+                        set->bit_mask = subset_mask;
+                        for (size_t bit_index = 0; bit_index < residual_bit_count; bit_index++) {
+                                if (!(subset_mask & ((size_t) 1 << bit_index)))
+                                        continue;
+                                subset_bits[subset_count++] = residual_bits[bit_index];
+                                if (set->label[0] != '\0')
+                                        strncat (set->label, "+", sizeof set->label - strlen (set->label) - 1);
+                                {
+                                        char bit_label[16];
+                                        snprintf (bit_label, sizeof bit_label, "%zu", residual_bits[bit_index]);
+                                        strncat (set->label, bit_label, sizeof set->label - strlen (set->label) - 1);
+                                }
+                        }
+                        set->bit_count = subset_count;
+
+                        exact_options.max_flips = 32;
+                        set->exact_measured =
+                                itty_feed_model_train_selected_node_direct_clear_set (decoder_model,
+                                                                                     input_d,
+                                                                                     target_d,
+                                                                                     subset_bits,
+                                                                                     subset_count,
+                                                                                     d_route,
+                                                                                     d_internal.current_internal_node,
+                                                                                     &exact_options,
+                                                                                     &exact_summary);
+                        if (!set->exact_measured) {
+                                set->exact_reason = "solver-failed";
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                                continue;
+                        }
+
+                        set->exact_selected_after = exact_summary.selected_node_after;
+                        set->exact_gap_after = exact_summary.selection_margin_after;
+                        set->exact_flips = exact_summary.total_flips;
+                        set->exact_objective_after = exact_summary.selected_objective_after;
+                        set->exact_trace_count =
+                                itty_feed_model_collect_final_layer_mask_flip_traces (decoder_model,
+                                                                                      snapshot,
+                                                                                      set->exact_traces,
+                                                                                      sizeof set->exact_traces / sizeof (set->exact_traces[0]));
+
+                        route_key_after = measure_route_key_selection_for_probe (route_keys, nodes, probe_d);
+                        set->fail_route_change = route_key_after.selected_route != d_route;
+                        set->fail_gap_loss = route_key_after.selected_gap == 0;
+                        for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            owner_index == 0 ? input_a :
+                                                                                            owner_index == 1 ? input_b :
+                                                                                                               input_c,
+                                                                                            owner_index == 0 ? target_a :
+                                                                                            owner_index == 1 ? target_b :
+                                                                                                               target_c,
+                                                                                            owner_index == 0 ? a_route :
+                                                                                            owner_index == 1 ? b_route :
+                                                                                                               c_route,
+                                                                                            &owner_after[owner_index]));
+                        }
+                        set->fail_a_baseline = !route_objective_not_worse_than_committed (&owner_after[0], &committed_objectives[0]);
+                        set->fail_b_baseline = !route_objective_not_worse_than_committed (&owner_after[1], &committed_objectives[1]);
+                        set->fail_c_baseline = !route_objective_not_worse_than_committed (&owner_after[2], &committed_objectives[2]);
+                        set->fail_d_distance =
+                                exact_summary.selected_objective_after.selected_distance >
+                                committed_objectives[3].selected_distance;
+                        set->fail_d_deficit =
+                                exact_summary.selected_objective_after.false_negative_vote_deficit >
+                                committed_objectives[3].false_negative_vote_deficit;
+                        set->fail_d_excess =
+                                exact_summary.selected_objective_after.false_positive_vote_excess >
+                                committed_objectives[3].false_positive_vote_excess;
+                        set->fail_selected_switch_worse =
+                                exact_summary.selected_node_after != exact_summary.selected_node_before &&
+                                (set->fail_d_distance || set->fail_d_deficit || set->fail_d_excess);
+                        set->exact_selected_safe =
+                                !set->fail_route_change &&
+                                !set->fail_gap_loss &&
+                                !set->fail_a_baseline &&
+                                !set->fail_b_baseline &&
+                                !set->fail_c_baseline &&
+                                !set->fail_d_distance &&
+                                !set->fail_d_deficit &&
+                                !set->fail_d_excess;
+                        set->exact_improves =
+                                set->exact_selected_safe &&
+                                route_objective_improves_on_committed (&exact_summary.selected_objective_after,
+                                                                      &committed_objectives[3]);
+                        set->exact_reason = set->exact_improves ? "improves" : "no-improvement";
+
+                        itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                }
+        }
+        {
+                typedef struct {
+                        itty_feed_model_mask_flip_trace_t trace;
+                        char        label[48];
+                        bool        selected_safe;
+                        size_t      selected_distance;
+                        size_t      selected_excess;
+                        size_t      teacher_distance;
+                        ptrdiff_t   gap;
+                } baseline_effect_candidate_t;
+                size_t baseline_node_indices[2] = { d_route, d_internal.current_internal_node };
+                itty_feed_model_mask_flip_trace_t baseline_traces[512] = { 0 };
+                size_t baseline_trace_count =
+                        itty_feed_model_collect_final_layer_toggle_traces_for_nodes (decoder_model,
+                                                                                     baseline_node_indices,
+                                                                                     2,
+                                                                                     baseline_traces,
+                                                                                     sizeof baseline_traces / sizeof (baseline_traces[0]));
+
+                for (size_t set_index = 0; set_index < d_post_commit_residual_set_count; set_index++) {
+                        d_residual_set_summary_t *set = &d_post_commit_residual_sets[set_index];
+                        baseline_effect_candidate_t best_candidates[16] = { 0 };
+                        size_t best_candidate_count = 0;
+                        itty_bit_string_t *teacher_activation = NULL;
+
+                        if (!set->exact_measured || set->exact_trace_count == 0)
+                                continue;
+
+                        {
+                                size_t subset_bits[4] = { 0 };
+                                size_t subset_count = 0;
+                                char *cursor = set->label;
+                                while (*cursor && subset_count < 4) {
+                                        char *end = NULL;
+                                        subset_bits[subset_count++] = strtoul (cursor, &end, 10);
+                                        cursor = end;
+                                        if (*cursor == '+')
+                                                cursor++;
+                                }
+                                assert (build_selected_node_direct_clear_teacher (decoder_model,
+                                                                                 input_d,
+                                                                                 target_d,
+                                                                                 d_route,
+                                                                                 subset_bits,
+                                                                                 subset_count,
+                                                                                 &teacher_activation));
+                        }
+
+                        set->tx_pool_count = baseline_trace_count;
+                        for (size_t trace_index = 0; trace_index < baseline_trace_count; trace_index++) {
+                                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                itty_feed_model_decoder_objective_t selected_objective = { 0 };
+                                itty_feed_model_decoder_objective_t node1_objective = { 0 };
+                                itty_feed_model_decoder_objective_t node6_objective = { 0 };
+                                itty_feed_model_segment_node_selection_summary_t selection = { 0 };
+                                bool selected_safe = true;
+                                baseline_effect_candidate_t candidate = { .trace = baseline_traces[trace_index] };
+
+                                assert (snapshot);
+                                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                             &baseline_traces[trace_index],
+                                                                                             1));
+                                assert (measure_selected_node_objective (decoder_model,
+                                                                        input_d,
+                                                                        target_d,
+                                                                        &selection,
+                                                                        &selected_objective));
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            input_d,
+                                                                                            target_d,
+                                                                                            d_route,
+                                                                                            &node1_objective));
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            input_d,
+                                                                                            target_d,
+                                                                                            d_internal.current_internal_node,
+                                                                                            &node6_objective));
+                                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                        itty_feed_model_decoder_objective_t owner_after = { 0 };
+                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                    owner_index == 0 ? input_a :
+                                                                                                    owner_index == 1 ? input_b :
+                                                                                                                       input_c,
+                                                                                                    owner_index == 0 ? target_a :
+                                                                                                    owner_index == 1 ? target_b :
+                                                                                                                       target_c,
+                                                                                                    owner_index == 0 ? a_route :
+                                                                                                    owner_index == 1 ? b_route :
+                                                                                                                       c_route,
+                                                                                                    &owner_after));
+                                        if (!route_objective_not_worse_than_committed (&owner_after, &committed_objectives[owner_index]))
+                                                selected_safe = false;
+                                }
+                                if (node1_objective.selected_popcount <= node6_objective.selected_popcount)
+                                        selected_safe = false;
+                                if (selected_objective.false_negative_vote_deficit != 0)
+                                        selected_safe = false;
+                                if (!route_objective_not_worse_than_committed (&selected_objective, &committed_objectives[3]))
+                                        selected_safe = false;
+                                {
+                                        itty_bit_string_t *node1_activation = NULL;
+                                        assert (measure_output_activation_for_node (decoder_model, input_d, d_route, &node1_activation));
+                                        candidate.teacher_distance = measure_bit_string_distance (node1_activation, teacher_activation);
+                                        itty_bit_string_free (node1_activation);
+                                }
+                                candidate.selected_safe = selected_safe;
+                                candidate.selected_distance = selected_objective.selected_distance;
+                                candidate.selected_excess = selected_objective.false_positive_vote_excess;
+                                candidate.gap = (ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount;
+                                snprintf (candidate.label, sizeof candidate.label, "n%zu.i%zu.b%zu=%d",
+                                          candidate.trace.node_index,
+                                          candidate.trace.input_index,
+                                          candidate.trace.bit_index,
+                                          candidate.trace.value_after ? 1 : 0);
+                                {
+                                        bool interesting =
+                                                candidate.selected_safe ||
+                                                candidate.selected_distance <= committed_objectives[3].selected_distance ||
+                                                candidate.selected_excess <= committed_objectives[3].false_positive_vote_excess ||
+                                                candidate.gap > 0;
+                                        if (interesting) {
+                                                size_t insert_index = best_candidate_count;
+                                                for (size_t candidate_index = 0; candidate_index < best_candidate_count; candidate_index++) {
+                                                        bool better =
+                                                                (candidate.selected_safe && !best_candidates[candidate_index].selected_safe) ||
+                                                                (candidate.selected_safe == best_candidates[candidate_index].selected_safe &&
+                                                                 candidate.selected_distance < best_candidates[candidate_index].selected_distance) ||
+                                                                (candidate.selected_safe == best_candidates[candidate_index].selected_safe &&
+                                                                 candidate.selected_distance == best_candidates[candidate_index].selected_distance &&
+                                                                 candidate.selected_excess < best_candidates[candidate_index].selected_excess) ||
+                                                                (candidate.selected_safe == best_candidates[candidate_index].selected_safe &&
+                                                                 candidate.selected_distance == best_candidates[candidate_index].selected_distance &&
+                                                                 candidate.selected_excess == best_candidates[candidate_index].selected_excess &&
+                                                                 candidate.teacher_distance < best_candidates[candidate_index].teacher_distance) ||
+                                                                (candidate.selected_safe == best_candidates[candidate_index].selected_safe &&
+                                                                 candidate.selected_distance == best_candidates[candidate_index].selected_distance &&
+                                                                 candidate.selected_excess == best_candidates[candidate_index].selected_excess &&
+                                                                 candidate.teacher_distance == best_candidates[candidate_index].teacher_distance &&
+                                                                 candidate.gap > best_candidates[candidate_index].gap);
+                                                        if (better) {
+                                                                insert_index = candidate_index;
+                                                                break;
+                                                        }
+                                                }
+                                                if (insert_index < 16) {
+                                                        if (best_candidate_count < 16)
+                                                                best_candidate_count++;
+                                                        for (size_t move_index = best_candidate_count - 1; move_index > insert_index; move_index--)
+                                                                best_candidates[move_index] = best_candidates[move_index - 1];
+                                                        best_candidates[insert_index] = candidate;
+                                                }
+                                        }
+                                }
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                        }
+
+                        for (size_t first_index = 0; first_index < best_candidate_count; first_index++) {
+                                for (size_t second_index = first_index; second_index < best_candidate_count; second_index++) {
+                                        for (size_t third_index = second_index; third_index < best_candidate_count; third_index++) {
+                                                baseline_effect_candidate_t const *picked[3] = {
+                                                        &best_candidates[first_index],
+                                                        &best_candidates[second_index],
+                                                        &best_candidates[third_index],
+                                                };
+                                                itty_feed_model_mask_flip_trace_t combined_traces[32] = { 0 };
+                                                size_t combined_count = 0;
+                                                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                                itty_feed_model_decoder_objective_t selected_objective = { 0 };
+                                                itty_feed_model_decoder_objective_t node1_objective = { 0 };
+                                                itty_feed_model_decoder_objective_t node6_objective = { 0 };
+                                                itty_feed_model_segment_node_selection_summary_t selection = { 0 };
+                                                bool selected_safe = true;
+                                                size_t teacher_distance_after = 0;
+                                                char label[96] = { 0 };
+
+                                                assert (snapshot);
+                                                for (size_t trace_index = 0; trace_index < set->exact_trace_count; trace_index++)
+                                                        combined_traces[combined_count++] = set->exact_traces[trace_index];
+                                                for (size_t pick_index = 0; pick_index < 3; pick_index++) {
+                                                        bool duplicate = false;
+                                                        for (size_t existing_index = 0; existing_index < combined_count; existing_index++) {
+                                                                if (combined_traces[existing_index].node_index == picked[pick_index]->trace.node_index &&
+                                                                    combined_traces[existing_index].input_index == picked[pick_index]->trace.input_index &&
+                                                                    combined_traces[existing_index].bit_index == picked[pick_index]->trace.bit_index) {
+                                                                        combined_traces[existing_index].value_after = picked[pick_index]->trace.value_after;
+                                                                        duplicate = true;
+                                                                        break;
+                                                                }
+                                                        }
+                                                        if (!duplicate && combined_count < sizeof combined_traces / sizeof combined_traces[0])
+                                                                combined_traces[combined_count++] = picked[pick_index]->trace;
+                                                        if (strlen (label) == 0)
+                                                                snprintf (label, sizeof label, "%s", picked[pick_index]->label);
+                                                        else
+                                                                snprintf (label + strlen (label), sizeof label - strlen (label), "+%s", picked[pick_index]->label);
+                                                }
+
+                                                set->tx_tested++;
+                                                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                                             combined_traces,
+                                                                                                             combined_count));
+                                                assert (measure_selected_node_objective (decoder_model,
+                                                                                        input_d,
+                                                                                        target_d,
+                                                                                        &selection,
+                                                                                        &selected_objective));
+                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                            input_d,
+                                                                                                            target_d,
+                                                                                                            d_route,
+                                                                                                            &node1_objective));
+                                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                            input_d,
+                                                                                                            target_d,
+                                                                                                            d_internal.current_internal_node,
+                                                                                                            &node6_objective));
+                                                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                                        itty_feed_model_decoder_objective_t owner_after = { 0 };
+                                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                                    owner_index == 0 ? input_a :
+                                                                                                                    owner_index == 1 ? input_b :
+                                                                                                                                       input_c,
+                                                                                                                    owner_index == 0 ? target_a :
+                                                                                                                    owner_index == 1 ? target_b :
+                                                                                                                                       target_c,
+                                                                                                                    owner_index == 0 ? a_route :
+                                                                                                                    owner_index == 1 ? b_route :
+                                                                                                                                       c_route,
+                                                                                                                    &owner_after));
+                                                        if (!route_objective_not_worse_than_committed (&owner_after, &committed_objectives[owner_index]))
+                                                                selected_safe = false;
+                                                }
+                                                if (measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route ||
+                                                    measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap == 0)
+                                                        selected_safe = false;
+                                                if (node1_objective.selected_popcount <= node6_objective.selected_popcount)
+                                                        selected_safe = false;
+                                                if (selected_objective.false_negative_vote_deficit != 0)
+                                                        selected_safe = false;
+                                                if (!route_objective_not_worse_than_committed (&selected_objective, &committed_objectives[3]))
+                                                        selected_safe = false;
+                                                {
+                                                        itty_bit_string_t *node1_activation = NULL;
+                                                        assert (measure_output_activation_for_node (decoder_model, input_d, d_route, &node1_activation));
+                                                        teacher_distance_after = measure_bit_string_distance (node1_activation, teacher_activation);
+                                                        itty_bit_string_free (node1_activation);
+                                                }
+                                                if (selected_safe)
+                                                        set->tx_selected_safe++;
+                                                if (selected_safe &&
+                                                    route_objective_improves_on_committed (&selected_objective, &committed_objectives[3]))
+                                                        set->tx_improving++;
+                                                if (selected_safe &&
+                                                    route_objective_improves_on_committed (&selected_objective, &committed_objectives[3]) &&
+                                                    (!set->tx_found ||
+                                                     route_objective_improves_on_committed (&selected_objective, &set->tx_objective_after) ||
+                                                     (selected_objective.selected_distance == set->tx_objective_after.selected_distance &&
+                                                      selected_objective.false_positive_vote_excess == set->tx_objective_after.false_positive_vote_excess &&
+                                                      ((ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount) > set->tx_node1_vs_node6_gap_after) ||
+                                                     (selected_objective.selected_distance == set->tx_objective_after.selected_distance &&
+                                                      selected_objective.false_positive_vote_excess == set->tx_objective_after.false_positive_vote_excess &&
+                                                      ((ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount) == set->tx_node1_vs_node6_gap_after &&
+                                                      teacher_distance_after < set->tx_teacher_distance_after) ||
+                                                     (selected_objective.selected_distance == set->tx_objective_after.selected_distance &&
+                                                      selected_objective.false_positive_vote_excess == set->tx_objective_after.false_positive_vote_excess &&
+                                                      ((ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount) == set->tx_node1_vs_node6_gap_after &&
+                                                      teacher_distance_after == set->tx_teacher_distance_after &&
+                                                      combined_count < set->tx_flips))) {
+                                                        set->tx_found = true;
+                                                        snprintf (set->tx_label, sizeof set->tx_label, "%s", label);
+                                                        set->tx_flips = combined_count;
+                                                        set->tx_teacher_distance_after = teacher_distance_after;
+                                                        set->tx_selected_after = selection.selected_by_popcount;
+                                                        set->tx_node1_pop_after = node1_objective.selected_popcount;
+                                                        set->tx_node6_pop_after = node6_objective.selected_popcount;
+                                                        set->tx_node1_vs_node6_gap_after =
+                                                                (ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount;
+                                                        set->tx_objective_after = selected_objective;
+                                                        set->tx_trace_count = combined_count;
+                                                        memcpy (set->tx_traces, combined_traces, sizeof set->tx_traces);
+                                                }
+                                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                                        }
+                                }
+                        }
+
+                        itty_bit_string_free (teacher_activation);
+                }
+        }
+        {
+                typedef struct {
+                        itty_feed_model_mask_flip_trace_t trace;
+                        char        label[48];
+                        bool        selected_safe;
+                        size_t      selected_distance;
+                        size_t      selected_excess;
+                        size_t      teacher_distance;
+                        ptrdiff_t   gap;
+                } sat_effect_candidate_t;
+                size_t baseline_node_indices[2] = { d_route, d_internal.current_internal_node };
+                itty_feed_model_mask_flip_trace_t baseline_traces[512] = { 0 };
+                size_t baseline_trace_count =
+                        itty_feed_model_collect_final_layer_toggle_traces_for_nodes (decoder_model,
+                                                                                     baseline_node_indices,
+                                                                                     2,
+                                                                                     baseline_traces,
+                                                                                     sizeof baseline_traces / sizeof (baseline_traces[0]));
+
+                for (size_t set_index = 0; set_index < d_post_commit_residual_set_count; set_index++) {
+                        d_residual_set_summary_t *set = &d_post_commit_residual_sets[set_index];
+                        sat_effect_candidate_t candidates[24] = { 0 };
+                        size_t candidate_count = 0;
+                        itty_bit_string_t *teacher_activation = NULL;
+
+                        if (set->bit_count != 1)
+                                continue;
+                        if (!set->exact_measured || set->exact_trace_count == 0)
+                                continue;
+
+                        {
+                                size_t subset_bits[4] = { 0 };
+                                size_t subset_count = 0;
+                                char *cursor = set->label;
+                                while (*cursor && subset_count < 4) {
+                                        char *end = NULL;
+                                        subset_bits[subset_count++] = strtoul (cursor, &end, 10);
+                                        cursor = end;
+                                        if (*cursor == '+')
+                                                cursor++;
+                                }
+                                assert (build_selected_node_direct_clear_teacher (decoder_model,
+                                                                                 input_d,
+                                                                                 target_d,
+                                                                                 d_route,
+                                                                                 subset_bits,
+                                                                                 subset_count,
+                                                                                 &teacher_activation));
+                        }
+
+                        for (size_t trace_index = 0; trace_index < baseline_trace_count; trace_index++) {
+                                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                itty_feed_model_decoder_objective_t selected_objective = { 0 };
+                                itty_feed_model_decoder_objective_t node1_objective = { 0 };
+                                itty_feed_model_decoder_objective_t node6_objective = { 0 };
+                                itty_feed_model_segment_node_selection_summary_t selection = { 0 };
+                                bool selected_safe = true;
+                                sat_effect_candidate_t candidate = { .trace = baseline_traces[trace_index] };
+
+                                assert (snapshot);
+                                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                             &baseline_traces[trace_index],
+                                                                                             1));
+                                assert (measure_selected_node_objective (decoder_model,
+                                                                        input_d,
+                                                                        target_d,
+                                                                        &selection,
+                                                                        &selected_objective));
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            input_d,
+                                                                                            target_d,
+                                                                                            d_route,
+                                                                                            &node1_objective));
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            input_d,
+                                                                                            target_d,
+                                                                                            d_internal.current_internal_node,
+                                                                                            &node6_objective));
+                                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                        itty_feed_model_decoder_objective_t owner_after = { 0 };
+                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                    owner_index == 0 ? input_a :
+                                                                                                    owner_index == 1 ? input_b :
+                                                                                                                       input_c,
+                                                                                                    owner_index == 0 ? target_a :
+                                                                                                    owner_index == 1 ? target_b :
+                                                                                                                       target_c,
+                                                                                                    owner_index == 0 ? a_route :
+                                                                                                    owner_index == 1 ? b_route :
+                                                                                                                       c_route,
+                                                                                                    &owner_after));
+                                        if (!route_objective_not_worse_than_committed (&owner_after, &committed_objectives[owner_index]))
+                                                selected_safe = false;
+                                }
+                                if (measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route ||
+                                    measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap == 0)
+                                        selected_safe = false;
+                                if (node1_objective.selected_popcount <= node6_objective.selected_popcount)
+                                        selected_safe = false;
+                                if (selected_objective.false_negative_vote_deficit != 0)
+                                        selected_safe = false;
+                                if (!route_objective_not_worse_than_committed (&selected_objective, &committed_objectives[3]))
+                                        selected_safe = false;
+                                {
+                                        itty_bit_string_t *node1_activation = NULL;
+                                        assert (measure_output_activation_for_node (decoder_model, input_d, d_route, &node1_activation));
+                                        candidate.teacher_distance = measure_bit_string_distance (node1_activation, teacher_activation);
+                                        itty_bit_string_free (node1_activation);
+                                }
+                                candidate.selected_safe = selected_safe;
+                                candidate.selected_distance = selected_objective.selected_distance;
+                                candidate.selected_excess = selected_objective.false_positive_vote_excess;
+                                candidate.gap = (ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount;
+                                snprintf (candidate.label, sizeof candidate.label, "n%zu.i%zu.b%zu=%d",
+                                          candidate.trace.node_index,
+                                          candidate.trace.input_index,
+                                          candidate.trace.bit_index,
+                                          candidate.trace.value_after ? 1 : 0);
+                                {
+                                        bool interesting =
+                                                candidate.selected_safe ||
+                                                candidate.selected_distance <= committed_objectives[3].selected_distance ||
+                                                candidate.selected_excess <= committed_objectives[3].false_positive_vote_excess ||
+                                                candidate.gap > 0;
+
+                                        if (interesting) {
+                                                size_t insert_index = candidate_count;
+                                                for (size_t candidate_index = 0; candidate_index < candidate_count; candidate_index++) {
+                                                        bool better =
+                                                                (candidate.selected_safe && !candidates[candidate_index].selected_safe) ||
+                                                                (candidate.selected_safe == candidates[candidate_index].selected_safe &&
+                                                                 candidate.selected_distance < candidates[candidate_index].selected_distance) ||
+                                                                (candidate.selected_safe == candidates[candidate_index].selected_safe &&
+                                                                 candidate.selected_distance == candidates[candidate_index].selected_distance &&
+                                                                 candidate.selected_excess < candidates[candidate_index].selected_excess) ||
+                                                                (candidate.selected_safe == candidates[candidate_index].selected_safe &&
+                                                                 candidate.selected_distance == candidates[candidate_index].selected_distance &&
+                                                                 candidate.selected_excess == candidates[candidate_index].selected_excess &&
+                                                                 candidate.teacher_distance < candidates[candidate_index].teacher_distance) ||
+                                                                (candidate.selected_safe == candidates[candidate_index].selected_safe &&
+                                                                 candidate.selected_distance == candidates[candidate_index].selected_distance &&
+                                                                 candidate.selected_excess == candidates[candidate_index].selected_excess &&
+                                                                 candidate.teacher_distance == candidates[candidate_index].teacher_distance &&
+                                                                 candidate.gap > candidates[candidate_index].gap);
+                                                        if (better) {
+                                                                insert_index = candidate_index;
+                                                                break;
+                                                        }
+                                                }
+                                                if (insert_index < sizeof candidates / sizeof candidates[0]) {
+                                                        if (candidate_count < sizeof candidates / sizeof candidates[0])
+                                                                candidate_count++;
+                                                        for (size_t move_index = candidate_count - 1; move_index > insert_index; move_index--)
+                                                                candidates[move_index] = candidates[move_index - 1];
+                                                        candidates[insert_index] = candidate;
+                                                }
+                                        }
+                                }
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                        }
+
+                        set->sat_pool_count = candidate_count;
+
+                        for (size_t first_index = 0; first_index < candidate_count; first_index++) {
+                                sat_effect_candidate_t const *picked = &candidates[first_index];
+                                itty_feed_model_mask_flip_trace_t combined_traces[32] = { 0 };
+                                size_t combined_count = 0;
+                                itty_feed_model_layer_state_snapshot_t *snapshot = itty_feed_model_snapshot_final_layer_state (decoder_model);
+                                itty_feed_model_decoder_objective_t selected_objective = { 0 };
+                                itty_feed_model_decoder_objective_t node1_objective = { 0 };
+                                itty_feed_model_decoder_objective_t node6_objective = { 0 };
+                                itty_feed_model_segment_node_selection_summary_t selection = { 0 };
+                                bool selected_safe = true;
+                                size_t teacher_distance_after = 0;
+
+                                assert (snapshot);
+                                for (size_t trace_index = 0; trace_index < set->exact_trace_count; trace_index++)
+                                        combined_traces[combined_count++] = set->exact_traces[trace_index];
+                                combined_traces[combined_count++] = picked->trace;
+
+                                set->sat_tested++;
+                                assert (itty_feed_model_apply_final_layer_mask_flip_traces (decoder_model,
+                                                                                             combined_traces,
+                                                                                             combined_count));
+                                assert (measure_selected_node_objective (decoder_model,
+                                                                        input_d,
+                                                                        target_d,
+                                                                        &selection,
+                                                                        &selected_objective));
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            input_d,
+                                                                                            target_d,
+                                                                                            d_route,
+                                                                                            &node1_objective));
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            input_d,
+                                                                                            target_d,
+                                                                                            d_internal.current_internal_node,
+                                                                                            &node6_objective));
+                                for (size_t owner_index = 0; owner_index < 3; owner_index++) {
+                                        itty_feed_model_decoder_objective_t owner_after = { 0 };
+                                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                                    owner_index == 0 ? input_a :
+                                                                                                    owner_index == 1 ? input_b :
+                                                                                                                       input_c,
+                                                                                                    owner_index == 0 ? target_a :
+                                                                                                    owner_index == 1 ? target_b :
+                                                                                                                       target_c,
+                                                                                                    owner_index == 0 ? a_route :
+                                                                                                    owner_index == 1 ? b_route :
+                                                                                                                       c_route,
+                                                                                                    &owner_after));
+                                        if (!route_objective_not_worse_than_committed (&owner_after, &committed_objectives[owner_index]))
+                                                selected_safe = false;
+                                }
+                                if (measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_route != d_route ||
+                                    measure_route_key_selection_for_probe (route_keys, nodes, probe_d).selected_gap == 0)
+                                        selected_safe = false;
+                                if (node1_objective.selected_popcount <= node6_objective.selected_popcount)
+                                        selected_safe = false;
+                                if (selected_objective.false_negative_vote_deficit != 0)
+                                        selected_safe = false;
+                                if (!route_objective_not_worse_than_committed (&selected_objective, &committed_objectives[3]))
+                                        selected_safe = false;
+                                {
+                                        itty_bit_string_t *node1_activation = NULL;
+                                        assert (measure_output_activation_for_node (decoder_model, input_d, d_route, &node1_activation));
+                                        teacher_distance_after = measure_bit_string_distance (node1_activation, teacher_activation);
+                                        itty_bit_string_free (node1_activation);
+                                }
+                                if (selected_safe)
+                                        set->sat_selected_safe++;
+                                if (selected_safe &&
+                                    route_objective_improves_on_committed (&selected_objective, &committed_objectives[3]))
+                                        set->sat_improving++;
+                                if (selected_safe &&
+                                    route_objective_improves_on_committed (&selected_objective, &committed_objectives[3]) &&
+                                    (!set->sat_found ||
+                                     route_objective_improves_on_committed (&selected_objective, &set->sat_objective_after) ||
+                                     (selected_objective.selected_distance == set->sat_objective_after.selected_distance &&
+                                      selected_objective.false_positive_vote_excess == set->sat_objective_after.false_positive_vote_excess &&
+                                      ((ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount) > set->sat_node1_vs_node6_gap_after) ||
+                                     (selected_objective.selected_distance == set->sat_objective_after.selected_distance &&
+                                      selected_objective.false_positive_vote_excess == set->sat_objective_after.false_positive_vote_excess &&
+                                      ((ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount) == set->sat_node1_vs_node6_gap_after &&
+                                      teacher_distance_after < set->sat_teacher_distance_after) ||
+                                     (selected_objective.selected_distance == set->sat_objective_after.selected_distance &&
+                                      selected_objective.false_positive_vote_excess == set->sat_objective_after.false_positive_vote_excess &&
+                                      ((ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount) == set->sat_node1_vs_node6_gap_after &&
+                                      teacher_distance_after == set->sat_teacher_distance_after &&
+                                      combined_count < set->sat_flips))) {
+                                        set->sat_found = true;
+                                        snprintf (set->sat_label, sizeof set->sat_label, "%s", picked->label);
+                                        set->sat_flips = combined_count;
+                                        set->sat_teacher_distance_after = teacher_distance_after;
+                                        set->sat_selected_after = selection.selected_by_popcount;
+                                        set->sat_node1_pop_after = node1_objective.selected_popcount;
+                                        set->sat_node6_pop_after = node6_objective.selected_popcount;
+                                        set->sat_node1_vs_node6_gap_after =
+                                                (ptrdiff_t) node1_objective.selected_popcount - (ptrdiff_t) node6_objective.selected_popcount;
+                                        set->sat_objective_after = selected_objective;
+                                        set->sat_trace_count = combined_count;
+                                        memcpy (set->sat_traces, combined_traces, sizeof set->sat_traces);
+                                }
+                                itty_feed_model_restore_final_layer_state_snapshot (decoder_model, snapshot);
+                        }
+
+                        itty_bit_string_free (teacher_activation);
+                }
+        }
+        {
+                size_t max_threshold = nodes;
+                itty_feed_model_set_residual_merge_enabled (decoder_model, false);
+
+                d_threshold_sweep_count = max_threshold < (sizeof d_threshold_sweep / sizeof d_threshold_sweep[0]) ?
+                                          max_threshold :
+                                          (sizeof d_threshold_sweep / sizeof d_threshold_sweep[0]);
+                for (size_t threshold_index = 0; threshold_index < d_threshold_sweep_count; threshold_index++) {
+                        within_node_threshold_sweep_summary_t *summary = &d_threshold_sweep[threshold_index];
+
+                        *summary = (within_node_threshold_sweep_summary_t) {
+                                .threshold = threshold_index + 1,
+                        };
+                        itty_feed_model_set_within_node_condense_threshold_override (decoder_model,
+                                                                                     summary->threshold);
+                        summary->measured = true;
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            owner_index == 0 ? input_a :
+                                                                                            owner_index == 1 ? input_b :
+                                                                                            owner_index == 2 ? input_c :
+                                                                                                               input_d,
+                                                                                            owner_index == 0 ? target_a :
+                                                                                            owner_index == 1 ? target_b :
+                                                                                            owner_index == 2 ? target_c :
+                                                                                                               target_d,
+                                                                                            owner_index == 0 ? a_route :
+                                                                                            owner_index == 1 ? b_route :
+                                                                                            owner_index == 2 ? c_route :
+                                                                                                               d_route,
+                                                                                            &summary->objectives[owner_index]));
+                                summary->total_distance += summary->objectives[owner_index].selected_distance;
+                                summary->total_excess += summary->objectives[owner_index].false_positive_vote_excess;
+                                if (!route_objective_not_worse_than_committed (&summary->objectives[owner_index],
+                                                                              &committed_objectives[owner_index]))
+                                        summary->regressions++;
+                        }
+                        {
+                                itty_feed_model_segment_node_selection_summary_t selection = { 0 };
+
+                                assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                                       input_d,
+                                                                                       target_d,
+                                                                                       &selection));
+                                summary->d_selected_node = selection.selected_by_popcount;
+                                summary->d_selected_gap = selection.popcount_gap;
+                        }
+                }
+                itty_feed_model_set_within_node_condense_threshold_override (decoder_model, 0);
+                d_fixed_node_threshold_sweep_count = d_threshold_sweep_count;
+                for (size_t threshold_index = 0; threshold_index < d_fixed_node_threshold_sweep_count; threshold_index++) {
+                        fixed_node_threshold_sweep_summary_t *summary = &d_fixed_node_threshold_sweep[threshold_index];
+                        itty_feed_model_segment_node_selection_summary_t selection = { 0 };
+                        itty_feed_model_decoder_objective_t node6_objective = { 0 };
+
+                        *summary = (fixed_node_threshold_sweep_summary_t) {
+                                .threshold = threshold_index + 1,
+                                .fixed_node = d_route,
+                        };
+                        itty_feed_model_set_within_node_condense_threshold_override (decoder_model,
+                                                                                     summary->threshold);
+                        summary->measured =
+                                itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                    input_d,
+                                                                                    target_d,
+                                                                                    d_route,
+                                                                                    &summary->node1_objective) &&
+                                itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                    input_d,
+                                                                                    target_d,
+                                                                                    6,
+                                                                                    &node6_objective) &&
+                                itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                               input_d,
+                                                                               target_d,
+                                                                               &selection);
+                        if (!summary->measured)
+                                continue;
+
+                        summary->selected_node = selection.selected_by_popcount;
+                        summary->node1_popcount = summary->node1_objective.selected_popcount;
+                        summary->node6_popcount = node6_objective.selected_popcount;
+                        summary->node1_vs_node6_gap = (ptrdiff_t) summary->node1_popcount -
+                                                      (ptrdiff_t) summary->node6_popcount;
+                }
+                itty_feed_model_set_within_node_condense_threshold_override (decoder_model, 0);
+                memcpy (d_fixed_node_threshold_ranked,
+                        d_fixed_node_threshold_sweep,
+                        sizeof d_fixed_node_threshold_sweep);
+                qsort (d_fixed_node_threshold_ranked,
+                       d_fixed_node_threshold_sweep_count,
+                       sizeof d_fixed_node_threshold_ranked[0],
+                       compare_fixed_node_threshold_sweep_summary);
+                memcpy (d_threshold_ranked, d_threshold_sweep, sizeof d_threshold_sweep);
+                qsort (d_threshold_ranked,
+                       d_threshold_sweep_count,
+                       sizeof d_threshold_ranked[0],
+                       compare_within_node_threshold_sweep_summary);
+                if (d_threshold_sweep_count >= 2) {
+                        itty_bit_string_t *condensed_low = NULL;
+                        itty_bit_string_t *condensed_high = NULL;
+                        itty_bit_string_t *activation_low = NULL;
+                        itty_bit_string_t *activation_high = NULL;
+                        itty_bit_string_t *folded_low = NULL;
+                        itty_bit_string_t *folded_high = NULL;
+                        itty_bit_string_t *fixed_folded_low = NULL;
+                        itty_bit_string_t *fixed_folded_high = NULL;
+                        size_t folded_selected_low = 0;
+                        size_t folded_selected_high = 0;
+
+                        d_threshold_extremes.threshold_low = 1;
+                        d_threshold_extremes.threshold_high = d_threshold_sweep_count;
+                        d_threshold_extremes.residual_disabled = true;
+                        d_threshold_extremes.fixed_node_index = d_route;
+
+                        itty_feed_model_set_within_node_condense_threshold_override (decoder_model,
+                                                                                     d_threshold_extremes.threshold_low);
+                        assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                               input_d,
+                                                                               target_d,
+                                                                               &d_profile_post_commit_selection));
+                        d_threshold_extremes.selected_node_low = d_profile_post_commit_selection.selected_by_popcount;
+                        assert (itty_feed_model_measure_node_condensed_output (decoder_model,
+                                                                              input_d,
+                                                                              1,
+                                                                              d_threshold_extremes.selected_node_low,
+                                                                              &condensed_low));
+                        assert (measure_output_activation_for_node (decoder_model,
+                                                                   input_d,
+                                                                   d_threshold_extremes.selected_node_low,
+                                                                   &activation_low));
+                        assert (itty_feed_model_measure_selected_folded_output (decoder_model,
+                                                                                input_d,
+                                                                                target_d,
+                                                                                &folded_selected_low,
+                                                                                &folded_low));
+                        assert (itty_feed_model_measure_node_folded_output (decoder_model,
+                                                                            input_d,
+                                                                            target_d,
+                                                                            d_threshold_extremes.fixed_node_index,
+                                                                            &fixed_folded_low));
+                        d_threshold_extremes.folded_selected_low = folded_selected_low;
+                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                    input_d,
+                                                                                    target_d,
+                                                                                    d_route,
+                                                                                    &d_threshold_extremes.objective_low));
+
+                        itty_feed_model_set_within_node_condense_threshold_override (decoder_model,
+                                                                                     d_threshold_extremes.threshold_high);
+                        assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                               input_d,
+                                                                               target_d,
+                                                                               &d_profile_post_commit_selection));
+                        d_threshold_extremes.selected_node_high = d_profile_post_commit_selection.selected_by_popcount;
+                        assert (itty_feed_model_measure_node_condensed_output (decoder_model,
+                                                                              input_d,
+                                                                              1,
+                                                                              d_threshold_extremes.selected_node_high,
+                                                                              &condensed_high));
+                        assert (measure_output_activation_for_node (decoder_model,
+                                                                   input_d,
+                                                                   d_threshold_extremes.selected_node_high,
+                                                                   &activation_high));
+                        assert (itty_feed_model_measure_selected_folded_output (decoder_model,
+                                                                                input_d,
+                                                                                target_d,
+                                                                                &folded_selected_high,
+                                                                                &folded_high));
+                        assert (itty_feed_model_measure_node_folded_output (decoder_model,
+                                                                            input_d,
+                                                                            target_d,
+                                                                            d_threshold_extremes.fixed_node_index,
+                                                                            &fixed_folded_high));
+                        d_threshold_extremes.folded_selected_high = folded_selected_high;
+                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                    input_d,
+                                                                                    target_d,
+                                                                                    d_route,
+                                                                                    &d_threshold_extremes.objective_high));
+
+                        d_threshold_extremes.condensed_distance = measure_bit_string_distance (condensed_low,
+                                                                                                condensed_high);
+                        d_threshold_extremes.condensed_pop_low = itty_bit_string_get_pop_count (condensed_low);
+                        d_threshold_extremes.condensed_pop_high = itty_bit_string_get_pop_count (condensed_high);
+                        d_threshold_extremes.activation_distance = measure_bit_string_distance (activation_low,
+                                                                                                activation_high);
+                        d_threshold_extremes.activation_pop_low = itty_bit_string_get_pop_count (activation_low);
+                        d_threshold_extremes.activation_pop_high = itty_bit_string_get_pop_count (activation_high);
+                        d_threshold_extremes.fixed_folded_distance = measure_bit_string_distance (fixed_folded_low,
+                                                                                                  fixed_folded_high);
+                        d_threshold_extremes.fixed_folded_pop_low = itty_bit_string_get_pop_count (fixed_folded_low);
+                        d_threshold_extremes.fixed_folded_pop_high = itty_bit_string_get_pop_count (fixed_folded_high);
+                        d_threshold_extremes.target_bit_capacity = itty_bit_string_get_bit_capacity (target_d);
+                        d_threshold_extremes.segments_per_bit =
+                                d_threshold_extremes.target_bit_capacity == 0 ? 0 :
+                                itty_bit_string_get_bit_capacity (activation_low) / d_threshold_extremes.target_bit_capacity;
+                        for (size_t decoded_bit = 0;
+                             decoded_bit < d_threshold_extremes.target_bit_capacity;
+                             decoded_bit++) {
+                                size_t ones_low = 0;
+                                size_t ones_high = 0;
+                                bool folded_bit_low = measure_public_bit (fixed_folded_low, decoded_bit);
+                                bool folded_bit_high = measure_public_bit (fixed_folded_high, decoded_bit);
+
+                                for (size_t output_bit = decoded_bit;
+                                     output_bit < itty_bit_string_get_bit_capacity (activation_low);
+                                     output_bit += d_threshold_extremes.target_bit_capacity) {
+                                        if (measure_public_bit (activation_low, output_bit))
+                                                ones_low++;
+                                        if (measure_public_bit (activation_high, output_bit))
+                                                ones_high++;
+                                }
+
+                                if (ones_low != ones_high)
+                                        d_threshold_extremes.decoded_groups_changed++;
+                                if (folded_bit_low != folded_bit_high)
+                                        d_threshold_extremes.decoded_groups_crossed_threshold++;
+                        }
+                        {
+                                size_t residual_bits[] = { 25, 26, 29 };
+                                for (size_t residual_index = 0;
+                                     residual_index < sizeof residual_bits / sizeof residual_bits[0] &&
+                                     residual_index < sizeof d_threshold_extremes.residual_rows / sizeof d_threshold_extremes.residual_rows[0];
+                                     residual_index++) {
+                                        size_t decoded_bit = residual_bits[residual_index];
+                                size_t ones_low = 0;
+                                size_t ones_high = 0;
+
+                                for (size_t output_bit = decoded_bit;
+                                     output_bit < itty_bit_string_get_bit_capacity (activation_low);
+                                     output_bit += d_threshold_extremes.target_bit_capacity) {
+                                        if (measure_public_bit (activation_low, output_bit))
+                                                ones_low++;
+                                        if (measure_public_bit (activation_high, output_bit))
+                                                ones_high++;
+                                }
+
+                                d_threshold_extremes.residual_rows[d_threshold_extremes.residual_bits_compared].decoded_bit = decoded_bit;
+                                d_threshold_extremes.residual_rows[d_threshold_extremes.residual_bits_compared].ones_low = ones_low;
+                                d_threshold_extremes.residual_rows[d_threshold_extremes.residual_bits_compared].ones_high = ones_high;
+                                d_threshold_extremes.residual_rows[d_threshold_extremes.residual_bits_compared].folded_low =
+                                        measure_public_bit (fixed_folded_low, decoded_bit);
+                                d_threshold_extremes.residual_rows[d_threshold_extremes.residual_bits_compared].folded_high =
+                                        measure_public_bit (fixed_folded_high, decoded_bit);
+                                d_threshold_extremes.residual_bits_compared++;
+                                }
+                        }
+                        d_threshold_extremes.measured = true;
+
+                        itty_bit_string_free (condensed_low);
+                        itty_bit_string_free (condensed_high);
+                        itty_bit_string_free (activation_low);
+                        itty_bit_string_free (activation_high);
+                        itty_bit_string_free (folded_low);
+                        itty_bit_string_free (folded_high);
+                        itty_bit_string_free (fixed_folded_low);
+                        itty_bit_string_free (fixed_folded_high);
+                        itty_feed_model_set_within_node_condense_threshold_override (decoder_model, 0);
+                }
+                itty_feed_model_set_residual_merge_enabled (decoder_model, true);
+        }
+        if (d_threshold_sweep_count >= 2) {
+                itty_bit_string_t *condensed_low = NULL;
+                itty_bit_string_t *condensed_high = NULL;
+                itty_bit_string_t *activation_low = NULL;
+                itty_bit_string_t *activation_high = NULL;
+                itty_bit_string_t *folded_low = NULL;
+                itty_bit_string_t *folded_high = NULL;
+                itty_bit_string_t *fixed_folded_low = NULL;
+                itty_bit_string_t *fixed_folded_high = NULL;
+                size_t folded_selected_low = 0;
+                size_t folded_selected_high = 0;
+
+                d_threshold_extremes_enabled.threshold_low = 1;
+                d_threshold_extremes_enabled.threshold_high = d_threshold_sweep_count;
+                d_threshold_extremes_enabled.residual_disabled = false;
+                d_threshold_extremes_enabled.fixed_node_index = d_route;
+
+                itty_feed_model_set_within_node_condense_threshold_override (decoder_model,
+                                                                             d_threshold_extremes_enabled.threshold_low);
+                assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                       input_d,
+                                                                       target_d,
+                                                                       &d_profile_post_commit_selection));
+                d_threshold_extremes_enabled.selected_node_low = d_profile_post_commit_selection.selected_by_popcount;
+                assert (itty_feed_model_measure_node_condensed_output (decoder_model,
+                                                                      input_d,
+                                                                      1,
+                                                                      d_threshold_extremes_enabled.selected_node_low,
+                                                                      &condensed_low));
+                assert (measure_output_activation_for_node (decoder_model,
+                                                           input_d,
+                                                           d_threshold_extremes_enabled.fixed_node_index,
+                                                           &activation_low));
+                assert (itty_feed_model_measure_selected_folded_output (decoder_model,
+                                                                        input_d,
+                                                                        target_d,
+                                                                        &folded_selected_low,
+                                                                        &folded_low));
+                assert (itty_feed_model_measure_node_folded_output (decoder_model,
+                                                                    input_d,
+                                                                    target_d,
+                                                                    d_threshold_extremes_enabled.fixed_node_index,
+                                                                    &fixed_folded_low));
+                d_threshold_extremes_enabled.folded_selected_low = folded_selected_low;
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_d,
+                                                                            target_d,
+                                                                            d_route,
+                                                                            &d_threshold_extremes_enabled.objective_low));
+
+                itty_feed_model_set_within_node_condense_threshold_override (decoder_model,
+                                                                             d_threshold_extremes_enabled.threshold_high);
+                assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                       input_d,
+                                                                       target_d,
+                                                                       &d_profile_post_commit_selection));
+                d_threshold_extremes_enabled.selected_node_high = d_profile_post_commit_selection.selected_by_popcount;
+                assert (itty_feed_model_measure_node_condensed_output (decoder_model,
+                                                                      input_d,
+                                                                      1,
+                                                                      d_threshold_extremes_enabled.selected_node_high,
+                                                                      &condensed_high));
+                assert (measure_output_activation_for_node (decoder_model,
+                                                           input_d,
+                                                           d_threshold_extremes_enabled.fixed_node_index,
+                                                           &activation_high));
+                assert (itty_feed_model_measure_selected_folded_output (decoder_model,
+                                                                        input_d,
+                                                                        target_d,
+                                                                        &folded_selected_high,
+                                                                        &folded_high));
+                assert (itty_feed_model_measure_node_folded_output (decoder_model,
+                                                                    input_d,
+                                                                    target_d,
+                                                                    d_threshold_extremes_enabled.fixed_node_index,
+                                                                    &fixed_folded_high));
+                d_threshold_extremes_enabled.folded_selected_high = folded_selected_high;
+                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                            input_d,
+                                                                            target_d,
+                                                                            d_route,
+                                                                            &d_threshold_extremes_enabled.objective_high));
+
+                d_threshold_extremes_enabled.condensed_distance = measure_bit_string_distance (condensed_low,
+                                                                                               condensed_high);
+                d_threshold_extremes_enabled.condensed_pop_low = itty_bit_string_get_pop_count (condensed_low);
+                d_threshold_extremes_enabled.condensed_pop_high = itty_bit_string_get_pop_count (condensed_high);
+                d_threshold_extremes_enabled.activation_distance = measure_bit_string_distance (activation_low,
+                                                                                               activation_high);
+                d_threshold_extremes_enabled.activation_pop_low = itty_bit_string_get_pop_count (activation_low);
+                d_threshold_extremes_enabled.activation_pop_high = itty_bit_string_get_pop_count (activation_high);
+                d_threshold_extremes_enabled.fixed_folded_distance = measure_bit_string_distance (fixed_folded_low,
+                                                                                                  fixed_folded_high);
+                d_threshold_extremes_enabled.fixed_folded_pop_low = itty_bit_string_get_pop_count (fixed_folded_low);
+                d_threshold_extremes_enabled.fixed_folded_pop_high = itty_bit_string_get_pop_count (fixed_folded_high);
+                d_threshold_extremes_enabled.target_bit_capacity = itty_bit_string_get_bit_capacity (target_d);
+                d_threshold_extremes_enabled.segments_per_bit =
+                        d_threshold_extremes_enabled.target_bit_capacity == 0 ? 0 :
+                        itty_bit_string_get_bit_capacity (activation_low) / d_threshold_extremes_enabled.target_bit_capacity;
+                for (size_t decoded_bit = 0;
+                     decoded_bit < d_threshold_extremes_enabled.target_bit_capacity;
+                     decoded_bit++) {
+                        size_t ones_low = 0;
+                        size_t ones_high = 0;
+                        bool folded_bit_low = measure_public_bit (fixed_folded_low, decoded_bit);
+                        bool folded_bit_high = measure_public_bit (fixed_folded_high, decoded_bit);
+
+                        for (size_t output_bit = decoded_bit;
+                             output_bit < itty_bit_string_get_bit_capacity (activation_low);
+                             output_bit += d_threshold_extremes_enabled.target_bit_capacity) {
+                                if (measure_public_bit (activation_low, output_bit))
+                                        ones_low++;
+                                if (measure_public_bit (activation_high, output_bit))
+                                        ones_high++;
+                        }
+
+                        if (ones_low != ones_high)
+                                d_threshold_extremes_enabled.decoded_groups_changed++;
+                        if (folded_bit_low != folded_bit_high)
+                                d_threshold_extremes_enabled.decoded_groups_crossed_threshold++;
+                }
+                {
+                        size_t residual_bits[] = { 25, 26, 29 };
+                        for (size_t residual_index = 0;
+                             residual_index < sizeof residual_bits / sizeof residual_bits[0] &&
+                             residual_index < sizeof d_threshold_extremes_enabled.residual_rows / sizeof d_threshold_extremes_enabled.residual_rows[0];
+                             residual_index++) {
+                                size_t decoded_bit = residual_bits[residual_index];
+                                size_t ones_low = 0;
+                                size_t ones_high = 0;
+
+                                for (size_t output_bit = decoded_bit;
+                                     output_bit < itty_bit_string_get_bit_capacity (activation_low);
+                                     output_bit += d_threshold_extremes_enabled.target_bit_capacity) {
+                                        if (measure_public_bit (activation_low, output_bit))
+                                                ones_low++;
+                                        if (measure_public_bit (activation_high, output_bit))
+                                                ones_high++;
+                                }
+
+                                d_threshold_extremes_enabled.residual_rows[d_threshold_extremes_enabled.residual_bits_compared].decoded_bit = decoded_bit;
+                                d_threshold_extremes_enabled.residual_rows[d_threshold_extremes_enabled.residual_bits_compared].ones_low = ones_low;
+                                d_threshold_extremes_enabled.residual_rows[d_threshold_extremes_enabled.residual_bits_compared].ones_high = ones_high;
+                                d_threshold_extremes_enabled.residual_rows[d_threshold_extremes_enabled.residual_bits_compared].folded_low =
+                                        measure_public_bit (fixed_folded_low, decoded_bit);
+                                d_threshold_extremes_enabled.residual_rows[d_threshold_extremes_enabled.residual_bits_compared].folded_high =
+                                        measure_public_bit (fixed_folded_high, decoded_bit);
+                                d_threshold_extremes_enabled.residual_bits_compared++;
+                        }
+                }
+                d_threshold_extremes_enabled.measured = true;
+
+                itty_bit_string_free (condensed_low);
+                itty_bit_string_free (condensed_high);
+                itty_bit_string_free (activation_low);
+                itty_bit_string_free (activation_high);
+                itty_bit_string_free (folded_low);
+                itty_bit_string_free (folded_high);
+                itty_bit_string_free (fixed_folded_low);
+                itty_bit_string_free (fixed_folded_high);
+                itty_feed_model_set_within_node_condense_threshold_override (decoder_model, 0);
+        }
+        {
+                itty_feed_model_train_options_t direct_options = {
+                        .backward_fold = ITTY_FEED_MODEL_BACKWARD_FOLD_SEGMENT_CONDENSE,
+                        .backward_node_target = ITTY_FEED_MODEL_BACKWARD_NODE_TARGET_SAME,
+                };
+
+                itty_feed_model_set_decoder (decoder_model,
+                                             ITTY_FEED_MODEL_DECODER_DIRECT_DUPLICATED_TARGET);
+                d_direct_duplicate_probe.measured = true;
+                for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                    owner_index == 0 ? input_a :
+                                                                                    owner_index == 1 ? input_b :
+                                                                                    owner_index == 2 ? input_c :
+                                                                                                       input_d,
+                                                                                    owner_index == 0 ? target_a :
+                                                                                    owner_index == 1 ? target_b :
+                                                                                    owner_index == 2 ? target_c :
+                                                                                                       target_d,
+                                                                                    owner_index == 0 ? a_route :
+                                                                                    owner_index == 1 ? b_route :
+                                                                                    owner_index == 2 ? c_route :
+                                                                                                       d_route,
+                                                                                    &d_direct_duplicate_probe.before[owner_index]));
+                }
+                d_direct_duplicate_probe.trained =
+                        itty_feed_model_train_backwards_one_with_options (decoder_model,
+                                                                          input_d,
+                                                                          target_d,
+                                                                          &direct_options);
+                if (d_direct_duplicate_probe.trained) {
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                            owner_index == 0 ? input_a :
+                                                                                            owner_index == 1 ? input_b :
+                                                                                            owner_index == 2 ? input_c :
+                                                                                                               input_d,
+                                                                                            owner_index == 0 ? target_a :
+                                                                                            owner_index == 1 ? target_b :
+                                                                                            owner_index == 2 ? target_c :
+                                                                                                               target_d,
+                                                                                            owner_index == 0 ? a_route :
+                                                                                            owner_index == 1 ? b_route :
+                                                                                            owner_index == 2 ? c_route :
+                                                                                                               d_route,
+                                                                                            &d_direct_duplicate_probe.after[owner_index]));
+                        }
+                }
+                itty_feed_model_set_decoder (decoder_model,
+                                             ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE);
+        }
+        {
+                itty_feed_model_t *fresh_direct_model = itty_feed_model_new (2, nodes, 1, 1);
+                itty_bit_string_list_t *fresh_inputs[4] = { input_a, input_b, input_c, input_d };
+                itty_bit_string_t *fresh_targets[4] = { target_a, target_b, target_c, target_d };
+                size_t fresh_routes[4] = { a_route, b_route, c_route, d_route };
+                itty_bit_string_t *fresh_a_activation = NULL;
+                itty_bit_string_t *fresh_a_dup_target = NULL;
+                itty_feed_model_train_stats_t fresh_stats = { 0 };
+                size_t direct_training_order[4] = { 1, 0, 2, 3 };
+                itty_feed_model_train_options_t fresh_options = {
+                        .max_flips = oracle_options.max_flips,
+                        .budget_policy = ITTY_FEED_MODEL_TRAIN_BUDGET_POLICY_LARGEST_ERROR_FIRST,
+                        .backward_fold = ITTY_FEED_MODEL_BACKWARD_FOLD_SEGMENT_CONDENSE,
+                        .backward_node_target = ITTY_FEED_MODEL_BACKWARD_NODE_TARGET_SAME,
+                };
+
+                d_direct_duplicate_fresh.measured = fresh_direct_model != NULL;
+                d_direct_duplicate_fresh.a_route = a_route;
+                d_direct_duplicate_fresh.b_route = b_route;
+                d_direct_duplicate_fresh.c_route = c_route;
+                d_direct_duplicate_fresh.d_route = d_route;
+                assert (fresh_direct_model);
+                itty_feed_model_set_decoder (fresh_direct_model,
+                                             ITTY_FEED_MODEL_DECODER_DIRECT_DUPLICATED_TARGET);
+
+                {
+                        itty_feed_model_segment_node_selection_summary_t fresh_a_selection = { 0 };
+                        d_direct_duplicate_fresh.a_selected_route =
+                                itty_feed_model_measure_segment_node_selection (fresh_direct_model,
+                                                                                input_a,
+                                                                                target_a,
+                                                                                &fresh_a_selection) ?
+                                fresh_a_selection.selected_by_popcount :
+                                (size_t) -1;
+                        d_direct_duplicate_fresh.a_selected_gap = fresh_a_selection.popcount_gap;
+                        for (size_t route_index = 0; route_index < nodes && route_index < 8; route_index++) {
+                                itty_bit_string_t *route_activation = NULL;
+                                if (itty_feed_model_measure_node_activation_output (fresh_direct_model,
+                                                                                    input_a,
+                                                                                    route_index,
+                                                                                    &route_activation)) {
+                                        d_direct_duplicate_fresh.a_route_activation_words[route_index] =
+                                                itty_bit_string_get_number_of_words (route_activation);
+                                        d_direct_duplicate_fresh.a_route_activation_popcounts[route_index] =
+                                                itty_bit_string_get_pop_count (route_activation);
+                                        itty_bit_string_free (route_activation);
+                                }
+                        }
+                }
+
+                d_direct_duplicate_fresh.a_activation_measured =
+                        itty_feed_model_measure_node_activation_output (fresh_direct_model,
+                                                                        input_a,
+                                                                        a_route,
+                                                                        &fresh_a_activation);
+                d_direct_duplicate_fresh.a_target_words =
+                        itty_bit_string_get_number_of_words (target_a);
+                if (d_direct_duplicate_fresh.a_activation_measured) {
+                        fresh_a_dup_target = itty_bit_string_clone (target_a);
+                        while (fresh_a_dup_target &&
+                               itty_bit_string_get_number_of_words (fresh_a_dup_target) <
+                               itty_bit_string_get_number_of_words (fresh_a_activation)) {
+                                itty_bit_string_t *next = itty_bit_string_double (fresh_a_dup_target);
+                                itty_bit_string_free (fresh_a_dup_target);
+                                fresh_a_dup_target = next;
+                        }
+                        d_direct_duplicate_fresh.a_activation_words =
+                                itty_bit_string_get_number_of_words (fresh_a_activation);
+                        d_direct_duplicate_fresh.a_activation_popcount =
+                                itty_bit_string_get_pop_count (fresh_a_activation);
+                        if (fresh_a_dup_target) {
+                                d_direct_duplicate_fresh.a_duplicated_target_words =
+                                        itty_bit_string_get_number_of_words (fresh_a_dup_target);
+                                d_direct_duplicate_fresh.a_duplicated_target_popcount =
+                                        itty_bit_string_get_pop_count (fresh_a_dup_target);
+                                d_direct_duplicate_fresh.a_target_aligned =
+                                        d_direct_duplicate_fresh.a_duplicated_target_words ==
+                                        d_direct_duplicate_fresh.a_activation_words;
+                        }
+                }
+
+                for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                        d_direct_duplicate_fresh.before_measured[owner_index] =
+                                itty_feed_model_measure_decoder_objective_for_node (fresh_direct_model,
+                                                                                    fresh_inputs[owner_index],
+                                                                                    fresh_targets[owner_index],
+                                                                                    fresh_routes[owner_index],
+                                                                                    &d_direct_duplicate_fresh.before[owner_index]);
+                }
+
+                d_direct_duplicate_fresh.trained =
+                        d_direct_duplicate_fresh.before_measured[0] &&
+                        d_direct_duplicate_fresh.before_measured[1] &&
+                        d_direct_duplicate_fresh.before_measured[2] &&
+                        d_direct_duplicate_fresh.before_measured[3];
+                for (size_t phase_index = 0; phase_index < 4 && d_direct_duplicate_fresh.trained; phase_index++) {
+                        size_t owner_index = direct_training_order[phase_index];
+
+                        d_direct_duplicate_fresh.trained =
+                                train_owner_to_convergence (fresh_direct_model,
+                                                            fresh_inputs[owner_index],
+                                                            fresh_targets[owner_index],
+                                                            fresh_routes[owner_index],
+                                                            &fresh_options,
+                                                            32,
+                                                            &d_direct_duplicate_fresh.owner_passes[owner_index],
+                                                            NULL);
+                        if (!d_direct_duplicate_fresh.trained)
+                                break;
+
+                        d_direct_duplicate_fresh.rounds_completed = phase_index + 1;
+                        for (size_t measure_index = 0; measure_index < 4; measure_index++) {
+                                d_direct_duplicate_fresh.round_measured[phase_index][measure_index] =
+                                        itty_feed_model_measure_decoder_objective_for_node (fresh_direct_model,
+                                                                                            fresh_inputs[measure_index],
+                                                                                            fresh_targets[measure_index],
+                                                                                            fresh_routes[measure_index],
+                                                                                            &d_direct_duplicate_fresh.rounds[phase_index][measure_index]);
+                                if (!d_direct_duplicate_fresh.round_measured[phase_index][measure_index]) {
+                                        d_direct_duplicate_fresh.trained = false;
+                                        break;
+                                }
+                        }
+                }
+                if (d_direct_duplicate_fresh.trained) {
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                d_direct_duplicate_fresh.after_train_measured[owner_index] =
+                                        itty_feed_model_measure_decoder_objective_for_node (fresh_direct_model,
+                                                                                            fresh_inputs[owner_index],
+                                                                                            fresh_targets[owner_index],
+                                                                                            fresh_routes[owner_index],
+                                                                                            &d_direct_duplicate_fresh.after_train[owner_index]);
+                                if (!d_direct_duplicate_fresh.after_train_measured[owner_index]) {
+                                        d_direct_duplicate_fresh.trained = false;
+                                        break;
+                                }
+                        }
+                }
+
+                d_direct_duplicate_fresh.replay_trained = d_direct_duplicate_fresh.trained;
+                if (d_direct_duplicate_fresh.replay_trained) {
+                        for (size_t phase_index = 0; phase_index < 4; phase_index++) {
+                                size_t owner_index = direct_training_order[phase_index];
+                                if (!train_owner_to_convergence (fresh_direct_model,
+                                                                 fresh_inputs[owner_index],
+                                                                 fresh_targets[owner_index],
+                                                                 fresh_routes[owner_index],
+                                                                 &fresh_options,
+                                                                 32,
+                                                                 NULL,
+                                                                 NULL)) {
+                                        d_direct_duplicate_fresh.replay_trained = false;
+                                        break;
+                                }
+                        }
+                }
+                if (d_direct_duplicate_fresh.replay_trained) {
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                d_direct_duplicate_fresh.after_replay_measured[owner_index] =
+                                        itty_feed_model_measure_decoder_objective_for_node (fresh_direct_model,
+                                                                                            fresh_inputs[owner_index],
+                                                                                            fresh_targets[owner_index],
+                                                                                            fresh_routes[owner_index],
+                                                                                            &d_direct_duplicate_fresh.after_replay[owner_index]);
+                                if (!d_direct_duplicate_fresh.after_replay_measured[owner_index]) {
+                                        d_direct_duplicate_fresh.replay_trained = false;
+                                        break;
+                                }
+                        }
+                }
+
+                if (fresh_a_activation)
+                        itty_bit_string_free (fresh_a_activation);
+                if (fresh_a_dup_target)
+                        itty_bit_string_free (fresh_a_dup_target);
+                itty_feed_model_free (fresh_direct_model);
+        }
+        {
+                itty_feed_model_t *fresh_padded_model = itty_feed_model_new (2, nodes, 1, 1);
+                itty_bit_string_list_t *fresh_inputs[4] = { input_a, input_b, input_c, input_d };
+                itty_bit_string_t *fresh_targets[4] = { target_a, target_b, target_c, target_d };
+                size_t fresh_routes[4] = { a_route, b_route, c_route, d_route };
+                size_t padded_training_order[4] = { 1, 0, 2, 3 };
+                itty_feed_model_train_options_t fresh_options = {
+                        .max_flips = oracle_options.max_flips,
+                        .budget_policy = ITTY_FEED_MODEL_TRAIN_BUDGET_POLICY_LARGEST_ERROR_FIRST,
+                        .backward_fold = ITTY_FEED_MODEL_BACKWARD_FOLD_SEGMENT_CONDENSE,
+                        .backward_node_target = ITTY_FEED_MODEL_BACKWARD_NODE_TARGET_SAME,
+                };
+
+                assert (fresh_padded_model);
+                itty_feed_model_set_decoder (fresh_padded_model,
+                                             ITTY_FEED_MODEL_DECODER_DIRECT_PADDED_TARGET);
+
+                for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                        d_direct_padded_fresh.before_measured[owner_index] =
+                                itty_feed_model_measure_decoder_objective_for_node (fresh_padded_model,
+                                                                                    fresh_inputs[owner_index],
+                                                                                    fresh_targets[owner_index],
+                                                                                    fresh_routes[owner_index],
+                                                                                    &d_direct_padded_fresh.before[owner_index]);
+                }
+
+                d_direct_padded_fresh.trained =
+                        d_direct_padded_fresh.before_measured[0] &&
+                        d_direct_padded_fresh.before_measured[1] &&
+                        d_direct_padded_fresh.before_measured[2] &&
+                        d_direct_padded_fresh.before_measured[3];
+                for (size_t phase_index = 0; phase_index < 4 && d_direct_padded_fresh.trained; phase_index++) {
+                        size_t owner_index = padded_training_order[phase_index];
+
+                        d_direct_padded_fresh.trained =
+                                train_owner_to_convergence (fresh_padded_model,
+                                                            fresh_inputs[owner_index],
+                                                            fresh_targets[owner_index],
+                                                            fresh_routes[owner_index],
+                                                            &fresh_options,
+                                                            32,
+                                                            &d_direct_padded_fresh.owner_passes[owner_index],
+                                                            NULL);
+                        if (!d_direct_padded_fresh.trained)
+                                break;
+
+                        d_direct_padded_fresh.rounds_completed = phase_index + 1;
+                        for (size_t measure_index = 0; measure_index < 4; measure_index++) {
+                                d_direct_padded_fresh.round_measured[phase_index][measure_index] =
+                                        itty_feed_model_measure_decoder_objective_for_node (fresh_padded_model,
+                                                                                            fresh_inputs[measure_index],
+                                                                                            fresh_targets[measure_index],
+                                                                                            fresh_routes[measure_index],
+                                                                                            &d_direct_padded_fresh.rounds[phase_index][measure_index]);
+                                if (!d_direct_padded_fresh.round_measured[phase_index][measure_index]) {
+                                        d_direct_padded_fresh.trained = false;
+                                        break;
+                                }
+                        }
+                }
+                if (d_direct_padded_fresh.trained) {
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                d_direct_padded_fresh.after_train_measured[owner_index] =
+                                        itty_feed_model_measure_decoder_objective_for_node (fresh_padded_model,
+                                                                                            fresh_inputs[owner_index],
+                                                                                            fresh_targets[owner_index],
+                                                                                            fresh_routes[owner_index],
+                                                                                            &d_direct_padded_fresh.after_train[owner_index]);
+                                if (!d_direct_padded_fresh.after_train_measured[owner_index]) {
+                                        d_direct_padded_fresh.trained = false;
+                                        break;
+                                }
+                        }
+                }
+
+                d_direct_padded_fresh.replay_trained = d_direct_padded_fresh.trained;
+                if (d_direct_padded_fresh.replay_trained) {
+                        for (size_t phase_index = 0; phase_index < 4; phase_index++) {
+                                size_t owner_index = padded_training_order[phase_index];
+                                if (!train_owner_to_convergence (fresh_padded_model,
+                                                                 fresh_inputs[owner_index],
+                                                                 fresh_targets[owner_index],
+                                                                 fresh_routes[owner_index],
+                                                                 &fresh_options,
+                                                                 32,
+                                                                 NULL,
+                                                                 NULL)) {
+                                        d_direct_padded_fresh.replay_trained = false;
+                                        break;
+                                }
+                        }
+                }
+                if (d_direct_padded_fresh.replay_trained) {
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                d_direct_padded_fresh.after_replay_measured[owner_index] =
+                                        itty_feed_model_measure_decoder_objective_for_node (fresh_padded_model,
+                                                                                            fresh_inputs[owner_index],
+                                                                                            fresh_targets[owner_index],
+                                                                                            fresh_routes[owner_index],
+                                                                                            &d_direct_padded_fresh.after_replay[owner_index]);
+                                if (!d_direct_padded_fresh.after_replay_measured[owner_index]) {
+                                        d_direct_padded_fresh.replay_trained = false;
+                                        break;
+                                }
+                        }
+                }
+
+                itty_feed_model_free (fresh_padded_model);
+        }
+        {
+                itty_feed_model_t *fresh_gray_model = itty_feed_model_new (2, nodes, 1, 1);
+                itty_bit_string_list_t *fresh_inputs[4] = { input_a, input_b, input_c, input_d };
+                itty_bit_string_t *fresh_targets[4] = { target_a, target_b, target_c, target_d };
+                size_t fresh_routes[4] = { a_route, b_route, c_route, d_route };
+                size_t gray_training_order[4] = { 1, 0, 2, 3 };
+                itty_feed_model_train_options_t fresh_options = {
+                        .max_flips = oracle_options.max_flips,
+                        .budget_policy = ITTY_FEED_MODEL_TRAIN_BUDGET_POLICY_LARGEST_ERROR_FIRST,
+                        .backward_fold = ITTY_FEED_MODEL_BACKWARD_FOLD_SEGMENT_CONDENSE,
+                        .backward_node_target = ITTY_FEED_MODEL_BACKWARD_NODE_TARGET_SAME,
+                };
+
+                assert (fresh_gray_model);
+                itty_feed_model_set_decoder (fresh_gray_model,
+                                             ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
+
+                for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                        d_direct_gray_fresh.before_measured[owner_index] =
+                                itty_feed_model_measure_decoder_objective_for_node (fresh_gray_model,
+                                                                                    fresh_inputs[owner_index],
+                                                                                    fresh_targets[owner_index],
+                                                                                    fresh_routes[owner_index],
+                                                                                    &d_direct_gray_fresh.before[owner_index]);
+                }
+
+                d_direct_gray_fresh.trained =
+                        d_direct_gray_fresh.before_measured[0] &&
+                        d_direct_gray_fresh.before_measured[1] &&
+                        d_direct_gray_fresh.before_measured[2] &&
+                        d_direct_gray_fresh.before_measured[3];
+                for (size_t phase_index = 0; phase_index < 4 && d_direct_gray_fresh.trained; phase_index++) {
+                        size_t owner_index = gray_training_order[phase_index];
+
+                        d_direct_gray_fresh.trained =
+                                train_gray_owner_with_layer_scheduler (fresh_gray_model,
+                                                                       fresh_inputs[owner_index],
+                                                                       fresh_targets[owner_index],
+                                                                       fresh_routes[owner_index],
+                                                                       &fresh_options,
+                                                                       16,
+                                                                       2,
+                                                                       &d_direct_gray_fresh.owner_passes[owner_index],
+                                                                       NULL,
+                                                                       NULL,
+                                                                       NULL);
+                        if (!d_direct_gray_fresh.trained)
+                                break;
+
+                        d_direct_gray_fresh.rounds_completed = phase_index + 1;
+                        for (size_t measure_index = 0; measure_index < 4; measure_index++) {
+                                d_direct_gray_fresh.round_measured[phase_index][measure_index] =
+                                        itty_feed_model_measure_decoder_objective_for_node (fresh_gray_model,
+                                                                                            fresh_inputs[measure_index],
+                                                                                            fresh_targets[measure_index],
+                                                                                            fresh_routes[measure_index],
+                                                                                            &d_direct_gray_fresh.rounds[phase_index][measure_index]);
+                                if (!d_direct_gray_fresh.round_measured[phase_index][measure_index]) {
+                                        d_direct_gray_fresh.trained = false;
+                                        break;
+                                }
+                        }
+                }
+                if (d_direct_gray_fresh.trained) {
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                d_direct_gray_fresh.after_train_measured[owner_index] =
+                                        itty_feed_model_measure_decoder_objective_for_node (fresh_gray_model,
+                                                                                            fresh_inputs[owner_index],
+                                                                                            fresh_targets[owner_index],
+                                                                                            fresh_routes[owner_index],
+                                                                                            &d_direct_gray_fresh.after_train[owner_index]);
+                                if (!d_direct_gray_fresh.after_train_measured[owner_index]) {
+                                        d_direct_gray_fresh.trained = false;
+                                        break;
+                                }
+                        }
+                }
+                if (d_direct_gray_fresh.trained) {
+                        itty_bit_string_t *b_folded = NULL;
+                        itty_bit_string_t *c_folded = NULL;
+
+                        d_direct_gray_b_probe.measured =
+                                itty_feed_model_measure_node_folded_output (fresh_gray_model,
+                                                                            input_b,
+                                                                            target_b,
+                                                                            b_route,
+                                                                            &b_folded) &&
+                                itty_feed_model_measure_best_single_final_layer_flip_for_node (fresh_gray_model,
+                                                                                                input_b,
+                                                                                                target_b,
+                                                                                                b_route,
+                                                                                                &d_direct_gray_b_probe.best_single_flip_found,
+                                                                                                &d_direct_gray_b_probe.best_single_flip,
+                                                                                                &d_direct_gray_b_probe.best_single_flip_objective);
+                        if (d_direct_gray_b_probe.measured && b_folded) {
+                                size_t bit_capacity = itty_bit_string_get_bit_capacity (target_b);
+                                for (size_t bit_index = 0; bit_index < bit_capacity &&
+                                     d_direct_gray_b_probe.wrong_bit_count < sizeof d_direct_gray_b_probe.wrong_bits / sizeof d_direct_gray_b_probe.wrong_bits[0];
+                                     bit_index++) {
+                                        if (measure_public_bit (b_folded, bit_index) == measure_public_bit (target_b, bit_index))
+                                                continue;
+                                        d_direct_gray_b_probe.wrong_bits[d_direct_gray_b_probe.wrong_bit_count++] = bit_index;
+                                }
+                        }
+                        d_direct_gray_c_probe.measured =
+                                itty_feed_model_measure_node_folded_output (fresh_gray_model,
+                                                                            input_c,
+                                                                            target_c,
+                                                                            c_route,
+                                                                            &c_folded) &&
+                                itty_feed_model_measure_best_single_final_layer_flip_for_node (fresh_gray_model,
+                                                                                                input_c,
+                                                                                                target_c,
+                                                                                                c_route,
+                                                                                                &d_direct_gray_c_probe.best_single_flip_found,
+                                                                                                &d_direct_gray_c_probe.best_single_flip,
+                                                                                                &d_direct_gray_c_probe.best_single_flip_objective);
+                        if (d_direct_gray_c_probe.measured && c_folded) {
+                                size_t bit_capacity = itty_bit_string_get_bit_capacity (target_c);
+                                for (size_t bit_index = 0; bit_index < bit_capacity &&
+                                     d_direct_gray_c_probe.wrong_bit_count < sizeof d_direct_gray_c_probe.wrong_bits / sizeof d_direct_gray_c_probe.wrong_bits[0];
+                                     bit_index++) {
+                                        if (measure_public_bit (c_folded, bit_index) == measure_public_bit (target_c, bit_index))
+                                                continue;
+                                        d_direct_gray_c_probe.wrong_bits[d_direct_gray_c_probe.wrong_bit_count++] = bit_index;
+                                }
+                        }
+                        if (b_folded)
+                                itty_bit_string_free (b_folded);
+                        if (c_folded)
+                                itty_bit_string_free (c_folded);
+                }
+
+                d_direct_gray_fresh.replay_trained = d_direct_gray_fresh.trained;
+                if (d_direct_gray_fresh.replay_trained) {
+                        for (size_t phase_index = 0; phase_index < 4; phase_index++) {
+                                size_t owner_index = gray_training_order[phase_index];
+                                if (!train_gray_owner_with_layer_scheduler (fresh_gray_model,
+                                                                            fresh_inputs[owner_index],
+                                                                            fresh_targets[owner_index],
+                                                                            fresh_routes[owner_index],
+                                                                            &fresh_options,
+                                                                            16,
+                                                                            2,
+                                                                            NULL,
+                                                                            NULL,
+                                                                            NULL,
+                                                                            NULL)) {
+                                        d_direct_gray_fresh.replay_trained = false;
+                                        break;
+                                }
+                        }
+                }
+                if (d_direct_gray_fresh.replay_trained) {
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                d_direct_gray_fresh.after_replay_measured[owner_index] =
+                                        itty_feed_model_measure_decoder_objective_for_node (fresh_gray_model,
+                                                                                            fresh_inputs[owner_index],
+                                                                                            fresh_targets[owner_index],
+                                                                                            fresh_routes[owner_index],
+                                                                                            &d_direct_gray_fresh.after_replay[owner_index]);
+                                if (!d_direct_gray_fresh.after_replay_measured[owner_index]) {
+                                        d_direct_gray_fresh.replay_trained = false;
+                                        break;
+                                }
+                        }
+                }
+
+                itty_feed_model_free (fresh_gray_model);
+        }
+        {
+                itty_feed_model_t *fresh_adapter_model = itty_feed_model_new (2, nodes, 1, 1);
+                itty_bit_string_list_t *fresh_inputs[4] = { input_a, input_b, input_c, input_d };
+                itty_bit_string_t *fresh_targets[4] = { target_a, target_b, target_c, target_d };
+                size_t fresh_routes[4] = { a_route, b_route, c_route, d_route };
+                size_t adapter_training_order[4] = { 1, 0, 2, 3 };
+                itty_feed_model_train_options_t fresh_options = {
+                        .max_flips = oracle_options.max_flips,
+                        .budget_policy = ITTY_FEED_MODEL_TRAIN_BUDGET_POLICY_LARGEST_ERROR_FIRST,
+                        .backward_fold = ITTY_FEED_MODEL_BACKWARD_FOLD_SEGMENT_CONDENSE,
+                        .backward_node_target = ITTY_FEED_MODEL_BACKWARD_NODE_TARGET_SAME,
+                };
+                itty_feed_model_train_stats_t fresh_stats = { 0 };
+                itty_feed_model_train_stats_t adapter_stats = { 0 };
+
+                assert (fresh_adapter_model);
+                itty_feed_model_set_decoder (fresh_adapter_model,
+                                             ITTY_FEED_MODEL_DECODER_DIRECT_DUPLICATED_TARGET);
+                itty_feed_model_set_input_route_adapter_enabled (fresh_adapter_model, true);
+
+                for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                        d_direct_duplicate_adapter.before_measured[owner_index] =
+                                itty_feed_model_measure_decoder_objective_for_node (fresh_adapter_model,
+                                                                                    fresh_inputs[owner_index],
+                                                                                    fresh_targets[owner_index],
+                                                                                    fresh_routes[owner_index],
+                                                                                    &d_direct_duplicate_adapter.before[owner_index]);
+                }
+
+                d_direct_duplicate_adapter.trained =
+                        d_direct_duplicate_adapter.before_measured[0] &&
+                        d_direct_duplicate_adapter.before_measured[1] &&
+                        d_direct_duplicate_adapter.before_measured[2] &&
+                        d_direct_duplicate_adapter.before_measured[3];
+                for (size_t round_index = 0; round_index < 8 && d_direct_duplicate_adapter.trained; round_index++) {
+                        for (size_t order_index = 0; order_index < 4; order_index++) {
+                                size_t owner_index = adapter_training_order[order_index];
+                                if (!itty_feed_model_train_input_route_adapter (fresh_adapter_model,
+                                                                                fresh_inputs[owner_index],
+                                                                                fresh_targets[owner_index],
+                                                                                fresh_routes[owner_index],
+                                                                                &fresh_options,
+                                                                                &adapter_stats) ||
+                                    !itty_feed_model_train_final_layer_with_suffix_oracle_for_node (fresh_adapter_model,
+                                                                                                    fresh_inputs[owner_index],
+                                                                                                    fresh_targets[owner_index],
+                                                                                                    fresh_routes[owner_index],
+                                                                                                    &fresh_options,
+                                                                                                    &fresh_stats)) {
+                                        d_direct_duplicate_adapter.trained = false;
+                                        break;
+                                }
+                        }
+                        if (!d_direct_duplicate_adapter.trained)
+                                break;
+
+                        d_direct_duplicate_adapter.rounds_completed = round_index + 1;
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                d_direct_duplicate_adapter.round_measured[round_index][owner_index] =
+                                        itty_feed_model_measure_decoder_objective_for_node (fresh_adapter_model,
+                                                                                            fresh_inputs[owner_index],
+                                                                                            fresh_targets[owner_index],
+                                                                                            fresh_routes[owner_index],
+                                                                                            &d_direct_duplicate_adapter.rounds[round_index][owner_index]);
+                                if (!d_direct_duplicate_adapter.round_measured[round_index][owner_index]) {
+                                        d_direct_duplicate_adapter.trained = false;
+                                        break;
+                                }
+                        }
+                }
+
+                if (d_direct_duplicate_adapter.trained) {
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                d_direct_duplicate_adapter.after_train_measured[owner_index] =
+                                        itty_feed_model_measure_decoder_objective_for_node (fresh_adapter_model,
+                                                                                            fresh_inputs[owner_index],
+                                                                                            fresh_targets[owner_index],
+                                                                                            fresh_routes[owner_index],
+                                                                                            &d_direct_duplicate_adapter.after_train[owner_index]);
+                                if (!d_direct_duplicate_adapter.after_train_measured[owner_index]) {
+                                        d_direct_duplicate_adapter.trained = false;
+                                        break;
+                                }
+                        }
+                }
+
+                d_direct_duplicate_adapter.replay_trained = d_direct_duplicate_adapter.trained;
+                if (d_direct_duplicate_adapter.replay_trained) {
+                        for (size_t order_index = 0; order_index < 4; order_index++) {
+                                size_t owner_index = adapter_training_order[order_index];
+                                if (!itty_feed_model_train_input_route_adapter (fresh_adapter_model,
+                                                                                fresh_inputs[owner_index],
+                                                                                fresh_targets[owner_index],
+                                                                                fresh_routes[owner_index],
+                                                                                &fresh_options,
+                                                                                &adapter_stats) ||
+                                    !itty_feed_model_train_final_layer_with_suffix_oracle_for_node (fresh_adapter_model,
+                                                                                                    fresh_inputs[owner_index],
+                                                                                                    fresh_targets[owner_index],
+                                                                                                    fresh_routes[owner_index],
+                                                                                                    &fresh_options,
+                                                                                                    &fresh_stats)) {
+                                        d_direct_duplicate_adapter.replay_trained = false;
+                                        break;
+                                }
+                        }
+                }
+                if (d_direct_duplicate_adapter.replay_trained) {
+                        for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                                d_direct_duplicate_adapter.after_replay_measured[owner_index] =
+                                        itty_feed_model_measure_decoder_objective_for_node (fresh_adapter_model,
+                                                                                            fresh_inputs[owner_index],
+                                                                                            fresh_targets[owner_index],
+                                                                                            fresh_routes[owner_index],
+                                                                                            &d_direct_duplicate_adapter.after_replay[owner_index]);
+                                if (!d_direct_duplicate_adapter.after_replay_measured[owner_index]) {
+                                        d_direct_duplicate_adapter.replay_trained = false;
+                                        break;
+                                }
+                        }
+                }
+
+                itty_feed_model_free (fresh_adapter_model);
+        }
+        {
+                itty_feed_model_decoder_t previous_decoder = ITTY_FEED_MODEL_DECODER_SEGMENT_CONDENSE;
+
+                itty_feed_model_set_decoder (decoder_model,
+                                             ITTY_FEED_MODEL_DECODER_SEGMENT_WEIGHTED_CONDENSE);
+                for (size_t owner_index = 0; owner_index < 4; owner_index++) {
+                        assert (itty_feed_model_measure_decoder_objective_for_node (decoder_model,
+                                                                                    owner_index == 0 ? input_a :
+                                                                                    owner_index == 1 ? input_b :
+                                                                                    owner_index == 2 ? input_c :
+                                                                                                       input_d,
+                                                                                    owner_index == 0 ? target_a :
+                                                                                    owner_index == 1 ? target_b :
+                                                                                    owner_index == 2 ? target_c :
+                                                                                                       target_d,
+                                                                                    owner_index == 0 ? a_route :
+                                                                                    owner_index == 1 ? b_route :
+                                                                                    owner_index == 2 ? c_route :
+                                                                                                       d_route,
+                                                                                    &d_weighted_objectives[owner_index]));
+                }
+                assert (itty_feed_model_measure_segment_node_selection (decoder_model,
+                                                                        input_d,
+                                                                        target_d,
+                                                                        &d_profile_weighted_selection));
+                assert (itty_feed_model_measure_segment_vote_profile_for_node (decoder_model,
+                                                                               input_d,
+                                                                               target_d,
+                                                                               d_profile_weighted_selection.selected_by_popcount,
+                                                                               &d_profile_weighted));
+                itty_feed_model_set_decoder (decoder_model, previous_decoder);
+        }
+        for (size_t row_index = 0; row_index < d_excess_row_count; row_index++) {
+                d_excess_audit_row_t const *row = &d_excess_rows[row_index];
+                printf ("---d_excess_bit_%zu intended_node=%zu selected_after=%zu ones=%zu threshold=%zu max_zero=%zu excess=%zu clearable=%zu neg_quota=%zu mask_flips=%zu cleared=%zu intended_after=%zu/%zu/%zu selected_after_obj=%zu/%zu/%zu dist_delta=%td excess_delta=%td replay_rejections=%zu free_reason=%s propagation=%s class=%s selected_switch=%s selected_not_worse=%s selected_improves=%s direct_selected_improves=%s parity=%s baseline_guard=%s\n",
+                        row->decoded_bit,
+                        row->intended_node_before,
+                        row->selected_node_after,
+                        row->current_ones,
+                        row->threshold,
+                        row->max_zero,
+                        row->excess,
+                        row->clearable_final_segment_votes,
+                        row->candidate_negative_quota_repairs,
+                        row->mask_flips,
+                        row->actual_cleared_votes,
+                        row->intended_node_distance_after,
+                        row->intended_node_deficit_after,
+                        row->intended_node_excess_after,
+                        row->selected_node_distance_after,
+                        row->selected_node_deficit_after,
+                        row->selected_node_excess_after,
+                        row->distance_delta,
+                        row->excess_delta,
+                        row->replay_owner_rejections,
+                        row->free_reason,
+                        row->propagation,
+                        row->classification,
+                        row->selected_switch_class,
+                        row->selected_objective_not_worse ? "yes" : "no",
+                        row->selected_objective_improves ? "yes" : "no",
+                        row->direct_selected_node_improvement ? "yes" : "no",
+                        row->parity_reason,
+                        row->parity_baseline_guard ? "yes" : "no");
+                printf ("---d_excess_bit_%zu_owner_A accepted=%s reason=%s\n",
+                        row->decoded_bit,
+                        row->owner_accepted[0] ? "yes" : "no",
+                        row->owner_reason[0]);
+                printf ("---d_excess_bit_%zu_owner_B accepted=%s reason=%s\n",
+                        row->decoded_bit,
+                        row->owner_accepted[1] ? "yes" : "no",
+                        row->owner_reason[1]);
+                printf ("---d_excess_bit_%zu_owner_C accepted=%s reason=%s\n",
+                        row->decoded_bit,
+                        row->owner_accepted[2] ? "yes" : "no",
+                        row->owner_reason[2]);
+                printf ("---d_excess_bit_%zu_owner_A_obj=%zu/%zu/%zu\n",
+                        row->decoded_bit,
+                        row->owner_distance_after[0],
+                        row->owner_deficit_after[0],
+                        row->owner_excess_after[0]);
+                printf ("---d_excess_bit_%zu_owner_B_obj=%zu/%zu/%zu\n",
+                        row->decoded_bit,
+                        row->owner_distance_after[1],
+                        row->owner_deficit_after[1],
+                        row->owner_excess_after[1]);
+                printf ("---d_excess_bit_%zu_owner_C_obj=%zu/%zu/%zu\n",
+                        row->decoded_bit,
+                        row->owner_distance_after[2],
+                        row->owner_deficit_after[2],
+                        row->owner_excess_after[2]);
+        }
+        for (size_t row_index = 0; row_index < d_residual_row_count; row_index++) {
+                d_residual_error_row_t const *row = &d_residual_rows[row_index];
+                printf ("---d_residual_bit_%zu target=%zu selected_node=%zu ones=%zu threshold=%zu max_zero=%zu deficit=%zu excess=%zu candidate_votes=%zu mask_flips=%zu reason=%s\n",
+                        row->decoded_bit,
+                        row->target_bit,
+                        row->selected_internal_node,
+                        row->ones,
+                        row->threshold,
+                        row->max_zero,
+                        row->deficit,
+                        row->excess,
+                        row->candidate_final_votes,
+                        row->candidate_mask_flips,
+                        row->reason);
+        }
+        for (size_t matrix_index = 0; matrix_index < sizeof (d_exact_zero_blocks) / sizeof (d_exact_zero_blocks[0]); matrix_index++) {
+                printf ("---d_exact_zero_block_%zu label=%s selected_safe=%s improves=%s reason=%s selected_after=%zu gap_after=%zu selected_obj=%zu/%zu/%zu flips=%zu\n",
+                        matrix_index,
+                        d_exact_zero_blocks[matrix_index].label,
+                        d_exact_zero_blocks[matrix_index].selected_safe ? "yes" : "no",
+                        d_exact_zero_blocks[matrix_index].improves ? "yes" : "no",
+                        d_exact_zero_blocks[matrix_index].reason,
+                        d_exact_zero_blocks[matrix_index].selected_after,
+                        d_exact_zero_blocks[matrix_index].gap_after,
+                        d_exact_zero_blocks[matrix_index].selected_objective_after.selected_distance,
+                        d_exact_zero_blocks[matrix_index].selected_objective_after.false_negative_vote_deficit,
+                        d_exact_zero_blocks[matrix_index].selected_objective_after.false_positive_vote_excess,
+                        d_exact_zero_blocks[matrix_index].total_flips);
+        }
+        for (size_t set_index = 0; set_index < d_residual_set_count; set_index++) {
+                d_residual_set_summary_t const *set = &d_residual_sets[set_index];
+
+                printf ("---d_residual_direct_set_%zu bits=%s measured=%s improves=%s selected_after=%zu gap_after=%zu clear_votes=%zu selected_obj=%zu/%zu/%zu\n",
+                        set_index,
+                        set->label,
+                        set->direct_measured ? "yes" : "no",
+                        set->direct_improves ? "yes" : "no",
+                        set->direct_selected_after,
+                        set->direct_gap_after,
+                        set->direct_clear_votes,
+                        set->direct_objective_after.selected_distance,
+                        set->direct_objective_after.false_negative_vote_deficit,
+                        set->direct_objective_after.false_positive_vote_excess);
+                printf ("---d_residual_exact_set_%zu bits=%s measured=%s selected_safe=%s improves=%s reason=%s selected_after=%zu gap_after=%zu flips=%zu selected_obj=%zu/%zu/%zu route_change=%s gap_lost=%s A_fail=%s B_fail=%s C_fail=%s D_dist_fail=%s D_def_fail=%s D_excess_fail=%s selected_switch_worse=%s\n",
+                        set_index,
+                        set->label,
+                        set->exact_measured ? "yes" : "no",
+                        set->exact_selected_safe ? "yes" : "no",
+                        set->exact_improves ? "yes" : "no",
+                        set->exact_reason,
+                        set->exact_selected_after,
+                        set->exact_gap_after,
+                        set->exact_flips,
+                        set->exact_objective_after.selected_distance,
+                        set->exact_objective_after.false_negative_vote_deficit,
+                        set->exact_objective_after.false_positive_vote_excess,
+                        set->fail_route_change ? "yes" : "no",
+                        set->fail_gap_loss ? "yes" : "no",
+                        set->fail_a_baseline ? "yes" : "no",
+                        set->fail_b_baseline ? "yes" : "no",
+                        set->fail_c_baseline ? "yes" : "no",
+                        set->fail_d_distance ? "yes" : "no",
+                        set->fail_d_deficit ? "yes" : "no",
+                        set->fail_d_excess ? "yes" : "no",
+                        set->fail_selected_switch_worse ? "yes" : "no");
+                printf ("---d_residual_tx_set_%zu bits=%s pool=%zu tested=%zu selected_safe=%zu improving=%zu found=%s label=%s flips=%zu selected_after=%zu node1_pop_after=%zu node6_pop_after=%zu gap_1_vs_6_after=%td teacher_dist_after=%zu selected_obj=%zu/%zu/%zu\n",
+                        set_index,
+                        set->label,
+                        set->tx_pool_count,
+                        set->tx_tested,
+                        set->tx_selected_safe,
+                        set->tx_improving,
+                        set->tx_found ? "yes" : "no",
+                        set->tx_found ? set->tx_label : "none",
+                        set->tx_flips,
+                        set->tx_selected_after,
+                        set->tx_node1_pop_after,
+                        set->tx_node6_pop_after,
+                        set->tx_node1_vs_node6_gap_after,
+                        set->tx_teacher_distance_after,
+                        set->tx_objective_after.selected_distance,
+                        set->tx_objective_after.false_negative_vote_deficit,
+                        set->tx_objective_after.false_positive_vote_excess);
+        }
+        for (size_t compare_index = 0; compare_index < sizeof (d_residual_compare) / sizeof (d_residual_compare[0]); compare_index++) {
+                d_residual_compare_summary_t const *cmp = &d_residual_compare[compare_index];
+
+                printf ("---d_residual_compare_%s before_selected_direct=%zu before_selected_exact=%zu before_node1_pop=%zu before_node6_pop=%zu before_gap_1_vs_6=%td\n",
+                        cmp->label,
+                        cmp->before_selected_node_direct,
+                        cmp->before_selected_node_exact,
+                        cmp->before_node1_popcount,
+                        cmp->before_node6_popcount,
+                        cmp->before_node1_vs_node6_gap);
+                printf ("---d_residual_compare_%s_direct measured=%s selected_after=%zu node1_pop_after=%zu node6_pop_after=%zu gap_1_vs_6_after=%td\n",
+                        cmp->label,
+                        cmp->direct_measured ? "yes" : "no",
+                        cmp->direct_selected_node_after,
+                        cmp->direct_node1_popcount_after,
+                        cmp->direct_node6_popcount_after,
+                        cmp->direct_node1_vs_node6_gap_after);
+                printf ("---d_residual_compare_%s_condensed measured=%s selected_after=%zu node1_pop_after=%zu node6_pop_after=%zu gap_1_vs_6_after=%td selected_obj=%zu/%zu/%zu\n",
+                        cmp->label,
+                        cmp->condensed_measured ? "yes" : "no",
+                        cmp->condensed_selected_node_after,
+                        cmp->condensed_node1_popcount_after,
+                        cmp->condensed_node6_popcount_after,
+                        cmp->condensed_node1_vs_node6_gap_after,
+                        cmp->condensed_selected_objective_after.selected_distance,
+                        cmp->condensed_selected_objective_after.false_negative_vote_deficit,
+                        cmp->condensed_selected_objective_after.false_positive_vote_excess);
+                printf ("---d_residual_compare_%s_exact measured=%s selected_after=%zu node1_pop_after=%zu node6_pop_after=%zu gap_1_vs_6_after=%td\n",
+                        cmp->label,
+                        cmp->exact_measured ? "yes" : "no",
+                        cmp->exact_selected_node_after,
+                        cmp->exact_node1_popcount_after,
+                        cmp->exact_node6_popcount_after,
+                        cmp->exact_node1_vs_node6_gap_after);
+                printf ("---d_residual_compare_%s_support found=%s label=%s budget=%zu candidates=%zu accepted=%zu flips=%zu teacher_bits=%zu teacher_dist_before=%zu teacher_dist_after=%zu selected_after=%zu node1_pop_after=%zu node6_pop_after=%zu gap_1_vs_6_after=%td selected_obj=%zu/%zu/%zu A_ok=%s B_ok=%s C_ok=%s\n",
+                        cmp->label,
+                        cmp->support_found ? "yes" : "no",
+                        cmp->support_label ? cmp->support_label : "none",
+                        cmp->support_budget,
+                        cmp->support_candidate_count,
+                        cmp->support_accepted_candidates,
+                        cmp->support_flips,
+                        cmp->teacher_requested_bits,
+                        cmp->teacher_distance_before,
+                        cmp->teacher_distance_after,
+                        cmp->support_selected_node_after,
+                        cmp->support_node1_popcount_after,
+                        cmp->support_node6_popcount_after,
+                        cmp->support_node1_vs_node6_gap_after,
+                        cmp->support_selected_objective_after.selected_distance,
+                        cmp->support_selected_objective_after.false_negative_vote_deficit,
+                        cmp->support_selected_objective_after.false_positive_vote_excess,
+                        cmp->support_a_ok ? "yes" : "no",
+                        cmp->support_b_ok ? "yes" : "no",
+                        cmp->support_c_ok ? "yes" : "no");
+                printf ("---d_residual_compare_%s_teacher_search found=%s label=%s flips=%zu teacher_dist_after=%zu selected_after=%zu node1_pop_after=%zu node6_pop_after=%zu gap_1_vs_6_after=%td selected_obj=%zu/%zu/%zu\n",
+                        cmp->label,
+                        cmp->teacher_search_found ? "yes" : "no",
+                        cmp->teacher_search_found ? cmp->teacher_search_label : "none",
+                        cmp->teacher_search_flips,
+                        cmp->teacher_search_distance_after,
+                        cmp->teacher_search_selected_node_after,
+                        cmp->teacher_search_node1_popcount_after,
+                        cmp->teacher_search_node6_popcount_after,
+                        cmp->teacher_search_node1_vs_node6_gap_after,
+                        cmp->teacher_search_selected_objective_after.selected_distance,
+                        cmp->teacher_search_selected_objective_after.false_negative_vote_deficit,
+                        cmp->teacher_search_selected_objective_after.false_positive_vote_excess);
+                printf ("---d_residual_compare_%s_structural pool=%zu tested=%zu selected_safe=%zu improving=%zu found=%s label=%s flips=%zu teacher_dist_after=%zu selected_after=%zu node1_pop_after=%zu node6_pop_after=%zu gap_1_vs_6_after=%td selected_obj=%zu/%zu/%zu\n",
+                        cmp->label,
+                        cmp->structural_pool_count,
+                        cmp->structural_blocks_tested,
+                        cmp->structural_selected_safe_blocks,
+                        cmp->structural_improving_blocks,
+                        cmp->structural_found ? "yes" : "no",
+                        cmp->structural_found ? cmp->structural_label : "none",
+                        cmp->structural_flips,
+                        cmp->structural_teacher_distance_after,
+                        cmp->structural_selected_node_after,
+                        cmp->structural_node1_popcount_after,
+                        cmp->structural_node6_popcount_after,
+                        cmp->structural_node1_vs_node6_gap_after,
+                        cmp->structural_selected_objective_after.selected_distance,
+                        cmp->structural_selected_objective_after.false_negative_vote_deficit,
+                        cmp->structural_selected_objective_after.false_positive_vote_excess);
+                printf ("---d_residual_compare_%s_expanded pool=%zu tested=%zu selected_safe=%zu improving=%zu found=%s label=%s flips=%zu teacher_dist_after=%zu selected_after=%zu node1_pop_after=%zu node6_pop_after=%zu gap_1_vs_6_after=%td selected_obj=%zu/%zu/%zu\n",
+                        cmp->label,
+                        cmp->expanded_pool_count,
+                        cmp->expanded_blocks_tested,
+                        cmp->expanded_selected_safe_blocks,
+                        cmp->expanded_improving_blocks,
+                        cmp->expanded_found ? "yes" : "no",
+                        cmp->expanded_found ? cmp->expanded_label : "none",
+                        cmp->expanded_flips,
+                        cmp->expanded_teacher_distance_after,
+                        cmp->expanded_selected_node_after,
+                        cmp->expanded_node1_popcount_after,
+                        cmp->expanded_node6_popcount_after,
+                        cmp->expanded_node1_vs_node6_gap_after,
+                        cmp->expanded_selected_objective_after.selected_distance,
+                        cmp->expanded_selected_objective_after.false_negative_vote_deficit,
+                        cmp->expanded_selected_objective_after.false_positive_vote_excess);
+        }
+        printf ("---d_trace_commit_probe measured=%s selected_safe=%s improves=%s final_stable=%s flips=%zu selected_after=%zu gap_after=%zu selected_obj=%zu/%zu/%zu\n",
+                d_trace_commit_probe.measured ? "yes" : "no",
+                d_trace_commit_probe.selected_safe ? "yes" : "no",
+                d_trace_commit_probe.improves ? "yes" : "no",
+                d_trace_commit_probe.final_stable ? "yes" : "no",
+                d_trace_commit_probe.flips,
+                d_trace_commit_probe.selected_after,
+                d_trace_commit_probe.gap_after,
+                d_trace_commit_probe.objective_after.selected_distance,
+                d_trace_commit_probe.objective_after.false_negative_vote_deficit,
+                d_trace_commit_probe.objective_after.false_positive_vote_excess);
+        printf ("---d_trace_transaction_probe measured=%s selected_safe=%s improves=%s flips=%zu selected_after=%zu gap_after=%zu node1_pop_after=%zu node6_pop_after=%zu selected_obj=%zu/%zu/%zu\n",
+                d_trace_transaction_probe.measured ? "yes" : "no",
+                d_trace_transaction_probe.selected_safe ? "yes" : "no",
+                d_trace_transaction_probe.improves ? "yes" : "no",
+                d_trace_transaction_probe.flips,
+                d_trace_transaction_probe.selected_after,
+                d_trace_transaction_probe.gap_after,
+                d_trace_transaction_probe.node1_pop_after,
+                d_trace_transaction_probe.node6_pop_after,
+                d_trace_transaction_probe.objective_after.selected_distance,
+                d_trace_transaction_probe.objective_after.false_negative_vote_deficit,
+                d_trace_transaction_probe.objective_after.false_positive_vote_excess);
+        printf ("---d_tx_commit_probe measured=%s selected_safe=%s improves=%s final_stable=%s flips=%zu selected_after=%zu gap_after=%zu selected_obj=%zu/%zu/%zu\n",
+                d_tx_commit_probe.measured ? "yes" : "no",
+                d_tx_commit_probe.selected_safe ? "yes" : "no",
+                d_tx_commit_probe.improves ? "yes" : "no",
+                d_tx_commit_probe.final_stable ? "yes" : "no",
+                d_tx_commit_probe.flips,
+                d_tx_commit_probe.selected_after,
+                d_tx_commit_probe.gap_after,
+                d_tx_commit_probe.objective_after.selected_distance,
+                d_tx_commit_probe.objective_after.false_negative_vote_deficit,
+                d_tx_commit_probe.objective_after.false_positive_vote_excess);
+        printf ("---d_profile_post_commit_selected_node=%zu\n",
+                d_profile_post_commit_selection.selected_by_popcount);
+        printf ("---d_profile_post_commit_gap=%zu\n",
+                d_profile_post_commit_selection.popcount_gap);
+        printf ("---d_profile_post_commit_node_histogram_bits=%zu\n",
+                d_post_commit_node_histogram_bits);
+        for (size_t vote_index = 0; vote_index < sizeof d_post_commit_node_histogram / sizeof d_post_commit_node_histogram[0]; vote_index++) {
+                printf ("---d_profile_post_commit_node_histogram_%zu=%zu\n",
+                        vote_index,
+                        d_post_commit_node_histogram[vote_index]);
+        }
+        printf ("---d_profile_post_commit_segments=%zu threshold=%zu fp=%zu fn=%zu near_fp=%zu near_fn=%zu confident_fp=%zu confident_fn=%zu\n",
+                d_profile_post_commit.segments_per_bit,
+                d_profile_post_commit.threshold,
+                d_profile_post_commit.false_positive_bits,
+                d_profile_post_commit.false_negative_bits,
+                d_profile_post_commit.near_threshold_false_positive_bits,
+                d_profile_post_commit.near_threshold_false_negative_bits,
+                d_profile_post_commit.confident_false_positive_bits,
+                d_profile_post_commit.confident_false_negative_bits);
+        printf ("---d_profile_post_commit_momentum aligned=%zu opposed=%zu net=%td frontier_sum=%td wrong_net=%td wrong_frontier_sum=%td\n",
+                d_profile_post_commit.target_aligned_threshold_crossings,
+                d_profile_post_commit.target_opposed_threshold_crossings,
+                d_profile_post_commit.net_threshold_momentum,
+                d_profile_post_commit.frontier_margin_sum,
+                d_profile_post_commit.wrong_bit_net_threshold_momentum,
+                d_profile_post_commit.wrong_bit_frontier_margin_sum);
+        for (size_t trace_index = 0; trace_index < d_profile_post_commit.trace_count; trace_index++) {
+                itty_feed_model_segment_vote_trace_t const *trace = &d_profile_post_commit.traces[trace_index];
+                printf ("---d_profile_post_commit_bit_%zu target=%d ones=%zu threshold=%zu max_zero=%zu deficit=%zu excess=%zu aligned=%zu opposed=%zu momentum=%td frontier=%td\n",
+                        trace->decoded_bit,
+                        trace->target_bit ? 1 : 0,
+                        trace->ones,
+                        trace->threshold,
+                        trace->max_zero,
+                        trace->deficit,
+                        trace->excess,
+                        trace->target_aligned_levels,
+                        trace->target_opposed_levels,
+                        trace->signed_momentum,
+                        trace->frontier_margin);
+        }
+        for (size_t row_index = 0; row_index < d_post_commit_residual_row_count; row_index++) {
+                d_residual_error_row_t const *row = &d_post_commit_residual_rows[row_index];
+                printf ("---d_post_commit_residual_bit_%zu target=%zu selected_node=%zu ones=%zu threshold=%zu max_zero=%zu deficit=%zu excess=%zu candidate_votes=%zu mask_flips=%zu reason=%s\n",
+                        row->decoded_bit,
+                        row->target_bit,
+                        row->selected_internal_node,
+                        row->ones,
+                        row->threshold,
+                        row->max_zero,
+                        row->deficit,
+                        row->excess,
+                        row->candidate_final_votes,
+                        row->candidate_mask_flips,
+                        row->reason);
+        }
+        for (size_t set_index = 0; set_index < d_post_commit_residual_set_count; set_index++) {
+                d_residual_set_summary_t const *set = &d_post_commit_residual_sets[set_index];
+                printf ("---d_post_commit_tx_set_%zu bits=%s pool=%zu tested=%zu selected_safe=%zu improving=%zu found=%s label=%s flips=%zu selected_after=%zu node1_pop_after=%zu node6_pop_after=%zu gap_1_vs_6_after=%td teacher_dist_after=%zu selected_obj=%zu/%zu/%zu\n",
+                        set_index,
+                        set->label,
+                        set->tx_pool_count,
+                        set->tx_tested,
+                        set->tx_selected_safe,
+                        set->tx_improving,
+                        set->tx_found ? "yes" : "no",
+                        set->tx_found ? set->tx_label : "none",
+                        set->tx_flips,
+                        set->tx_selected_after,
+                        set->tx_node1_pop_after,
+                        set->tx_node6_pop_after,
+                        set->tx_node1_vs_node6_gap_after,
+                        set->tx_teacher_distance_after,
+                        set->tx_objective_after.selected_distance,
+                        set->tx_objective_after.false_negative_vote_deficit,
+                        set->tx_objective_after.false_positive_vote_excess);
+                printf ("---d_post_commit_sat_set_%zu bits=%s pool=%zu tested=%zu selected_safe=%zu improving=%zu found=%s label=%s flips=%zu selected_after=%zu node1_pop_after=%zu node6_pop_after=%zu gap_1_vs_6_after=%td teacher_dist_after=%zu selected_obj=%zu/%zu/%zu\n",
+                        set_index,
+                        set->label,
+                        set->sat_pool_count,
+                        set->sat_tested,
+                        set->sat_selected_safe,
+                        set->sat_improving,
+                        set->sat_found ? "yes" : "no",
+                        set->sat_found ? set->sat_label : "none",
+                        set->sat_flips,
+                        set->sat_selected_after,
+                        set->sat_node1_pop_after,
+                        set->sat_node6_pop_after,
+                        set->sat_node1_vs_node6_gap_after,
+                        set->sat_teacher_distance_after,
+                        set->sat_objective_after.selected_distance,
+                        set->sat_objective_after.false_negative_vote_deficit,
+                        set->sat_objective_after.false_positive_vote_excess);
+        }
+        printf ("---d_weighted_post_commit_A=%zu/%zu/%zu\n",
+                d_weighted_objectives[0].selected_distance,
+                d_weighted_objectives[0].false_negative_vote_deficit,
+                d_weighted_objectives[0].false_positive_vote_excess);
+        printf ("---d_weighted_post_commit_B=%zu/%zu/%zu\n",
+                d_weighted_objectives[1].selected_distance,
+                d_weighted_objectives[1].false_negative_vote_deficit,
+                d_weighted_objectives[1].false_positive_vote_excess);
+        printf ("---d_weighted_post_commit_C=%zu/%zu/%zu\n",
+                d_weighted_objectives[2].selected_distance,
+                d_weighted_objectives[2].false_negative_vote_deficit,
+                d_weighted_objectives[2].false_positive_vote_excess);
+        printf ("---d_weighted_post_commit_D=%zu/%zu/%zu\n",
+                d_weighted_objectives[3].selected_distance,
+                d_weighted_objectives[3].false_negative_vote_deficit,
+                d_weighted_objectives[3].false_positive_vote_excess);
+        printf ("---d_weighted_post_commit_selected_node=%zu\n",
+                d_profile_weighted_selection.selected_by_popcount);
+        printf ("---d_weighted_post_commit_gap=%zu\n",
+                d_profile_weighted_selection.popcount_gap);
+        printf ("---d_weighted_post_commit_segments=%zu threshold=%zu fp=%zu fn=%zu near_fp=%zu near_fn=%zu confident_fp=%zu confident_fn=%zu\n",
+                d_profile_weighted.segments_per_bit,
+                d_profile_weighted.threshold,
+                d_profile_weighted.false_positive_bits,
+                d_profile_weighted.false_negative_bits,
+                d_profile_weighted.near_threshold_false_positive_bits,
+                d_profile_weighted.near_threshold_false_negative_bits,
+                d_profile_weighted.confident_false_positive_bits,
+                d_profile_weighted.confident_false_negative_bits);
+        printf ("---d_weighted_post_commit_momentum aligned=%zu opposed=%zu net=%td frontier_sum=%td wrong_net=%td wrong_frontier_sum=%td\n",
+                d_profile_weighted.target_aligned_threshold_crossings,
+                d_profile_weighted.target_opposed_threshold_crossings,
+                d_profile_weighted.net_threshold_momentum,
+                d_profile_weighted.frontier_margin_sum,
+                d_profile_weighted.wrong_bit_net_threshold_momentum,
+                d_profile_weighted.wrong_bit_frontier_margin_sum);
+        if (d_direct_duplicate_probe.measured) {
+                printf ("---d_direct_duplicate_before_A=%zu/%zu/%zu\n",
+                        d_direct_duplicate_probe.before[0].selected_distance,
+                        d_direct_duplicate_probe.before[0].false_negative_vote_deficit,
+                        d_direct_duplicate_probe.before[0].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_before_B=%zu/%zu/%zu\n",
+                        d_direct_duplicate_probe.before[1].selected_distance,
+                        d_direct_duplicate_probe.before[1].false_negative_vote_deficit,
+                        d_direct_duplicate_probe.before[1].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_before_C=%zu/%zu/%zu\n",
+                        d_direct_duplicate_probe.before[2].selected_distance,
+                        d_direct_duplicate_probe.before[2].false_negative_vote_deficit,
+                        d_direct_duplicate_probe.before[2].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_before_D=%zu/%zu/%zu\n",
+                        d_direct_duplicate_probe.before[3].selected_distance,
+                        d_direct_duplicate_probe.before[3].false_negative_vote_deficit,
+                        d_direct_duplicate_probe.before[3].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_trained=%s\n",
+                        d_direct_duplicate_probe.trained ? "yes" : "no");
+                if (d_direct_duplicate_probe.trained) {
+                        printf ("---d_direct_duplicate_after_A=%zu/%zu/%zu\n",
+                                d_direct_duplicate_probe.after[0].selected_distance,
+                                d_direct_duplicate_probe.after[0].false_negative_vote_deficit,
+                                d_direct_duplicate_probe.after[0].false_positive_vote_excess);
+                        printf ("---d_direct_duplicate_after_B=%zu/%zu/%zu\n",
+                                d_direct_duplicate_probe.after[1].selected_distance,
+                                d_direct_duplicate_probe.after[1].false_negative_vote_deficit,
+                                d_direct_duplicate_probe.after[1].false_positive_vote_excess);
+                        printf ("---d_direct_duplicate_after_C=%zu/%zu/%zu\n",
+                                d_direct_duplicate_probe.after[2].selected_distance,
+                                d_direct_duplicate_probe.after[2].false_negative_vote_deficit,
+                                d_direct_duplicate_probe.after[2].false_positive_vote_excess);
+                        printf ("---d_direct_duplicate_after_D=%zu/%zu/%zu\n",
+                                d_direct_duplicate_probe.after[3].selected_distance,
+                                d_direct_duplicate_probe.after[3].false_negative_vote_deficit,
+                                d_direct_duplicate_probe.after[3].false_positive_vote_excess);
+                }
+        }
+        if (d_direct_duplicate_fresh.measured) {
+                printf ("---d_direct_duplicate_fresh_routes A=%zu B=%zu C=%zu D=%zu\n",
+                        d_direct_duplicate_fresh.a_route,
+                        d_direct_duplicate_fresh.b_route,
+                        d_direct_duplicate_fresh.c_route,
+                        d_direct_duplicate_fresh.d_route);
+                printf ("---d_direct_duplicate_fresh_A_selection selected_route=%zu gap=%zu\n",
+                        d_direct_duplicate_fresh.a_selected_route,
+                        d_direct_duplicate_fresh.a_selected_gap);
+                for (size_t route_index = 0; route_index < 8; route_index++) {
+                        printf ("---d_direct_duplicate_fresh_A_route_%zu words=%zu pop=%zu\n",
+                                route_index,
+                                d_direct_duplicate_fresh.a_route_activation_words[route_index],
+                                d_direct_duplicate_fresh.a_route_activation_popcounts[route_index]);
+                }
+                printf ("---d_direct_duplicate_fresh_A_activation measured=%s activation_words=%zu activation_pop=%zu target_words=%zu dup_target_words=%zu dup_target_pop=%zu aligned=%s\n",
+                        d_direct_duplicate_fresh.a_activation_measured ? "yes" : "no",
+                        d_direct_duplicate_fresh.a_activation_words,
+                        d_direct_duplicate_fresh.a_activation_popcount,
+                        d_direct_duplicate_fresh.a_target_words,
+                        d_direct_duplicate_fresh.a_duplicated_target_words,
+                        d_direct_duplicate_fresh.a_duplicated_target_popcount,
+                        d_direct_duplicate_fresh.a_target_aligned ? "yes" : "no");
+                printf ("---d_direct_duplicate_fresh_before_A measured=%s %zu/%zu/%zu\n",
+                        d_direct_duplicate_fresh.before_measured[0] ? "yes" : "no",
+                        d_direct_duplicate_fresh.before[0].selected_distance,
+                        d_direct_duplicate_fresh.before[0].false_negative_vote_deficit,
+                        d_direct_duplicate_fresh.before[0].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_fresh_before_B measured=%s %zu/%zu/%zu\n",
+                        d_direct_duplicate_fresh.before_measured[1] ? "yes" : "no",
+                        d_direct_duplicate_fresh.before[1].selected_distance,
+                        d_direct_duplicate_fresh.before[1].false_negative_vote_deficit,
+                        d_direct_duplicate_fresh.before[1].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_fresh_before_C measured=%s %zu/%zu/%zu\n",
+                        d_direct_duplicate_fresh.before_measured[2] ? "yes" : "no",
+                        d_direct_duplicate_fresh.before[2].selected_distance,
+                        d_direct_duplicate_fresh.before[2].false_negative_vote_deficit,
+                        d_direct_duplicate_fresh.before[2].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_fresh_before_D measured=%s %zu/%zu/%zu\n",
+                        d_direct_duplicate_fresh.before_measured[3] ? "yes" : "no",
+                        d_direct_duplicate_fresh.before[3].selected_distance,
+                        d_direct_duplicate_fresh.before[3].false_negative_vote_deficit,
+                        d_direct_duplicate_fresh.before[3].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_fresh_trained=%s\n",
+                        d_direct_duplicate_fresh.trained ? "yes" : "no");
+                printf ("---d_direct_duplicate_fresh_owner_passes A=%zu B=%zu C=%zu D=%zu\n",
+                        d_direct_duplicate_fresh.owner_passes[0],
+                        d_direct_duplicate_fresh.owner_passes[1],
+                        d_direct_duplicate_fresh.owner_passes[2],
+                        d_direct_duplicate_fresh.owner_passes[3]);
+                printf ("---d_direct_duplicate_fresh_rounds_completed=%zu\n",
+                        d_direct_duplicate_fresh.rounds_completed);
+                for (size_t round_index = 0; round_index < d_direct_duplicate_fresh.rounds_completed; round_index++) {
+                        printf ("---d_direct_duplicate_fresh_round_%zu_A measured=%s %zu/%zu/%zu\n",
+                                round_index + 1,
+                                d_direct_duplicate_fresh.round_measured[round_index][0] ? "yes" : "no",
+                                d_direct_duplicate_fresh.rounds[round_index][0].selected_distance,
+                                d_direct_duplicate_fresh.rounds[round_index][0].false_negative_vote_deficit,
+                                d_direct_duplicate_fresh.rounds[round_index][0].false_positive_vote_excess);
+                        printf ("---d_direct_duplicate_fresh_round_%zu_B measured=%s %zu/%zu/%zu\n",
+                                round_index + 1,
+                                d_direct_duplicate_fresh.round_measured[round_index][1] ? "yes" : "no",
+                                d_direct_duplicate_fresh.rounds[round_index][1].selected_distance,
+                                d_direct_duplicate_fresh.rounds[round_index][1].false_negative_vote_deficit,
+                                d_direct_duplicate_fresh.rounds[round_index][1].false_positive_vote_excess);
+                        printf ("---d_direct_duplicate_fresh_round_%zu_C measured=%s %zu/%zu/%zu\n",
+                                round_index + 1,
+                                d_direct_duplicate_fresh.round_measured[round_index][2] ? "yes" : "no",
+                                d_direct_duplicate_fresh.rounds[round_index][2].selected_distance,
+                                d_direct_duplicate_fresh.rounds[round_index][2].false_negative_vote_deficit,
+                                d_direct_duplicate_fresh.rounds[round_index][2].false_positive_vote_excess);
+                        printf ("---d_direct_duplicate_fresh_round_%zu_D measured=%s %zu/%zu/%zu\n",
+                                round_index + 1,
+                                d_direct_duplicate_fresh.round_measured[round_index][3] ? "yes" : "no",
+                                d_direct_duplicate_fresh.rounds[round_index][3].selected_distance,
+                                d_direct_duplicate_fresh.rounds[round_index][3].false_negative_vote_deficit,
+                                d_direct_duplicate_fresh.rounds[round_index][3].false_positive_vote_excess);
+                }
+                if (d_direct_duplicate_fresh.trained) {
+                        printf ("---d_direct_duplicate_fresh_after_train_A measured=%s %zu/%zu/%zu\n",
+                                d_direct_duplicate_fresh.after_train_measured[0] ? "yes" : "no",
+                                d_direct_duplicate_fresh.after_train[0].selected_distance,
+                                d_direct_duplicate_fresh.after_train[0].false_negative_vote_deficit,
+                                d_direct_duplicate_fresh.after_train[0].false_positive_vote_excess);
+                        printf ("---d_direct_duplicate_fresh_after_train_B measured=%s %zu/%zu/%zu\n",
+                                d_direct_duplicate_fresh.after_train_measured[1] ? "yes" : "no",
+                                d_direct_duplicate_fresh.after_train[1].selected_distance,
+                                d_direct_duplicate_fresh.after_train[1].false_negative_vote_deficit,
+                                d_direct_duplicate_fresh.after_train[1].false_positive_vote_excess);
+                        printf ("---d_direct_duplicate_fresh_after_train_C measured=%s %zu/%zu/%zu\n",
+                                d_direct_duplicate_fresh.after_train_measured[2] ? "yes" : "no",
+                                d_direct_duplicate_fresh.after_train[2].selected_distance,
+                                d_direct_duplicate_fresh.after_train[2].false_negative_vote_deficit,
+                                d_direct_duplicate_fresh.after_train[2].false_positive_vote_excess);
+                        printf ("---d_direct_duplicate_fresh_after_train_D measured=%s %zu/%zu/%zu\n",
+                                d_direct_duplicate_fresh.after_train_measured[3] ? "yes" : "no",
+                                d_direct_duplicate_fresh.after_train[3].selected_distance,
+                                d_direct_duplicate_fresh.after_train[3].false_negative_vote_deficit,
+                                d_direct_duplicate_fresh.after_train[3].false_positive_vote_excess);
+                }
+                printf ("---d_direct_duplicate_fresh_replay_trained=%s\n",
+                        d_direct_duplicate_fresh.replay_trained ? "yes" : "no");
+                if (d_direct_duplicate_fresh.replay_trained) {
+                        printf ("---d_direct_duplicate_fresh_after_replay_A measured=%s %zu/%zu/%zu\n",
+                                d_direct_duplicate_fresh.after_replay_measured[0] ? "yes" : "no",
+                                d_direct_duplicate_fresh.after_replay[0].selected_distance,
+                                d_direct_duplicate_fresh.after_replay[0].false_negative_vote_deficit,
+                                d_direct_duplicate_fresh.after_replay[0].false_positive_vote_excess);
+                        printf ("---d_direct_duplicate_fresh_after_replay_B measured=%s %zu/%zu/%zu\n",
+                                d_direct_duplicate_fresh.after_replay_measured[1] ? "yes" : "no",
+                                d_direct_duplicate_fresh.after_replay[1].selected_distance,
+                                d_direct_duplicate_fresh.after_replay[1].false_negative_vote_deficit,
+                                d_direct_duplicate_fresh.after_replay[1].false_positive_vote_excess);
+                        printf ("---d_direct_duplicate_fresh_after_replay_C measured=%s %zu/%zu/%zu\n",
+                                d_direct_duplicate_fresh.after_replay_measured[2] ? "yes" : "no",
+                                d_direct_duplicate_fresh.after_replay[2].selected_distance,
+                                d_direct_duplicate_fresh.after_replay[2].false_negative_vote_deficit,
+                                d_direct_duplicate_fresh.after_replay[2].false_positive_vote_excess);
+                        printf ("---d_direct_duplicate_fresh_after_replay_D measured=%s %zu/%zu/%zu\n",
+                                d_direct_duplicate_fresh.after_replay_measured[3] ? "yes" : "no",
+                                d_direct_duplicate_fresh.after_replay[3].selected_distance,
+                                d_direct_duplicate_fresh.after_replay[3].false_negative_vote_deficit,
+                                d_direct_duplicate_fresh.after_replay[3].false_positive_vote_excess);
+                }
+        }
+        printf ("---d_direct_padded_fresh_before_A measured=%s %zu/%zu/%zu\n",
+                d_direct_padded_fresh.before_measured[0] ? "yes" : "no",
+                d_direct_padded_fresh.before[0].selected_distance,
+                d_direct_padded_fresh.before[0].false_negative_vote_deficit,
+                d_direct_padded_fresh.before[0].false_positive_vote_excess);
+        printf ("---d_direct_padded_fresh_before_B measured=%s %zu/%zu/%zu\n",
+                d_direct_padded_fresh.before_measured[1] ? "yes" : "no",
+                d_direct_padded_fresh.before[1].selected_distance,
+                d_direct_padded_fresh.before[1].false_negative_vote_deficit,
+                d_direct_padded_fresh.before[1].false_positive_vote_excess);
+        printf ("---d_direct_padded_fresh_before_C measured=%s %zu/%zu/%zu\n",
+                d_direct_padded_fresh.before_measured[2] ? "yes" : "no",
+                d_direct_padded_fresh.before[2].selected_distance,
+                d_direct_padded_fresh.before[2].false_negative_vote_deficit,
+                d_direct_padded_fresh.before[2].false_positive_vote_excess);
+        printf ("---d_direct_padded_fresh_before_D measured=%s %zu/%zu/%zu\n",
+                d_direct_padded_fresh.before_measured[3] ? "yes" : "no",
+                d_direct_padded_fresh.before[3].selected_distance,
+                d_direct_padded_fresh.before[3].false_negative_vote_deficit,
+                d_direct_padded_fresh.before[3].false_positive_vote_excess);
+        printf ("---d_direct_padded_fresh_trained=%s\n",
+                d_direct_padded_fresh.trained ? "yes" : "no");
+        printf ("---d_direct_padded_fresh_owner_passes A=%zu B=%zu C=%zu D=%zu\n",
+                d_direct_padded_fresh.owner_passes[0],
+                d_direct_padded_fresh.owner_passes[1],
+                d_direct_padded_fresh.owner_passes[2],
+                d_direct_padded_fresh.owner_passes[3]);
+        printf ("---d_direct_padded_fresh_rounds_completed=%zu\n",
+                d_direct_padded_fresh.rounds_completed);
+        for (size_t round_index = 0; round_index < d_direct_padded_fresh.rounds_completed; round_index++) {
+                printf ("---d_direct_padded_fresh_round_%zu_A measured=%s %zu/%zu/%zu\n",
+                        round_index + 1,
+                        d_direct_padded_fresh.round_measured[round_index][0] ? "yes" : "no",
+                        d_direct_padded_fresh.rounds[round_index][0].selected_distance,
+                        d_direct_padded_fresh.rounds[round_index][0].false_negative_vote_deficit,
+                        d_direct_padded_fresh.rounds[round_index][0].false_positive_vote_excess);
+                printf ("---d_direct_padded_fresh_round_%zu_B measured=%s %zu/%zu/%zu\n",
+                        round_index + 1,
+                        d_direct_padded_fresh.round_measured[round_index][1] ? "yes" : "no",
+                        d_direct_padded_fresh.rounds[round_index][1].selected_distance,
+                        d_direct_padded_fresh.rounds[round_index][1].false_negative_vote_deficit,
+                        d_direct_padded_fresh.rounds[round_index][1].false_positive_vote_excess);
+                printf ("---d_direct_padded_fresh_round_%zu_C measured=%s %zu/%zu/%zu\n",
+                        round_index + 1,
+                        d_direct_padded_fresh.round_measured[round_index][2] ? "yes" : "no",
+                        d_direct_padded_fresh.rounds[round_index][2].selected_distance,
+                        d_direct_padded_fresh.rounds[round_index][2].false_negative_vote_deficit,
+                        d_direct_padded_fresh.rounds[round_index][2].false_positive_vote_excess);
+                printf ("---d_direct_padded_fresh_round_%zu_D measured=%s %zu/%zu/%zu\n",
+                        round_index + 1,
+                        d_direct_padded_fresh.round_measured[round_index][3] ? "yes" : "no",
+                        d_direct_padded_fresh.rounds[round_index][3].selected_distance,
+                        d_direct_padded_fresh.rounds[round_index][3].false_negative_vote_deficit,
+                        d_direct_padded_fresh.rounds[round_index][3].false_positive_vote_excess);
+        }
+        if (d_direct_padded_fresh.trained) {
+                printf ("---d_direct_padded_fresh_after_train_A measured=%s %zu/%zu/%zu\n",
+                        d_direct_padded_fresh.after_train_measured[0] ? "yes" : "no",
+                        d_direct_padded_fresh.after_train[0].selected_distance,
+                        d_direct_padded_fresh.after_train[0].false_negative_vote_deficit,
+                        d_direct_padded_fresh.after_train[0].false_positive_vote_excess);
+                printf ("---d_direct_padded_fresh_after_train_B measured=%s %zu/%zu/%zu\n",
+                        d_direct_padded_fresh.after_train_measured[1] ? "yes" : "no",
+                        d_direct_padded_fresh.after_train[1].selected_distance,
+                        d_direct_padded_fresh.after_train[1].false_negative_vote_deficit,
+                        d_direct_padded_fresh.after_train[1].false_positive_vote_excess);
+                printf ("---d_direct_padded_fresh_after_train_C measured=%s %zu/%zu/%zu\n",
+                        d_direct_padded_fresh.after_train_measured[2] ? "yes" : "no",
+                        d_direct_padded_fresh.after_train[2].selected_distance,
+                        d_direct_padded_fresh.after_train[2].false_negative_vote_deficit,
+                        d_direct_padded_fresh.after_train[2].false_positive_vote_excess);
+                printf ("---d_direct_padded_fresh_after_train_D measured=%s %zu/%zu/%zu\n",
+                        d_direct_padded_fresh.after_train_measured[3] ? "yes" : "no",
+                        d_direct_padded_fresh.after_train[3].selected_distance,
+                        d_direct_padded_fresh.after_train[3].false_negative_vote_deficit,
+                        d_direct_padded_fresh.after_train[3].false_positive_vote_excess);
+        }
+        printf ("---d_direct_padded_fresh_replay_trained=%s\n",
+                d_direct_padded_fresh.replay_trained ? "yes" : "no");
+        if (d_direct_padded_fresh.replay_trained) {
+                printf ("---d_direct_padded_fresh_after_replay_A measured=%s %zu/%zu/%zu\n",
+                        d_direct_padded_fresh.after_replay_measured[0] ? "yes" : "no",
+                        d_direct_padded_fresh.after_replay[0].selected_distance,
+                        d_direct_padded_fresh.after_replay[0].false_negative_vote_deficit,
+                        d_direct_padded_fresh.after_replay[0].false_positive_vote_excess);
+                printf ("---d_direct_padded_fresh_after_replay_B measured=%s %zu/%zu/%zu\n",
+                        d_direct_padded_fresh.after_replay_measured[1] ? "yes" : "no",
+                        d_direct_padded_fresh.after_replay[1].selected_distance,
+                        d_direct_padded_fresh.after_replay[1].false_negative_vote_deficit,
+                        d_direct_padded_fresh.after_replay[1].false_positive_vote_excess);
+                printf ("---d_direct_padded_fresh_after_replay_C measured=%s %zu/%zu/%zu\n",
+                        d_direct_padded_fresh.after_replay_measured[2] ? "yes" : "no",
+                        d_direct_padded_fresh.after_replay[2].selected_distance,
+                        d_direct_padded_fresh.after_replay[2].false_negative_vote_deficit,
+                        d_direct_padded_fresh.after_replay[2].false_positive_vote_excess);
+                printf ("---d_direct_padded_fresh_after_replay_D measured=%s %zu/%zu/%zu\n",
+                        d_direct_padded_fresh.after_replay_measured[3] ? "yes" : "no",
+                        d_direct_padded_fresh.after_replay[3].selected_distance,
+                        d_direct_padded_fresh.after_replay[3].false_negative_vote_deficit,
+                        d_direct_padded_fresh.after_replay[3].false_positive_vote_excess);
+        }
+        printf ("---d_direct_gray_fresh_before_A measured=%s %zu/%zu/%zu\n",
+                d_direct_gray_fresh.before_measured[0] ? "yes" : "no",
+                d_direct_gray_fresh.before[0].selected_distance,
+                d_direct_gray_fresh.before[0].false_negative_vote_deficit,
+                d_direct_gray_fresh.before[0].false_positive_vote_excess);
+        printf ("---d_direct_gray_fresh_before_B measured=%s %zu/%zu/%zu\n",
+                d_direct_gray_fresh.before_measured[1] ? "yes" : "no",
+                d_direct_gray_fresh.before[1].selected_distance,
+                d_direct_gray_fresh.before[1].false_negative_vote_deficit,
+                d_direct_gray_fresh.before[1].false_positive_vote_excess);
+        printf ("---d_direct_gray_fresh_before_C measured=%s %zu/%zu/%zu\n",
+                d_direct_gray_fresh.before_measured[2] ? "yes" : "no",
+                d_direct_gray_fresh.before[2].selected_distance,
+                d_direct_gray_fresh.before[2].false_negative_vote_deficit,
+                d_direct_gray_fresh.before[2].false_positive_vote_excess);
+        printf ("---d_direct_gray_fresh_before_D measured=%s %zu/%zu/%zu\n",
+                d_direct_gray_fresh.before_measured[3] ? "yes" : "no",
+                d_direct_gray_fresh.before[3].selected_distance,
+                d_direct_gray_fresh.before[3].false_negative_vote_deficit,
+                d_direct_gray_fresh.before[3].false_positive_vote_excess);
+        printf ("---d_direct_gray_fresh_trained=%s\n",
+                d_direct_gray_fresh.trained ? "yes" : "no");
+        printf ("---d_direct_gray_fresh_owner_passes A=%zu B=%zu C=%zu D=%zu\n",
+                d_direct_gray_fresh.owner_passes[0],
+                d_direct_gray_fresh.owner_passes[1],
+                d_direct_gray_fresh.owner_passes[2],
+                d_direct_gray_fresh.owner_passes[3]);
+        printf ("---d_direct_gray_fresh_rounds_completed=%zu\n",
+                d_direct_gray_fresh.rounds_completed);
+        for (size_t round_index = 0; round_index < d_direct_gray_fresh.rounds_completed; round_index++) {
+                printf ("---d_direct_gray_fresh_round_%zu_A measured=%s %zu/%zu/%zu\n",
+                        round_index + 1,
+                        d_direct_gray_fresh.round_measured[round_index][0] ? "yes" : "no",
+                        d_direct_gray_fresh.rounds[round_index][0].selected_distance,
+                        d_direct_gray_fresh.rounds[round_index][0].false_negative_vote_deficit,
+                        d_direct_gray_fresh.rounds[round_index][0].false_positive_vote_excess);
+                printf ("---d_direct_gray_fresh_round_%zu_B measured=%s %zu/%zu/%zu\n",
+                        round_index + 1,
+                        d_direct_gray_fresh.round_measured[round_index][1] ? "yes" : "no",
+                        d_direct_gray_fresh.rounds[round_index][1].selected_distance,
+                        d_direct_gray_fresh.rounds[round_index][1].false_negative_vote_deficit,
+                        d_direct_gray_fresh.rounds[round_index][1].false_positive_vote_excess);
+                printf ("---d_direct_gray_fresh_round_%zu_C measured=%s %zu/%zu/%zu\n",
+                        round_index + 1,
+                        d_direct_gray_fresh.round_measured[round_index][2] ? "yes" : "no",
+                        d_direct_gray_fresh.rounds[round_index][2].selected_distance,
+                        d_direct_gray_fresh.rounds[round_index][2].false_negative_vote_deficit,
+                        d_direct_gray_fresh.rounds[round_index][2].false_positive_vote_excess);
+                printf ("---d_direct_gray_fresh_round_%zu_D measured=%s %zu/%zu/%zu\n",
+                        round_index + 1,
+                        d_direct_gray_fresh.round_measured[round_index][3] ? "yes" : "no",
+                        d_direct_gray_fresh.rounds[round_index][3].selected_distance,
+                        d_direct_gray_fresh.rounds[round_index][3].false_negative_vote_deficit,
+                        d_direct_gray_fresh.rounds[round_index][3].false_positive_vote_excess);
+        }
+        if (d_direct_gray_fresh.trained) {
+                printf ("---d_direct_gray_fresh_after_train_A measured=%s %zu/%zu/%zu\n",
+                        d_direct_gray_fresh.after_train_measured[0] ? "yes" : "no",
+                        d_direct_gray_fresh.after_train[0].selected_distance,
+                        d_direct_gray_fresh.after_train[0].false_negative_vote_deficit,
+                        d_direct_gray_fresh.after_train[0].false_positive_vote_excess);
+                printf ("---d_direct_gray_fresh_after_train_B measured=%s %zu/%zu/%zu\n",
+                        d_direct_gray_fresh.after_train_measured[1] ? "yes" : "no",
+                        d_direct_gray_fresh.after_train[1].selected_distance,
+                        d_direct_gray_fresh.after_train[1].false_negative_vote_deficit,
+                        d_direct_gray_fresh.after_train[1].false_positive_vote_excess);
+                printf ("---d_direct_gray_fresh_after_train_C measured=%s %zu/%zu/%zu\n",
+                        d_direct_gray_fresh.after_train_measured[2] ? "yes" : "no",
+                        d_direct_gray_fresh.after_train[2].selected_distance,
+                        d_direct_gray_fresh.after_train[2].false_negative_vote_deficit,
+                        d_direct_gray_fresh.after_train[2].false_positive_vote_excess);
+                printf ("---d_direct_gray_fresh_after_train_D measured=%s %zu/%zu/%zu\n",
+                        d_direct_gray_fresh.after_train_measured[3] ? "yes" : "no",
+                        d_direct_gray_fresh.after_train[3].selected_distance,
+                        d_direct_gray_fresh.after_train[3].false_negative_vote_deficit,
+                        d_direct_gray_fresh.after_train[3].false_positive_vote_excess);
+        }
+        if (d_direct_gray_b_probe.measured) {
+                printf ("---d_direct_gray_b_probe wrong_bit_count=%zu\n",
+                        d_direct_gray_b_probe.wrong_bit_count);
+                for (size_t wrong_index = 0; wrong_index < d_direct_gray_b_probe.wrong_bit_count; wrong_index++)
+                        printf ("---d_direct_gray_b_probe_wrong_%zu bit=%zu\n",
+                                wrong_index + 1,
+                                d_direct_gray_b_probe.wrong_bits[wrong_index]);
+                printf ("---d_direct_gray_b_probe_best_single_flip found=%s node=%zu input=%zu bit=%zu value_after=%s objective=%zu/%zu/%zu\n",
+                        d_direct_gray_b_probe.best_single_flip_found ? "yes" : "no",
+                        d_direct_gray_b_probe.best_single_flip.node_index,
+                        d_direct_gray_b_probe.best_single_flip.input_index,
+                        d_direct_gray_b_probe.best_single_flip.bit_index,
+                        d_direct_gray_b_probe.best_single_flip.value_after ? "1" : "0",
+                        d_direct_gray_b_probe.best_single_flip_objective.selected_distance,
+                        d_direct_gray_b_probe.best_single_flip_objective.false_negative_vote_deficit,
+                        d_direct_gray_b_probe.best_single_flip_objective.false_positive_vote_excess);
+        }
+        if (d_direct_gray_c_probe.measured) {
+                printf ("---d_direct_gray_c_probe wrong_bit_count=%zu\n",
+                        d_direct_gray_c_probe.wrong_bit_count);
+                for (size_t wrong_index = 0; wrong_index < d_direct_gray_c_probe.wrong_bit_count; wrong_index++)
+                        printf ("---d_direct_gray_c_probe_wrong_%zu bit=%zu\n",
+                                wrong_index + 1,
+                                d_direct_gray_c_probe.wrong_bits[wrong_index]);
+                printf ("---d_direct_gray_c_probe_best_single_flip found=%s node=%zu input=%zu bit=%zu value_after=%s objective=%zu/%zu/%zu\n",
+                        d_direct_gray_c_probe.best_single_flip_found ? "yes" : "no",
+                        d_direct_gray_c_probe.best_single_flip.node_index,
+                        d_direct_gray_c_probe.best_single_flip.input_index,
+                        d_direct_gray_c_probe.best_single_flip.bit_index,
+                        d_direct_gray_c_probe.best_single_flip.value_after ? "1" : "0",
+                        d_direct_gray_c_probe.best_single_flip_objective.selected_distance,
+                        d_direct_gray_c_probe.best_single_flip_objective.false_negative_vote_deficit,
+                        d_direct_gray_c_probe.best_single_flip_objective.false_positive_vote_excess);
+        }
+        printf ("---d_direct_gray_fresh_replay_trained=%s\n",
+                d_direct_gray_fresh.replay_trained ? "yes" : "no");
+        if (d_direct_gray_fresh.replay_trained) {
+                printf ("---d_direct_gray_fresh_after_replay_A measured=%s %zu/%zu/%zu\n",
+                        d_direct_gray_fresh.after_replay_measured[0] ? "yes" : "no",
+                        d_direct_gray_fresh.after_replay[0].selected_distance,
+                        d_direct_gray_fresh.after_replay[0].false_negative_vote_deficit,
+                        d_direct_gray_fresh.after_replay[0].false_positive_vote_excess);
+                printf ("---d_direct_gray_fresh_after_replay_B measured=%s %zu/%zu/%zu\n",
+                        d_direct_gray_fresh.after_replay_measured[1] ? "yes" : "no",
+                        d_direct_gray_fresh.after_replay[1].selected_distance,
+                        d_direct_gray_fresh.after_replay[1].false_negative_vote_deficit,
+                        d_direct_gray_fresh.after_replay[1].false_positive_vote_excess);
+                printf ("---d_direct_gray_fresh_after_replay_C measured=%s %zu/%zu/%zu\n",
+                        d_direct_gray_fresh.after_replay_measured[2] ? "yes" : "no",
+                        d_direct_gray_fresh.after_replay[2].selected_distance,
+                        d_direct_gray_fresh.after_replay[2].false_negative_vote_deficit,
+                        d_direct_gray_fresh.after_replay[2].false_positive_vote_excess);
+                printf ("---d_direct_gray_fresh_after_replay_D measured=%s %zu/%zu/%zu\n",
+                        d_direct_gray_fresh.after_replay_measured[3] ? "yes" : "no",
+                        d_direct_gray_fresh.after_replay[3].selected_distance,
+                        d_direct_gray_fresh.after_replay[3].false_negative_vote_deficit,
+                        d_direct_gray_fresh.after_replay[3].false_positive_vote_excess);
+        }
+        printf ("---d_direct_duplicate_adapter_before_A measured=%s %zu/%zu/%zu\n",
+                d_direct_duplicate_adapter.before_measured[0] ? "yes" : "no",
+                d_direct_duplicate_adapter.before[0].selected_distance,
+                d_direct_duplicate_adapter.before[0].false_negative_vote_deficit,
+                d_direct_duplicate_adapter.before[0].false_positive_vote_excess);
+        printf ("---d_direct_duplicate_adapter_before_B measured=%s %zu/%zu/%zu\n",
+                d_direct_duplicate_adapter.before_measured[1] ? "yes" : "no",
+                d_direct_duplicate_adapter.before[1].selected_distance,
+                d_direct_duplicate_adapter.before[1].false_negative_vote_deficit,
+                d_direct_duplicate_adapter.before[1].false_positive_vote_excess);
+        printf ("---d_direct_duplicate_adapter_before_C measured=%s %zu/%zu/%zu\n",
+                d_direct_duplicate_adapter.before_measured[2] ? "yes" : "no",
+                d_direct_duplicate_adapter.before[2].selected_distance,
+                d_direct_duplicate_adapter.before[2].false_negative_vote_deficit,
+                d_direct_duplicate_adapter.before[2].false_positive_vote_excess);
+        printf ("---d_direct_duplicate_adapter_before_D measured=%s %zu/%zu/%zu\n",
+                d_direct_duplicate_adapter.before_measured[3] ? "yes" : "no",
+                d_direct_duplicate_adapter.before[3].selected_distance,
+                d_direct_duplicate_adapter.before[3].false_negative_vote_deficit,
+                d_direct_duplicate_adapter.before[3].false_positive_vote_excess);
+        printf ("---d_direct_duplicate_adapter_trained=%s\n",
+                d_direct_duplicate_adapter.trained ? "yes" : "no");
+        printf ("---d_direct_duplicate_adapter_rounds_completed=%zu\n",
+                d_direct_duplicate_adapter.rounds_completed);
+        for (size_t round_index = 0; round_index < d_direct_duplicate_adapter.rounds_completed; round_index++) {
+                printf ("---d_direct_duplicate_adapter_round_%zu_A measured=%s %zu/%zu/%zu\n",
+                        round_index + 1,
+                        d_direct_duplicate_adapter.round_measured[round_index][0] ? "yes" : "no",
+                        d_direct_duplicate_adapter.rounds[round_index][0].selected_distance,
+                        d_direct_duplicate_adapter.rounds[round_index][0].false_negative_vote_deficit,
+                        d_direct_duplicate_adapter.rounds[round_index][0].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_adapter_round_%zu_B measured=%s %zu/%zu/%zu\n",
+                        round_index + 1,
+                        d_direct_duplicate_adapter.round_measured[round_index][1] ? "yes" : "no",
+                        d_direct_duplicate_adapter.rounds[round_index][1].selected_distance,
+                        d_direct_duplicate_adapter.rounds[round_index][1].false_negative_vote_deficit,
+                        d_direct_duplicate_adapter.rounds[round_index][1].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_adapter_round_%zu_C measured=%s %zu/%zu/%zu\n",
+                        round_index + 1,
+                        d_direct_duplicate_adapter.round_measured[round_index][2] ? "yes" : "no",
+                        d_direct_duplicate_adapter.rounds[round_index][2].selected_distance,
+                        d_direct_duplicate_adapter.rounds[round_index][2].false_negative_vote_deficit,
+                        d_direct_duplicate_adapter.rounds[round_index][2].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_adapter_round_%zu_D measured=%s %zu/%zu/%zu\n",
+                        round_index + 1,
+                        d_direct_duplicate_adapter.round_measured[round_index][3] ? "yes" : "no",
+                        d_direct_duplicate_adapter.rounds[round_index][3].selected_distance,
+                        d_direct_duplicate_adapter.rounds[round_index][3].false_negative_vote_deficit,
+                        d_direct_duplicate_adapter.rounds[round_index][3].false_positive_vote_excess);
+        }
+        if (d_direct_duplicate_adapter.trained) {
+                printf ("---d_direct_duplicate_adapter_after_train_A measured=%s %zu/%zu/%zu\n",
+                        d_direct_duplicate_adapter.after_train_measured[0] ? "yes" : "no",
+                        d_direct_duplicate_adapter.after_train[0].selected_distance,
+                        d_direct_duplicate_adapter.after_train[0].false_negative_vote_deficit,
+                        d_direct_duplicate_adapter.after_train[0].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_adapter_after_train_B measured=%s %zu/%zu/%zu\n",
+                        d_direct_duplicate_adapter.after_train_measured[1] ? "yes" : "no",
+                        d_direct_duplicate_adapter.after_train[1].selected_distance,
+                        d_direct_duplicate_adapter.after_train[1].false_negative_vote_deficit,
+                        d_direct_duplicate_adapter.after_train[1].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_adapter_after_train_C measured=%s %zu/%zu/%zu\n",
+                        d_direct_duplicate_adapter.after_train_measured[2] ? "yes" : "no",
+                        d_direct_duplicate_adapter.after_train[2].selected_distance,
+                        d_direct_duplicate_adapter.after_train[2].false_negative_vote_deficit,
+                        d_direct_duplicate_adapter.after_train[2].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_adapter_after_train_D measured=%s %zu/%zu/%zu\n",
+                        d_direct_duplicate_adapter.after_train_measured[3] ? "yes" : "no",
+                        d_direct_duplicate_adapter.after_train[3].selected_distance,
+                        d_direct_duplicate_adapter.after_train[3].false_negative_vote_deficit,
+                        d_direct_duplicate_adapter.after_train[3].false_positive_vote_excess);
+        }
+        printf ("---d_direct_duplicate_adapter_replay_trained=%s\n",
+                d_direct_duplicate_adapter.replay_trained ? "yes" : "no");
+        if (d_direct_duplicate_adapter.replay_trained) {
+                printf ("---d_direct_duplicate_adapter_after_replay_A measured=%s %zu/%zu/%zu\n",
+                        d_direct_duplicate_adapter.after_replay_measured[0] ? "yes" : "no",
+                        d_direct_duplicate_adapter.after_replay[0].selected_distance,
+                        d_direct_duplicate_adapter.after_replay[0].false_negative_vote_deficit,
+                        d_direct_duplicate_adapter.after_replay[0].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_adapter_after_replay_B measured=%s %zu/%zu/%zu\n",
+                        d_direct_duplicate_adapter.after_replay_measured[1] ? "yes" : "no",
+                        d_direct_duplicate_adapter.after_replay[1].selected_distance,
+                        d_direct_duplicate_adapter.after_replay[1].false_negative_vote_deficit,
+                        d_direct_duplicate_adapter.after_replay[1].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_adapter_after_replay_C measured=%s %zu/%zu/%zu\n",
+                        d_direct_duplicate_adapter.after_replay_measured[2] ? "yes" : "no",
+                        d_direct_duplicate_adapter.after_replay[2].selected_distance,
+                        d_direct_duplicate_adapter.after_replay[2].false_negative_vote_deficit,
+                        d_direct_duplicate_adapter.after_replay[2].false_positive_vote_excess);
+                printf ("---d_direct_duplicate_adapter_after_replay_D measured=%s %zu/%zu/%zu\n",
+                        d_direct_duplicate_adapter.after_replay_measured[3] ? "yes" : "no",
+                        d_direct_duplicate_adapter.after_replay[3].selected_distance,
+                        d_direct_duplicate_adapter.after_replay[3].false_negative_vote_deficit,
+                        d_direct_duplicate_adapter.after_replay[3].false_positive_vote_excess);
+        }
+        for (size_t threshold_index = 0; threshold_index < d_threshold_sweep_count; threshold_index++) {
+                within_node_threshold_sweep_summary_t const *summary = &d_threshold_sweep[threshold_index];
+
+                printf ("---d_threshold_sweep_t%zu measured=%s regressions=%zu d=%zu/%zu/%zu b=%zu/%zu/%zu total_dist=%zu total_excess=%zu selected_node=%zu selected_gap=%zu\n",
+                        summary->threshold,
+                        summary->measured ? "yes" : "no",
+                        summary->regressions,
+                        summary->objectives[3].selected_distance,
+                        summary->objectives[3].false_negative_vote_deficit,
+                        summary->objectives[3].false_positive_vote_excess,
+                        summary->objectives[1].selected_distance,
+                        summary->objectives[1].false_negative_vote_deficit,
+                        summary->objectives[1].false_positive_vote_excess,
+                        summary->total_distance,
+                        summary->total_excess,
+                        summary->d_selected_node,
+                        summary->d_selected_gap);
+        }
+        for (size_t rank_index = 0; rank_index < d_threshold_sweep_count; rank_index++) {
+                within_node_threshold_sweep_summary_t const *summary = &d_threshold_ranked[rank_index];
+
+                printf ("---d_threshold_rank_%zu t=%zu regressions=%zu d=%zu/%zu/%zu b=%zu/%zu/%zu total_dist=%zu total_excess=%zu selected_node=%zu selected_gap=%zu\n",
+                        rank_index + 1,
+                        summary->threshold,
+                        summary->regressions,
+                        summary->objectives[3].selected_distance,
+                        summary->objectives[3].false_negative_vote_deficit,
+                        summary->objectives[3].false_positive_vote_excess,
+                        summary->objectives[1].selected_distance,
+                        summary->objectives[1].false_negative_vote_deficit,
+                        summary->objectives[1].false_positive_vote_excess,
+                        summary->total_distance,
+                        summary->total_excess,
+                        summary->d_selected_node,
+                        summary->d_selected_gap);
+        }
+        for (size_t threshold_index = 0; threshold_index < d_fixed_node_threshold_sweep_count; threshold_index++) {
+                fixed_node_threshold_sweep_summary_t const *summary = &d_fixed_node_threshold_sweep[threshold_index];
+
+                printf ("---d_fixed_node_threshold_sweep_t%zu measured=%s fixed_node=%zu selected_node=%zu node1=%zu/%zu/%zu node1_pop=%zu node6_pop=%zu gap_1_vs_6=%td\n",
+                        summary->threshold,
+                        summary->measured ? "yes" : "no",
+                        summary->fixed_node,
+                        summary->selected_node,
+                        summary->node1_objective.selected_distance,
+                        summary->node1_objective.false_negative_vote_deficit,
+                        summary->node1_objective.false_positive_vote_excess,
+                        summary->node1_popcount,
+                        summary->node6_popcount,
+                        summary->node1_vs_node6_gap);
+        }
+        for (size_t rank_index = 0; rank_index < d_fixed_node_threshold_sweep_count; rank_index++) {
+                fixed_node_threshold_sweep_summary_t const *summary = &d_fixed_node_threshold_ranked[rank_index];
+
+                printf ("---d_fixed_node_threshold_rank_%zu t=%zu fixed_node=%zu selected_node=%zu node1=%zu/%zu/%zu node1_pop=%zu node6_pop=%zu gap_1_vs_6=%td\n",
+                        rank_index + 1,
+                        summary->threshold,
+                        summary->fixed_node,
+                        summary->selected_node,
+                        summary->node1_objective.selected_distance,
+                        summary->node1_objective.false_negative_vote_deficit,
+                        summary->node1_objective.false_positive_vote_excess,
+                        summary->node1_popcount,
+                        summary->node6_popcount,
+                        summary->node1_vs_node6_gap);
+        }
+        if (d_threshold_extremes.measured) {
+                printf ("---d_threshold_extremes residual_disabled=%s t_low=%zu t_high=%zu selected_low=%zu selected_high=%zu fixed_node=%zu condensed_dist=%zu condensed_pop=%zu/%zu activation_dist=%zu activation_pop=%zu/%zu folded_selected=%zu/%zu fixed_folded_dist=%zu fixed_folded_pop=%zu/%zu decoded_groups_changed=%zu decoded_groups_crossed=%zu d_low=%zu/%zu/%zu d_high=%zu/%zu/%zu\n",
+                        d_threshold_extremes.residual_disabled ? "yes" : "no",
+                        d_threshold_extremes.threshold_low,
+                        d_threshold_extremes.threshold_high,
+                        d_threshold_extremes.selected_node_low,
+                        d_threshold_extremes.selected_node_high,
+                        d_threshold_extremes.fixed_node_index,
+                        d_threshold_extremes.condensed_distance,
+                        d_threshold_extremes.condensed_pop_low,
+                        d_threshold_extremes.condensed_pop_high,
+                        d_threshold_extremes.activation_distance,
+                        d_threshold_extremes.activation_pop_low,
+                        d_threshold_extremes.activation_pop_high,
+                        d_threshold_extremes.folded_selected_low,
+                        d_threshold_extremes.folded_selected_high,
+                        d_threshold_extremes.fixed_folded_distance,
+                        d_threshold_extremes.fixed_folded_pop_low,
+                        d_threshold_extremes.fixed_folded_pop_high,
+                        d_threshold_extremes.decoded_groups_changed,
+                        d_threshold_extremes.decoded_groups_crossed_threshold,
+                        d_threshold_extremes.objective_low.selected_distance,
+                        d_threshold_extremes.objective_low.false_negative_vote_deficit,
+                        d_threshold_extremes.objective_low.false_positive_vote_excess,
+                        d_threshold_extremes.objective_high.selected_distance,
+                        d_threshold_extremes.objective_high.false_negative_vote_deficit,
+                        d_threshold_extremes.objective_high.false_positive_vote_excess);
+                for (size_t residual_index = 0; residual_index < d_threshold_extremes.residual_bits_compared; residual_index++) {
+                        printf ("---d_threshold_extremes_bit_%zu ones=%zu/%zu folded=%d/%d\n",
+                                d_threshold_extremes.residual_rows[residual_index].decoded_bit,
+                                d_threshold_extremes.residual_rows[residual_index].ones_low,
+                                d_threshold_extremes.residual_rows[residual_index].ones_high,
+                                d_threshold_extremes.residual_rows[residual_index].folded_low ? 1 : 0,
+                                d_threshold_extremes.residual_rows[residual_index].folded_high ? 1 : 0);
+                }
+        }
+        if (d_threshold_extremes_enabled.measured) {
+                printf ("---d_threshold_extremes_enabled residual_disabled=%s t_low=%zu t_high=%zu selected_low=%zu selected_high=%zu fixed_node=%zu condensed_dist=%zu condensed_pop=%zu/%zu activation_dist=%zu activation_pop=%zu/%zu folded_selected=%zu/%zu fixed_folded_dist=%zu fixed_folded_pop=%zu/%zu decoded_groups_changed=%zu decoded_groups_crossed=%zu d_low=%zu/%zu/%zu d_high=%zu/%zu/%zu\n",
+                        d_threshold_extremes_enabled.residual_disabled ? "yes" : "no",
+                        d_threshold_extremes_enabled.threshold_low,
+                        d_threshold_extremes_enabled.threshold_high,
+                        d_threshold_extremes_enabled.selected_node_low,
+                        d_threshold_extremes_enabled.selected_node_high,
+                        d_threshold_extremes_enabled.fixed_node_index,
+                        d_threshold_extremes_enabled.condensed_distance,
+                        d_threshold_extremes_enabled.condensed_pop_low,
+                        d_threshold_extremes_enabled.condensed_pop_high,
+                        d_threshold_extremes_enabled.activation_distance,
+                        d_threshold_extremes_enabled.activation_pop_low,
+                        d_threshold_extremes_enabled.activation_pop_high,
+                        d_threshold_extremes_enabled.folded_selected_low,
+                        d_threshold_extremes_enabled.folded_selected_high,
+                        d_threshold_extremes_enabled.fixed_folded_distance,
+                        d_threshold_extremes_enabled.fixed_folded_pop_low,
+                        d_threshold_extremes_enabled.fixed_folded_pop_high,
+                        d_threshold_extremes_enabled.decoded_groups_changed,
+                        d_threshold_extremes_enabled.decoded_groups_crossed_threshold,
+                        d_threshold_extremes_enabled.objective_low.selected_distance,
+                        d_threshold_extremes_enabled.objective_low.false_negative_vote_deficit,
+                        d_threshold_extremes_enabled.objective_low.false_positive_vote_excess,
+                        d_threshold_extremes_enabled.objective_high.selected_distance,
+                        d_threshold_extremes_enabled.objective_high.false_negative_vote_deficit,
+                        d_threshold_extremes_enabled.objective_high.false_positive_vote_excess);
+                for (size_t residual_index = 0; residual_index < d_threshold_extremes_enabled.residual_bits_compared; residual_index++) {
+                        printf ("---d_threshold_extremes_enabled_bit_%zu ones=%zu/%zu folded=%d/%d\n",
+                                d_threshold_extremes_enabled.residual_rows[residual_index].decoded_bit,
+                                d_threshold_extremes_enabled.residual_rows[residual_index].ones_low,
+                                d_threshold_extremes_enabled.residual_rows[residual_index].ones_high,
+                                d_threshold_extremes_enabled.residual_rows[residual_index].folded_low ? 1 : 0,
+                                d_threshold_extremes_enabled.residual_rows[residual_index].folded_high ? 1 : 0);
+                }
+        }
+        printf ("---d_post_commit_budget=%zu\n", d_commit_budget);
+        printf ("---d_post_commit_budget_class=%s\n", d_commit_budget_label);
+        printf ("---d_post_commit_forced=%zu/%zu/%zu\n",
+                committed_objectives[3].selected_distance,
+                committed_objectives[3].false_negative_vote_deficit,
+                committed_objectives[3].false_positive_vote_excess);
+        printf ("---d_post_replay_forced=%zu/%zu/%zu\n",
+                replay_steps[3].objective.selected_distance,
+                replay_steps[3].objective.false_negative_vote_deficit,
+                replay_steps[3].objective.false_positive_vote_excess);
+        printf ("---d_post_replay_budget=%zu\n", replay_steps[3].budget);
+        printf ("---d_post_replay_budget_class=%s\n",
+                replay_steps[3].budget_class ? replay_steps[3].budget_class : "none");
+        printf ("---b_post_commit_forced=%zu/%zu/%zu\n",
+                committed_objectives[1].selected_distance,
+                committed_objectives[1].false_negative_vote_deficit,
+                committed_objectives[1].false_positive_vote_excess);
+        printf ("---d_capacity_conflict=%s\n", rows[3].objective.selected_distance == 0 ? "no" : "yes");
+        printf ("---route-key-selector-d-end\n");
+
+        for (size_t route = 0; route < nodes; route++)
+                itty_bit_string_free (route_keys[route]);
+        itty_bit_string_free (probe_a);
+        itty_bit_string_free (probe_b);
+        itty_bit_string_free (probe_c);
+        itty_bit_string_free (probe_d);
+        free (a_routes);
+        free (b_routes);
+        itty_feed_model_free (baseline_selector_model);
+        itty_feed_model_free (decoder_model);
+        itty_bit_string_free (target_a);
+        itty_bit_string_free (target_b);
+        itty_bit_string_free (target_c);
+        itty_bit_string_free (target_d);
+        itty_bit_string_list_free (input_a);
+        itty_bit_string_list_free (input_b);
+        itty_bit_string_list_free (input_c);
+        itty_bit_string_list_free (input_d);
 }
 
 static void
@@ -8028,6 +17611,792 @@ run_replay_focus_suite (void)
         return 0;
 }
 
+static int
+run_gray_payload_probe_suite (void)
+{
+        itty_bit_string_list_t *input_a = create_input_with_count (1, 0);
+        itty_bit_string_list_t *input_b = create_input_with_count (1, 1);
+        itty_bit_string_t *target_a = create_bit_string ((size_t) 1 << 3);
+        itty_bit_string_t *target_b = create_bit_string (create_half_populated_word ());
+        itty_bit_string_list_t *input_c = create_input_with_count (1, create_half_populated_word ());
+        itty_bit_string_t *target_c = create_bit_string (create_half_populated_word () ^ ((size_t) 1 << 5));
+        itty_bit_string_list_t *input_d = create_input_with_count (1, ~create_mixed_word ());
+        itty_bit_string_t *target_d = create_bit_string (~create_half_populated_word ());
+        itty_feed_model_t *model = itty_feed_model_new (2, 8, 1, 1);
+        itty_bit_string_list_t *inputs[4] = { input_a, input_b, input_c, input_d };
+        itty_bit_string_t *targets[4] = { target_a, target_b, target_c, target_d };
+        size_t routes[4] = { 2, 0, 5, 1 };
+        size_t training_order[4] = { 1, 0, 2, 3 };
+        itty_feed_model_train_options_t options = {
+                .max_flips = 8,
+                .budget_policy = ITTY_FEED_MODEL_TRAIN_BUDGET_POLICY_LARGEST_ERROR_FIRST,
+                .backward_fold = ITTY_FEED_MODEL_BACKWARD_FOLD_SEGMENT_CONDENSE,
+                .backward_node_target = ITTY_FEED_MODEL_BACKWARD_NODE_TARGET_SAME,
+        };
+        itty_feed_model_decoder_objective_t before[4] = { 0 };
+        itty_feed_model_decoder_objective_t after[4] = { 0 };
+        size_t owner_passes[4] = { 0 };
+        size_t owner_final_slices[4] = { 0 };
+        size_t owner_penultimate_slices[4] = { 0 };
+        bool found_b = false;
+        bool found_c = false;
+        itty_feed_model_mask_flip_trace_t trace_b = { 0 };
+        itty_feed_model_mask_flip_trace_t trace_c = { 0 };
+        itty_feed_model_decoder_objective_t best_b = { 0 };
+        itty_feed_model_decoder_objective_t best_c = { 0 };
+        itty_bit_string_t *folded_b = NULL;
+        itty_bit_string_t *folded_c = NULL;
+
+        itty_feed_model_set_decoder (model, ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
+
+        for (size_t i = 0; i < 4; i++)
+                assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                            inputs[i],
+                                                                            targets[i],
+                                                                            routes[i],
+                                                                            &before[i]));
+
+        for (size_t order_index = 0; order_index < 4; order_index++) {
+                size_t owner_index = training_order[order_index];
+                assert (train_gray_owner_with_layer_scheduler (model,
+                                                               inputs[owner_index],
+                                                               targets[owner_index],
+                                                               routes[owner_index],
+                                                               &options,
+                                                               16,
+                                                               2,
+                                                               &owner_passes[owner_index],
+                                                               &owner_final_slices[owner_index],
+                                                               &owner_penultimate_slices[owner_index],
+                                                               NULL));
+        }
+
+        for (size_t i = 0; i < 4; i++)
+                assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                            inputs[i],
+                                                                            targets[i],
+                                                                            routes[i],
+                                                                            &after[i]));
+
+        assert (itty_feed_model_measure_node_folded_output (model, input_b, target_b, routes[1], &folded_b));
+        assert (itty_feed_model_measure_node_folded_output (model, input_c, target_c, routes[2], &folded_c));
+        assert (itty_feed_model_measure_best_single_final_layer_flip_for_node (model, input_b, target_b, routes[1], &found_b, &trace_b, &best_b));
+        assert (itty_feed_model_measure_best_single_final_layer_flip_for_node (model, input_c, target_c, routes[2], &found_c, &trace_c, &best_c));
+
+        printf ("---gray_probe_before_B %zu/%zu/%zu\n",
+                before[1].selected_distance,
+                before[1].false_negative_vote_deficit,
+                before[1].false_positive_vote_excess);
+        printf ("---gray_probe_before_C %zu/%zu/%zu\n",
+                before[2].selected_distance,
+                before[2].false_negative_vote_deficit,
+                before[2].false_positive_vote_excess);
+        printf ("---gray_probe_after_B %zu/%zu/%zu\n",
+                after[1].selected_distance,
+                after[1].false_negative_vote_deficit,
+                after[1].false_positive_vote_excess);
+        printf ("---gray_probe_after_C %zu/%zu/%zu\n",
+                after[2].selected_distance,
+                after[2].false_negative_vote_deficit,
+                after[2].false_positive_vote_excess);
+        printf ("---gray_probe_owner_passes A=%zu B=%zu C=%zu D=%zu\n",
+                owner_passes[0], owner_passes[1], owner_passes[2], owner_passes[3]);
+        printf ("---gray_probe_owner_final_slices A=%zu B=%zu C=%zu D=%zu\n",
+                owner_final_slices[0], owner_final_slices[1], owner_final_slices[2], owner_final_slices[3]);
+        printf ("---gray_probe_owner_penultimate_slices A=%zu B=%zu C=%zu D=%zu\n",
+                owner_penultimate_slices[0], owner_penultimate_slices[1], owner_penultimate_slices[2], owner_penultimate_slices[3]);
+
+        for (size_t bit_index = 0; bit_index < itty_bit_string_get_bit_capacity (target_b); bit_index++) {
+                if (measure_public_bit (folded_b, bit_index) != measure_public_bit (target_b, bit_index))
+                        printf ("---gray_probe_B_wrong bit=%zu\n", bit_index);
+        }
+        for (size_t bit_index = 0; bit_index < itty_bit_string_get_bit_capacity (target_c); bit_index++) {
+                if (measure_public_bit (folded_c, bit_index) != measure_public_bit (target_c, bit_index))
+                        printf ("---gray_probe_C_wrong bit=%zu\n", bit_index);
+        }
+
+        printf ("---gray_probe_B_best_single_flip found=%s node=%zu input=%zu bit=%zu value_after=%s objective=%zu/%zu/%zu\n",
+                found_b ? "yes" : "no",
+                trace_b.node_index,
+                trace_b.input_index,
+                trace_b.bit_index,
+                trace_b.value_after ? "1" : "0",
+                best_b.selected_distance,
+                best_b.false_negative_vote_deficit,
+                best_b.false_positive_vote_excess);
+        printf ("---gray_probe_C_best_single_flip found=%s node=%zu input=%zu bit=%zu value_after=%s objective=%zu/%zu/%zu\n",
+                found_c ? "yes" : "no",
+                trace_c.node_index,
+                trace_c.input_index,
+                trace_c.bit_index,
+                trace_c.value_after ? "1" : "0",
+                best_c.selected_distance,
+                best_c.false_negative_vote_deficit,
+                best_c.false_positive_vote_excess);
+
+        itty_bit_string_free (folded_b);
+        itty_bit_string_free (folded_c);
+        itty_feed_model_free (model);
+        itty_bit_string_free (target_a);
+        itty_bit_string_free (target_b);
+        itty_bit_string_free (target_c);
+        itty_bit_string_free (target_d);
+        itty_bit_string_list_free (input_a);
+        itty_bit_string_list_free (input_b);
+        itty_bit_string_list_free (input_c);
+        itty_bit_string_list_free (input_d);
+
+        printf ("Focused gray payload probe passed.\n");
+        return 0;
+}
+
+static int
+run_gray_payload_probe_b_only_suite (void)
+{
+        itty_bit_string_list_t *input_b = create_input_with_count (1, 1);
+        itty_bit_string_t *target_b = create_bit_string (create_half_populated_word ());
+        itty_feed_model_t *model = itty_feed_model_new (2, 8, 1, 1);
+        itty_feed_model_train_options_t options = {
+                .max_flips = 8,
+                .budget_policy = ITTY_FEED_MODEL_TRAIN_BUDGET_POLICY_LARGEST_ERROR_FIRST,
+                .backward_fold = ITTY_FEED_MODEL_BACKWARD_FOLD_SEGMENT_CONDENSE,
+                .backward_node_target = ITTY_FEED_MODEL_BACKWARD_NODE_TARGET_SAME,
+        };
+        itty_feed_model_decoder_objective_t before_b = { 0 };
+        itty_feed_model_decoder_objective_t after_b = { 0 };
+        size_t owner_passes = 0;
+        size_t final_slices = 0;
+        size_t penultimate_slices = 0;
+        bool found_b = false;
+        itty_feed_model_mask_flip_trace_t trace_b = { 0 };
+        itty_feed_model_decoder_objective_t best_b = { 0 };
+        itty_bit_string_t *folded_b = NULL;
+        itty_bit_string_t *baseline_activation = NULL;
+        size_t route_b = 0;
+        size_t identical_activation_nodes = 0;
+        size_t baseline_activation_popcount = 0;
+
+        itty_feed_model_set_decoder (model, ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
+
+        assert (measure_output_activation_for_node (model, input_b, 0, &baseline_activation));
+        baseline_activation_popcount = itty_bit_string_get_pop_count (baseline_activation);
+        for (size_t node_index = 0; node_index < 8; node_index++) {
+                itty_bit_string_t *candidate_activation = NULL;
+
+                assert (measure_output_activation_for_node (model, input_b, node_index, &candidate_activation));
+                if (itty_bit_string_compare (baseline_activation, candidate_activation) == 0)
+                        identical_activation_nodes++;
+                itty_bit_string_free (candidate_activation);
+        }
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                    input_b,
+                                                                    target_b,
+                                                                    route_b,
+                                                                    &before_b));
+        assert (train_gray_owner_with_offset_search (model,
+                                                     input_b,
+                                                     target_b,
+                                                     route_b,
+                                                     &options,
+                                                     16,
+                                                     2,
+                                                     &owner_passes,
+                                                     &after_b));
+        final_slices = owner_passes;
+        penultimate_slices = 0;
+        assert (itty_feed_model_measure_node_folded_output (model,
+                                                            input_b,
+                                                            target_b,
+                                                            route_b,
+                                                            &folded_b));
+        assert (itty_feed_model_measure_best_single_final_layer_flip_for_node (model,
+                                                                                input_b,
+                                                                                target_b,
+                                                                                route_b,
+                                                                                &found_b,
+                                                                                &trace_b,
+                                                                                &best_b));
+
+        printf ("---gray_probe_b_only_before %zu/%zu/%zu\n",
+                before_b.selected_distance,
+                before_b.false_negative_vote_deficit,
+                before_b.false_positive_vote_excess);
+        printf ("---gray_probe_b_only_fresh_activation_symmetry identical_nodes=%zu baseline_pop=%zu\n",
+                identical_activation_nodes,
+                baseline_activation_popcount);
+        printf ("---gray_probe_b_only_after %zu/%zu/%zu\n",
+                after_b.selected_distance,
+                after_b.false_negative_vote_deficit,
+                after_b.false_positive_vote_excess);
+        printf ("---gray_probe_b_only_passes %zu\n", owner_passes);
+        printf ("---gray_probe_b_only_final_slices %zu\n", final_slices);
+        printf ("---gray_probe_b_only_penultimate_slices %zu\n", penultimate_slices);
+
+        for (size_t bit_index = 0; bit_index < itty_bit_string_get_bit_capacity (target_b); bit_index++) {
+                if (measure_public_bit (folded_b, bit_index) != measure_public_bit (target_b, bit_index))
+                        printf ("---gray_probe_b_only_wrong bit=%zu\n", bit_index);
+        }
+
+        printf ("---gray_probe_b_only_best_single_flip found=%s node=%zu input=%zu bit=%zu value_after=%s objective=%zu/%zu/%zu\n",
+                found_b ? "yes" : "no",
+                trace_b.node_index,
+                trace_b.input_index,
+                trace_b.bit_index,
+                trace_b.value_after ? "1" : "0",
+                best_b.selected_distance,
+                best_b.false_negative_vote_deficit,
+                best_b.false_positive_vote_excess);
+
+        itty_bit_string_free (folded_b);
+        itty_bit_string_free (baseline_activation);
+        itty_feed_model_free (model);
+        itty_bit_string_free (target_b);
+        itty_bit_string_list_free (input_b);
+
+        printf ("Focused gray payload B-only probe passed.\n");
+        return 0;
+}
+
+static int
+run_gray_payload_probe_b_only_penultimate_suite (void)
+{
+        itty_bit_string_list_t *input_b = create_input_with_count (1, 1);
+        itty_bit_string_t *target_b = create_bit_string (create_half_populated_word ());
+        itty_feed_model_t *model = itty_feed_model_new (2, 8, 1, 1);
+        itty_feed_model_decoder_objective_t before_b = { 0 };
+        itty_feed_model_decoder_objective_t after_b = { 0 };
+        size_t owner_passes = 0;
+        size_t penultimate_slices = 0;
+        bool found_b = false;
+        itty_feed_model_mask_flip_trace_t trace_b = { 0 };
+        itty_feed_model_decoder_objective_t best_b = { 0 };
+        itty_bit_string_t *folded_b = NULL;
+        size_t route_b = 0;
+
+        itty_feed_model_set_decoder (model, ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                    input_b,
+                                                                    target_b,
+                                                                    route_b,
+                                                                    &before_b));
+        assert (train_gray_owner_penultimate_only_with_offset_search (model,
+                                                                      input_b,
+                                                                      target_b,
+                                                                      route_b,
+                                                                      16,
+                                                                      2,
+                                                                      &owner_passes,
+                                                                      &penultimate_slices,
+                                                                      &after_b));
+        assert (itty_feed_model_measure_node_folded_output (model,
+                                                            input_b,
+                                                            target_b,
+                                                            route_b,
+                                                            &folded_b));
+        assert (itty_feed_model_measure_best_single_final_layer_flip_for_node (model,
+                                                                                input_b,
+                                                                                target_b,
+                                                                                route_b,
+                                                                                &found_b,
+                                                                                &trace_b,
+                                                                                &best_b));
+
+        printf ("---gray_probe_b_only_penultimate_before %zu/%zu/%zu\n",
+                before_b.selected_distance,
+                before_b.false_negative_vote_deficit,
+                before_b.false_positive_vote_excess);
+        printf ("---gray_probe_b_only_penultimate_after %zu/%zu/%zu\n",
+                after_b.selected_distance,
+                after_b.false_negative_vote_deficit,
+                after_b.false_positive_vote_excess);
+        printf ("---gray_probe_b_only_penultimate_passes %zu\n", owner_passes);
+        printf ("---gray_probe_b_only_penultimate_slices %zu\n", penultimate_slices);
+
+        for (size_t bit_index = 0; bit_index < itty_bit_string_get_bit_capacity (target_b); bit_index++) {
+                if (measure_public_bit (folded_b, bit_index) != measure_public_bit (target_b, bit_index))
+                        printf ("---gray_probe_b_only_penultimate_wrong bit=%zu\n", bit_index);
+        }
+
+        printf ("---gray_probe_b_only_penultimate_best_single_flip found=%s node=%zu input=%zu bit=%zu value_after=%s objective=%zu/%zu/%zu\n",
+                found_b ? "yes" : "no",
+                trace_b.node_index,
+                trace_b.input_index,
+                trace_b.bit_index,
+                trace_b.value_after ? "1" : "0",
+                best_b.selected_distance,
+                best_b.false_negative_vote_deficit,
+                best_b.false_positive_vote_excess);
+
+        itty_bit_string_free (folded_b);
+        itty_feed_model_free (model);
+        itty_bit_string_free (target_b);
+        itty_bit_string_list_free (input_b);
+
+        printf ("Focused gray payload B-only penultimate probe passed.\n");
+        return 0;
+}
+
+static int
+run_gray_payload_probe_b_only_penultimate_bruteforce_suite (void)
+{
+        itty_bit_string_list_t *input_b = create_input_with_count (1, 1);
+        itty_bit_string_t *target_b = create_bit_string (create_half_populated_word ());
+        itty_feed_model_t *model = itty_feed_model_new (2, 8, 1, 1);
+        itty_feed_model_decoder_objective_t before_b = { 0 };
+        itty_feed_model_decoder_objective_t after_b = { 0 };
+        size_t owner_passes = 0;
+        size_t penultimate_slices = 0;
+        bool found_b = false;
+        itty_feed_model_mask_flip_trace_t trace_b = { 0 };
+        itty_feed_model_decoder_objective_t best_b = { 0 };
+        size_t route_b = 0;
+
+        itty_feed_model_set_decoder (model, ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                    input_b,
+                                                                    target_b,
+                                                                    route_b,
+                                                                    &before_b));
+        assert (train_gray_owner_penultimate_bruteforce_with_offset_search (model,
+                                                                            input_b,
+                                                                            target_b,
+                                                                            route_b,
+                                                                            32,
+                                                                            2,
+                                                                            &owner_passes,
+                                                                            &penultimate_slices,
+                                                                            &after_b));
+        assert (itty_feed_model_measure_best_single_penultimate_layer_flip_for_node (model,
+                                                                                      input_b,
+                                                                                      target_b,
+                                                                                      route_b,
+                                                                                      &found_b,
+                                                                                      &trace_b,
+                                                                                      &best_b));
+
+        printf ("---gray_probe_b_only_penultimate_bruteforce_before %zu/%zu/%zu\n",
+                before_b.selected_distance,
+                before_b.false_negative_vote_deficit,
+                before_b.false_positive_vote_excess);
+        printf ("---gray_probe_b_only_penultimate_bruteforce_after %zu/%zu/%zu\n",
+                after_b.selected_distance,
+                after_b.false_negative_vote_deficit,
+                after_b.false_positive_vote_excess);
+        printf ("---gray_probe_b_only_penultimate_bruteforce_passes %zu\n", owner_passes);
+        printf ("---gray_probe_b_only_penultimate_bruteforce_slices %zu\n", penultimate_slices);
+        printf ("---gray_probe_b_only_penultimate_bruteforce_next_single found=%s node=%zu input=%zu bit=%zu value_after=%s objective=%zu/%zu/%zu\n",
+                found_b ? "yes" : "no",
+                trace_b.node_index,
+                trace_b.input_index,
+                trace_b.bit_index,
+                trace_b.value_after ? "1" : "0",
+                best_b.selected_distance,
+                best_b.false_negative_vote_deficit,
+                best_b.false_positive_vote_excess);
+
+        itty_feed_model_free (model);
+        itty_bit_string_free (target_b);
+        itty_bit_string_list_free (input_b);
+
+        printf ("Focused gray payload B-only penultimate brute-force probe passed.\n");
+        return 0;
+}
+
+static int
+run_gray_payload_probe_b_only_penultimate_bundle_suite (void)
+{
+        itty_bit_string_list_t *input_b = create_input_with_count (1, 1);
+        itty_bit_string_t *target_b = create_bit_string (create_half_populated_word ());
+        itty_feed_model_t *model = itty_feed_model_new (2, 8, 1, 1);
+        itty_feed_model_decoder_objective_t before_b = { 0 };
+        itty_feed_model_decoder_objective_t after_b = { 0 };
+        bool found = false;
+        size_t accepted_bundles = 0;
+        itty_feed_model_mask_flip_trace_t traces[8] = { 0 };
+        size_t trace_count = 0;
+        size_t last_accepted_trace_count = 0;
+        itty_feed_model_decoder_objective_t best = { 0 };
+        bool stalled_with_candidate = false;
+        size_t route_b = 0;
+
+        itty_feed_model_set_decoder (model, ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                    input_b,
+                                                                    target_b,
+                                                                    route_b,
+                                                                    &before_b));
+
+        while (accepted_bundles < 256) {
+                assert (itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (model,
+                                                                                           input_b,
+                                                                                           target_b,
+                                                                                           route_b,
+                                                                                           5,
+                                                                                           8,
+                                                                                           &found,
+                                                                                           traces,
+                                                                                           8,
+                                                                                           &trace_count,
+                                                                                           &best));
+                if (!found)
+                        break;
+                for (size_t trace_index = 0; trace_index < trace_count; trace_index++)
+                        assert (itty_feed_model_apply_penultimate_layer_mask_flip_trace (model, &traces[trace_index]));
+                accepted_bundles++;
+                last_accepted_trace_count = trace_count;
+        }
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                    input_b,
+                                                                    target_b,
+                                                                    route_b,
+                                                                    &after_b));
+        assert (itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (model,
+                                                                                   input_b,
+                                                                                   target_b,
+                                                                                   route_b,
+                                                                                   5,
+                                                                                   8,
+                                                                                   &stalled_with_candidate,
+                                                                                   traces,
+                                                                                   8,
+                                                                                   &trace_count,
+                                                                                   &best));
+
+        printf ("---gray_probe_b_only_penultimate_bundle_before %zu/%zu/%zu\n",
+                before_b.selected_distance,
+                before_b.false_negative_vote_deficit,
+                before_b.false_positive_vote_excess);
+        printf ("---gray_probe_b_only_penultimate_bundle_after %zu/%zu/%zu\n",
+                after_b.selected_distance,
+                after_b.false_negative_vote_deficit,
+                after_b.false_positive_vote_excess);
+        printf ("---gray_probe_b_only_penultimate_bundle_accepted %zu\n", accepted_bundles);
+        printf ("---gray_probe_b_only_penultimate_bundle_last_size %zu\n", last_accepted_trace_count);
+        printf ("---gray_probe_b_only_penultimate_bundle_next_found %s objective=%zu/%zu/%zu\n",
+                stalled_with_candidate ? "yes" : "no",
+                best.selected_distance,
+                best.false_negative_vote_deficit,
+                best.false_positive_vote_excess);
+
+        itty_feed_model_free (model);
+        itty_bit_string_free (target_b);
+        itty_bit_string_list_free (input_b);
+
+        printf ("Focused gray payload B-only penultimate bundle probe passed.\n");
+        return 0;
+}
+
+static int
+run_gray_payload_probe_b_only_combined_bundle_final_suite (void)
+{
+        itty_bit_string_list_t *input_b = create_input_with_count (1, 1);
+        itty_bit_string_t *target_b = create_bit_string (create_half_populated_word ());
+        itty_feed_model_t *model = itty_feed_model_new (2, 8, 1, 1);
+        itty_feed_model_train_options_t options = {
+                .max_flips = 8,
+                .budget_policy = ITTY_FEED_MODEL_TRAIN_BUDGET_POLICY_LARGEST_ERROR_FIRST,
+                .backward_fold = ITTY_FEED_MODEL_BACKWARD_FOLD_SEGMENT_CONDENSE,
+                .backward_node_target = ITTY_FEED_MODEL_BACKWARD_NODE_TARGET_SAME,
+        };
+        itty_feed_model_decoder_objective_t before_b = { 0 };
+        itty_feed_model_decoder_objective_t after_b = { 0 };
+        size_t route_b = 0;
+        size_t accepted_steps = 0;
+        size_t accepted_penultimate_bundles = 0;
+        size_t accepted_final_singles = 0;
+        size_t current_offset = 0;
+        itty_feed_model_decoder_objective_t current = { 0 };
+        itty_feed_model_mask_flip_trace_t bundle_traces[8] = { 0 };
+        size_t bundle_trace_count = 0;
+        bool found_bundle = false;
+        itty_feed_model_decoder_objective_t best_bundle = { 0 };
+
+        itty_feed_model_set_decoder (model, ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                    input_b,
+                                                                    target_b,
+                                                                    route_b,
+                                                                    &before_b));
+        assert (train_gray_owner_with_offset_search (model,
+                                                     input_b,
+                                                     target_b,
+                                                     route_b,
+                                                     &options,
+                                                     16,
+                                                     2,
+                                                     &accepted_final_singles,
+                                                     &current));
+        accepted_steps = accepted_final_singles;
+
+        assert (find_best_gray_offset_for_route (model,
+                                                 input_b,
+                                                 target_b,
+                                                 route_b,
+                                                 &current_offset,
+                                                 &current));
+        itty_feed_model_set_gray_offset_override (model, route_b, true, current_offset);
+
+        while (accepted_steps < 256 && current.selected_distance > 0) {
+                assert (itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (model,
+                                                                                           input_b,
+                                                                                           target_b,
+                                                                                           route_b,
+                                                                                           5,
+                                                                                           8,
+                                                                                           &found_bundle,
+                                                                                           bundle_traces,
+                                                                                           8,
+                                                                                           &bundle_trace_count,
+                                                                                           &best_bundle));
+                if (!found_bundle ||
+                    !route_objective_improves_on_committed (&best_bundle, &current))
+                        break;
+
+                for (size_t trace_index = 0; trace_index < bundle_trace_count; trace_index++)
+                        assert (itty_feed_model_apply_penultimate_layer_mask_flip_trace (model,
+                                                                                         &bundle_traces[trace_index]));
+
+                current = best_bundle;
+                accepted_penultimate_bundles++;
+                accepted_steps++;
+        }
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                    input_b,
+                                                                    target_b,
+                                                                    route_b,
+                                                                    &after_b));
+
+        printf ("---gray_probe_b_only_combined_before %zu/%zu/%zu\n",
+                before_b.selected_distance,
+                before_b.false_negative_vote_deficit,
+                before_b.false_positive_vote_excess);
+        printf ("---gray_probe_b_only_combined_after %zu/%zu/%zu\n",
+                after_b.selected_distance,
+                after_b.false_negative_vote_deficit,
+                after_b.false_positive_vote_excess);
+        printf ("---gray_probe_b_only_combined_steps %zu\n", accepted_steps);
+        printf ("---gray_probe_b_only_combined_penultimate_bundles %zu\n", accepted_penultimate_bundles);
+        printf ("---gray_probe_b_only_combined_final_singles %zu\n", accepted_final_singles);
+
+        itty_feed_model_free (model);
+        itty_bit_string_free (target_b);
+        itty_bit_string_list_free (input_b);
+
+        printf ("Focused gray payload B-only combined probe passed.\n");
+        return 0;
+}
+
+static int
+run_gray_payload_probe_c_only_combined_bundle_final_suite (void)
+{
+        itty_bit_string_list_t *input_c = create_input_with_count (1, create_half_populated_word ());
+        itty_bit_string_t *target_c = create_bit_string (create_half_populated_word () ^ ((size_t) 1 << 5));
+        itty_feed_model_t *model = itty_feed_model_new (2, 8, 1, 1);
+        itty_feed_model_train_options_t options = {
+                .max_flips = 8,
+                .budget_policy = ITTY_FEED_MODEL_TRAIN_BUDGET_POLICY_LARGEST_ERROR_FIRST,
+                .backward_fold = ITTY_FEED_MODEL_BACKWARD_FOLD_SEGMENT_CONDENSE,
+                .backward_node_target = ITTY_FEED_MODEL_BACKWARD_NODE_TARGET_SAME,
+        };
+        itty_feed_model_decoder_objective_t before_c = { 0 };
+        itty_feed_model_decoder_objective_t after_c = { 0 };
+        size_t route_c = 5;
+        size_t accepted_steps = 0;
+        size_t accepted_penultimate_bundles = 0;
+        size_t accepted_final_singles = 0;
+        size_t current_offset = 0;
+        itty_feed_model_decoder_objective_t current = { 0 };
+        itty_feed_model_mask_flip_trace_t bundle_traces[8] = { 0 };
+        size_t bundle_trace_count = 0;
+        bool found_bundle = false;
+        itty_feed_model_decoder_objective_t best_bundle = { 0 };
+
+        itty_feed_model_set_decoder (model, ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                    input_c,
+                                                                    target_c,
+                                                                    route_c,
+                                                                    &before_c));
+        assert (train_gray_owner_with_offset_search (model,
+                                                     input_c,
+                                                     target_c,
+                                                     route_c,
+                                                     &options,
+                                                     16,
+                                                     2,
+                                                     &accepted_final_singles,
+                                                     &current));
+        accepted_steps = accepted_final_singles;
+
+        assert (find_best_gray_offset_for_route (model,
+                                                 input_c,
+                                                 target_c,
+                                                 route_c,
+                                                 &current_offset,
+                                                 &current));
+        itty_feed_model_set_gray_offset_override (model, route_c, true, current_offset);
+
+        while (accepted_steps < 256 && current.selected_distance > 0) {
+                assert (itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (model,
+                                                                                           input_c,
+                                                                                           target_c,
+                                                                                           route_c,
+                                                                                           5,
+                                                                                           8,
+                                                                                           &found_bundle,
+                                                                                           bundle_traces,
+                                                                                           8,
+                                                                                           &bundle_trace_count,
+                                                                                           &best_bundle));
+                if (!found_bundle ||
+                    !route_objective_improves_on_committed (&best_bundle, &current))
+                        break;
+
+                for (size_t trace_index = 0; trace_index < bundle_trace_count; trace_index++)
+                        assert (itty_feed_model_apply_penultimate_layer_mask_flip_trace (model,
+                                                                                         &bundle_traces[trace_index]));
+
+                current = best_bundle;
+                accepted_penultimate_bundles++;
+                accepted_steps++;
+        }
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                    input_c,
+                                                                    target_c,
+                                                                    route_c,
+                                                                    &after_c));
+
+        printf ("---gray_probe_c_only_combined_before %zu/%zu/%zu\n",
+                before_c.selected_distance,
+                before_c.false_negative_vote_deficit,
+                before_c.false_positive_vote_excess);
+        printf ("---gray_probe_c_only_combined_after %zu/%zu/%zu\n",
+                after_c.selected_distance,
+                after_c.false_negative_vote_deficit,
+                after_c.false_positive_vote_excess);
+        printf ("---gray_probe_c_only_combined_steps %zu\n", accepted_steps);
+        printf ("---gray_probe_c_only_combined_penultimate_bundles %zu\n", accepted_penultimate_bundles);
+        printf ("---gray_probe_c_only_combined_final_singles %zu\n", accepted_final_singles);
+
+        itty_feed_model_free (model);
+        itty_bit_string_free (target_c);
+        itty_bit_string_list_free (input_c);
+
+        printf ("Focused gray payload C-only combined probe passed.\n");
+        return 0;
+}
+
+static int
+run_gray_payload_probe_a_only_combined_bundle_final_suite (void)
+{
+        itty_bit_string_list_t *input_a = create_input_with_count (1, 0);
+        itty_bit_string_t *target_a = create_bit_string ((size_t) 1 << 3);
+        itty_feed_model_t *model = itty_feed_model_new (2, 8, 1, 1);
+        itty_feed_model_train_options_t options = {
+                .max_flips = 8,
+                .budget_policy = ITTY_FEED_MODEL_TRAIN_BUDGET_POLICY_LARGEST_ERROR_FIRST,
+                .backward_fold = ITTY_FEED_MODEL_BACKWARD_FOLD_SEGMENT_CONDENSE,
+                .backward_node_target = ITTY_FEED_MODEL_BACKWARD_NODE_TARGET_SAME,
+        };
+        itty_feed_model_decoder_objective_t before_a = { 0 };
+        itty_feed_model_decoder_objective_t after_a = { 0 };
+        size_t route_a = 2;
+        size_t accepted_steps = 0;
+        size_t accepted_penultimate_bundles = 0;
+        size_t accepted_final_singles = 0;
+        size_t current_offset = 0;
+        itty_feed_model_decoder_objective_t current = { 0 };
+        itty_feed_model_mask_flip_trace_t bundle_traces[8] = { 0 };
+        size_t bundle_trace_count = 0;
+        bool found_bundle = false;
+        itty_feed_model_decoder_objective_t best_bundle = { 0 };
+
+        itty_feed_model_set_decoder (model, ITTY_FEED_MODEL_DECODER_DIRECT_GRAY_OFFSET_TARGET);
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                    input_a,
+                                                                    target_a,
+                                                                    route_a,
+                                                                    &before_a));
+        assert (train_gray_owner_with_offset_search (model,
+                                                     input_a,
+                                                     target_a,
+                                                     route_a,
+                                                     &options,
+                                                     16,
+                                                     2,
+                                                     &accepted_final_singles,
+                                                     &current));
+        accepted_steps = accepted_final_singles;
+
+        assert (find_best_gray_offset_for_route (model,
+                                                 input_a,
+                                                 target_a,
+                                                 route_a,
+                                                 &current_offset,
+                                                 &current));
+        itty_feed_model_set_gray_offset_override (model, route_a, true, current_offset);
+
+        while (accepted_steps < 256 && current.selected_distance > 0) {
+                assert (itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (model,
+                                                                                           input_a,
+                                                                                           target_a,
+                                                                                           route_a,
+                                                                                           5,
+                                                                                           8,
+                                                                                           &found_bundle,
+                                                                                           bundle_traces,
+                                                                                           8,
+                                                                                           &bundle_trace_count,
+                                                                                           &best_bundle));
+                if (!found_bundle ||
+                    !route_objective_improves_on_committed (&best_bundle, &current))
+                        break;
+
+                for (size_t trace_index = 0; trace_index < bundle_trace_count; trace_index++)
+                        assert (itty_feed_model_apply_penultimate_layer_mask_flip_trace (model,
+                                                                                         &bundle_traces[trace_index]));
+
+                current = best_bundle;
+                accepted_penultimate_bundles++;
+                accepted_steps++;
+        }
+
+        assert (itty_feed_model_measure_decoder_objective_for_node (model,
+                                                                    input_a,
+                                                                    target_a,
+                                                                    route_a,
+                                                                    &after_a));
+
+        printf ("---gray_probe_a_only_combined_before %zu/%zu/%zu\n",
+                before_a.selected_distance,
+                before_a.false_negative_vote_deficit,
+                before_a.false_positive_vote_excess);
+        printf ("---gray_probe_a_only_combined_after %zu/%zu/%zu\n",
+                after_a.selected_distance,
+                after_a.false_negative_vote_deficit,
+                after_a.false_positive_vote_excess);
+        printf ("---gray_probe_a_only_combined_steps %zu\n", accepted_steps);
+        printf ("---gray_probe_a_only_combined_penultimate_bundles %zu\n", accepted_penultimate_bundles);
+        printf ("---gray_probe_a_only_combined_final_singles %zu\n", accepted_final_singles);
+
+        itty_feed_model_free (model);
+        itty_bit_string_free (target_a);
+        itty_bit_string_list_free (input_a);
+
+        printf ("Focused gray payload A-only combined probe passed.\n");
+        return 0;
+}
+
 int
 main (int   argc,
       char *argv[])
@@ -8085,6 +18454,27 @@ main (int   argc,
                 printf ("Focused route-key selector C diagnostics passed.\n");
                 return 0;
         }
+        if (argc > 1 && strcmp (argv[1], "--focus-route-key-selector-d") == 0) {
+                test_itty_feed_model_segment_replay_route_key_selector_add_d_diagnostic ();
+                printf ("Focused route-key selector D diagnostics passed.\n");
+                return 0;
+        }
+        if (argc > 1 && strcmp (argv[1], "--focus-gray-payload-probe") == 0)
+                return run_gray_payload_probe_suite ();
+        if (argc > 1 && strcmp (argv[1], "--focus-gray-payload-probe-b-only") == 0)
+                return run_gray_payload_probe_b_only_suite ();
+        if (argc > 1 && strcmp (argv[1], "--focus-gray-payload-probe-b-only-penultimate") == 0)
+                return run_gray_payload_probe_b_only_penultimate_suite ();
+        if (argc > 1 && strcmp (argv[1], "--focus-gray-payload-probe-b-only-penultimate-bruteforce") == 0)
+                return run_gray_payload_probe_b_only_penultimate_bruteforce_suite ();
+        if (argc > 1 && strcmp (argv[1], "--focus-gray-payload-probe-b-only-penultimate-bundle") == 0)
+                return run_gray_payload_probe_b_only_penultimate_bundle_suite ();
+        if (argc > 1 && strcmp (argv[1], "--focus-gray-payload-probe-b-only-combined") == 0)
+                return run_gray_payload_probe_b_only_combined_bundle_final_suite ();
+        if (argc > 1 && strcmp (argv[1], "--focus-gray-payload-probe-c-only-combined") == 0)
+                return run_gray_payload_probe_c_only_combined_bundle_final_suite ();
+        if (argc > 1 && strcmp (argv[1], "--focus-gray-payload-probe-a-only-combined") == 0)
+                return run_gray_payload_probe_a_only_combined_bundle_final_suite ();
 
         test_itty_feed_model_train_one_learns_single_mask ();
         test_itty_feed_model_train_one_with_budget_moves_toward_target ();

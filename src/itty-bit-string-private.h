@@ -9,10 +9,8 @@ struct itty_bit_string_t {
         size_t *words;
         size_t number_of_words;
         size_t pop_count;
-        size_t bit_length;
         itty_bit_string_mutability_t mutability;
         unsigned long pop_count_computed : 1;
-        unsigned long bit_length_computed : 1;
 };
 
 static inline bool
