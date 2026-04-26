@@ -10603,6 +10603,34 @@ itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (itty_feed_mod
                                                                    size_t                               *trace_count,
                                                                    itty_feed_model_decoder_objective_t  *objective)
 {
+        return itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node_excluding_bits (model,
+                                                                                                  input,
+                                                                                                  target,
+                                                                                                  node_index,
+                                                                                                  min_bundle_size,
+                                                                                                  max_bundle_size,
+                                                                                                  NULL,
+                                                                                                  found,
+                                                                                                  traces,
+                                                                                                  trace_capacity,
+                                                                                                  trace_count,
+                                                                                                  objective);
+}
+
+bool
+itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node_excluding_bits (itty_feed_model_t                    *model,
+                                                                                   itty_bit_string_list_t               *input,
+                                                                                   itty_bit_string_t                    *target,
+                                                                                   size_t                                node_index,
+                                                                                   size_t                                min_bundle_size,
+                                                                                   size_t                                max_bundle_size,
+                                                                                   itty_bit_string_t                    *excluded_bits,
+                                                                                   bool                                 *found,
+                                                                                   itty_feed_model_mask_flip_trace_t    *traces,
+                                                                                   size_t                                trace_capacity,
+                                                                                   size_t                               *trace_count,
+                                                                                   itty_feed_model_decoder_objective_t  *objective)
+{
         size_t penultimate_layer;
         itty_bit_string_list_t *baseline_outputs = NULL;
         itty_feed_model_decoder_objective_t current = { 0 };
@@ -10651,6 +10679,11 @@ itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (itty_feed_mod
                 uint64_t subset_limit = UINT64_C(1) << model->nodes_per_layer;
 
                 for (size_t bit_index = 0; bit_index < bit_capacity; bit_index++) {
+                        if (excluded_bits &&
+                            bit_index < itty_bit_string_get_bit_capacity (excluded_bits) &&
+                            itty_bit_string_get_bit (excluded_bits, bit_index))
+                                continue;
+
                         for (uint64_t subset = 1; subset < subset_limit; subset++) {
                                 size_t bundle_size = (size_t) __builtin_popcountll ((unsigned long long) subset);
                                 itty_bit_string_list_t *outputs = NULL;

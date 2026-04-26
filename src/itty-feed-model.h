@@ -1308,6 +1308,18 @@ bool itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node (itty_fee
                                                                         size_t                                trace_capacity,
                                                                         size_t                               *trace_count,
                                                                         itty_feed_model_decoder_objective_t  *objective);
+bool itty_feed_model_measure_best_penultimate_same_bit_bundle_for_node_excluding_bits (itty_feed_model_t                    *model,
+                                                                                        itty_bit_string_list_t               *input,
+                                                                                        itty_bit_string_t                    *target,
+                                                                                        size_t                                node_index,
+                                                                                        size_t                                min_bundle_size,
+                                                                                        size_t                                max_bundle_size,
+                                                                                        itty_bit_string_t                    *excluded_bits,
+                                                                                        bool                                 *found,
+                                                                                        itty_feed_model_mask_flip_trace_t    *traces,
+                                                                                        size_t                                trace_capacity,
+                                                                                        size_t                               *trace_count,
+                                                                                        itty_feed_model_decoder_objective_t  *objective);
 bool itty_feed_model_apply_penultimate_layer_mask_flip_trace (itty_feed_model_t                       *model,
                                                               itty_feed_model_mask_flip_trace_t const *trace);
 bool itty_feed_model_measure_selected_node_direct_clear_set (itty_feed_model_t                                *model,
