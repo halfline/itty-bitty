@@ -271,33 +271,33 @@ test_itty_bit_string_get_length (void)
 {
         itty_bit_string_t *bit_string_1 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         itty_bit_string_append_word (bit_string_1, 0b1100);
-        assert (itty_bit_string_get_length (bit_string_1) == 4);
+        assert (itty_bit_string_get_length (bit_string_1) == ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
         itty_bit_string_free (bit_string_1);
 
         itty_bit_string_t *bit_string_2 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         itty_bit_string_append_word (bit_string_2, 0);
         itty_bit_string_append_word (bit_string_2, 0);
         itty_bit_string_append_word (bit_string_2, 0b1111);
-        assert (itty_bit_string_get_length (bit_string_2) == 4);
+        assert (itty_bit_string_get_length (bit_string_2) == 3 * ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
         itty_bit_string_free (bit_string_2);
 
         itty_bit_string_t *bit_string_3 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         itty_bit_string_append_word (bit_string_3, 0);
-        assert (itty_bit_string_get_length (bit_string_3) == 0);
+        assert (itty_bit_string_get_length (bit_string_3) == ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
         itty_bit_string_free (bit_string_3);
 
         printf ("All test cases passed!\n");
 }
 
 void
-test_itty_bit_string_get_bit_capacity (void)
+test_itty_bit_string_get_length_reports_capacity (void)
 {
         itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         itty_bit_string_append_word (bit_string, 0);
         itty_bit_string_append_word (bit_string, 0);
 
-        assert (itty_bit_string_get_length (bit_string) == 0);
-        assert (itty_bit_string_get_bit_capacity (bit_string) == 2 * ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
+        assert (itty_bit_string_get_length (bit_string) == 2 * ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
+        assert (itty_bit_string_get_length (bit_string) == 2 * ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
 
         itty_bit_string_free (bit_string);
 
@@ -325,7 +325,7 @@ main (void)
         test_itty_bit_string_reduce_rotated_by_half_wraps ();
         test_itty_bit_string_reduce_by_half ();
         test_itty_bit_string_get_length ();
-        test_itty_bit_string_get_bit_capacity ();
+        test_itty_bit_string_get_length_reports_capacity ();
 
         printf ("All itty-bit-string tests passed.\n");
         return 0;

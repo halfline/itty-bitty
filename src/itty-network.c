@@ -585,7 +585,7 @@ network_affinity_score_bit_length_for_input (itty_network_node_t      *node,
 
         for (size_t i = 0; i < itty_bit_string_list_get_length (current_input); i++) {
                 itty_bit_string_t *probe = itty_bit_string_list_fetch (current_input, i);
-                size_t bit_capacity = itty_bit_string_get_bit_capacity (probe);
+                size_t bit_capacity = itty_bit_string_get_length (probe);
                 if (bit_capacity > score_bit_length)
                         score_bit_length = bit_capacity;
         }

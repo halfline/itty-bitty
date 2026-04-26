@@ -36,7 +36,7 @@ itty_model_metrics_measure_bit_string (itty_bit_string_t                *bit_str
         if (!bit_string || !summary)
                 return false;
 
-        size_t bit_count = itty_bit_string_get_bit_capacity (bit_string);
+        size_t bit_count = itty_bit_string_get_length (bit_string);
         size_t set_bits = itty_bit_string_get_pop_count (bit_string);
 
         *summary = (itty_model_metrics_bit_summary_t) {
@@ -64,7 +64,7 @@ itty_model_metrics_measure_bit_string_list (itty_bit_string_list_t           *li
 
         itty_bit_string_t *bit_string = NULL;
         while (itty_bit_string_list_iterator_next (&iterator, &bit_string)) {
-                summary->bit_count += itty_bit_string_get_bit_capacity (bit_string);
+                summary->bit_count += itty_bit_string_get_length (bit_string);
                 summary->set_bits += itty_bit_string_get_pop_count (bit_string);
         }
 

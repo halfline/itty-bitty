@@ -72,6 +72,12 @@ itty_vocabulary_free (itty_vocabulary_t *vocabulary)
         free (vocabulary);
 }
 
+size_t
+itty_vocabulary_get_count (itty_vocabulary_t *vocabulary)
+{
+        return vocabulary ? vocabulary->count : 0;
+}
+
 itty_bit_string_t *
 itty_vocabulary_translate_to_bit_string (itty_vocabulary_t *vocabulary,
                                          const char        *text)

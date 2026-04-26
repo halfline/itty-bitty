@@ -3,10 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "itty-bit-string.c"
-#include "itty-bit-string-list.c"
-#include "itty-bit-string-map.c"
-#include "itty-vocabulary.c"
+#include "itty-bit-string.h"
+#include "itty-bit-string-map.h"
+#include "itty-vocabulary.h"
 
 static char *
 create_temp_file (const char *content, size_t size)
@@ -18,7 +17,7 @@ create_temp_file (const char *content, size_t size)
                 return NULL;
         }
 
-        if (write (fd, content, size) != size) {
+        if (write (fd, content, size) != (ssize_t) size) {
                 close (fd);
                 free (filename);
                 return NULL;
@@ -41,7 +40,7 @@ test_itty_vocabulary_new (void)
 
         itty_vocabulary_t *vocabulary = itty_vocabulary_new (text_file, bit_string_file);
         assert (vocabulary != NULL);
-        assert (vocabulary->count == 3);
+        assert (itty_vocabulary_get_count (vocabulary) == 3);
 
         itty_vocabulary_free (vocabulary);
         remove (text_file);

@@ -116,7 +116,7 @@ run_inference (const char *vocabulary_text_file,
         for (size_t i = 0; i < number_of_layers; i++) {
                 itty_bit_string_list_t *bit_string_list;
                 size_t number_of_nodes = 0;
-                size_t number_of_words = 1 << i;
+                size_t number_of_words = ((size_t) 1) << i;
 
                 itty_network_layer_t *layer = itty_network_layer_new ();
                 while (number_of_nodes < nodes_per_layer) {

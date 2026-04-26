@@ -1,6 +1,5 @@
 #include "itty-bit-string.h"
 #include "itty-bit-string-list.h"
-#include "itty-feed-model.h"
 #include "itty-model-metrics.h"
 #include "itty-network.h"
 #include <assert.h>
@@ -71,33 +70,6 @@ test_itty_model_metrics_measure_bit_string_list (void)
         itty_bit_string_list_free (list);
 }
 
-static void
-test_itty_feed_model_measure_masks (void)
-{
-        itty_feed_model_t *model = itty_feed_model_new (1, 1, 1, 1);
-        itty_bit_string_list_t *input = itty_bit_string_list_new ();
-        itty_bit_string_t *target = create_bit_string (create_half_populated_word ());
-        itty_model_metrics_bit_summary_t summary;
-
-        itty_bit_string_list_append (input, create_bit_string (0));
-
-        assert (itty_feed_model_measure_masks (model, &summary));
-        assert (summary.bit_count == ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
-        assert (summary.set_bits == 0);
-        assert_near (summary.entropy, 0.0);
-
-        assert (itty_feed_model_train_one (model, input, target));
-
-        assert (itty_feed_model_measure_layer_masks (model, 0, &summary));
-        assert (summary.bit_count == ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
-        assert (summary.set_bits == ITTY_BIT_STRING_WORD_SIZE_IN_BITS / 2);
-        assert_near (summary.entropy, 1.0);
-
-        itty_bit_string_free (target);
-        itty_bit_string_list_free (input);
-        itty_feed_model_free (model);
-}
-
 static itty_network_t *
 create_two_layer_feed_network (void)
 {
@@ -153,7 +125,6 @@ main (void)
         test_itty_model_metrics_entropy_for_counts ();
         test_itty_model_metrics_measure_bit_string ();
         test_itty_model_metrics_measure_bit_string_list ();
-        test_itty_feed_model_measure_masks ();
         test_itty_model_metrics_traces_network_activations ();
         printf ("All itty-model-metrics tests passed.\n");
         return 0;

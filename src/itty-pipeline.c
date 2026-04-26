@@ -46,7 +46,7 @@ itty_pipeline_new (void)
 void
 itty_pipeline_free (itty_pipeline_t *pipeline)
 {
-        size_t i;
+        int i;
 
         for (i = 0; i < pipeline->elements_count; i++) {
                 free (pipeline->elements[i]);
@@ -85,7 +85,7 @@ itty_pipeline_add_operation (itty_pipeline_t *pipeline,
                              int              operation_id,
                              void            *data)
 {
-        size_t i;
+        int i;
         itty_pipeline_operation_t *operation;
         itty_pipeline_operation_t *pipeline_operation;
 
@@ -123,7 +123,7 @@ itty_pipeline_add_fence (itty_pipeline_t *pipeline)
 void
 itty_pipeline_process (itty_pipeline_t *pipeline)
 {
-        size_t i;
+        int i;
         itty_pipeline_operation_t *operation;
         itty_task_group_t *pending_work = itty_manager_create_task_group (pipeline->manager);
 

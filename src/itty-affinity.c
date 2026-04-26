@@ -107,7 +107,7 @@ bit_string_score_bit_length (itty_bit_string_t *bit_string)
         if (bit_length != 0)
                 return bit_length;
 
-        return itty_bit_string_get_bit_capacity (bit_string);
+        return itty_bit_string_get_length (bit_string);
 }
 
 static bool
