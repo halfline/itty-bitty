@@ -20,6 +20,7 @@ typedef struct {
 } itty_network_iterator_t;
 
 /* Takes ownership of modulation_masks on success. */
+itty_network_node_t *itty_network_adapter_node_new (itty_bit_string_t *modulation_mask);
 itty_network_node_t *itty_network_feed_node_new (itty_bit_string_list_t *modulation_masks);
 itty_network_node_t *itty_network_feed_node_new_with_rotation (itty_bit_string_list_t *modulation_masks,
                                                                size_t                  rotation);

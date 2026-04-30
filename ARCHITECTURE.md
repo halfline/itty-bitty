@@ -1,33 +1,30 @@
 # Itty Bitty Architecture
 
-Itty Bitty is a bit-native runtime for experimenting with binary model
-representations and bitwise execution. The current architecture is the small
-runtime in `src/` plus a narrow set of standalone experiments in
-`experiments/`.
+Itty Bitty is a bit-native runtime for binary model representations and
+bitwise execution. The architecture in this repository is the runtime in
+`src/` plus the standalone experiments in `experiments/`.
 
 ## Repository Shape
 
 The repository is split into three layers:
 
 - `src/`: current runtime, CLI, and default tests.
-- `experiments/`: active and archived experiments that are intentionally
-  outside the default runtime story.
-- `notes/`: long-form lab notes, dead ends, and historical design narratives.
+- `experiments/`: standalone experiments outside the runtime in `src/`.
 
-That boundary is deliberate. Experimental code can influence the architecture,
-but it should not become part of the runtime surface until it has been reduced
-to a small API and focused tests.
+Experimental code can influence the runtime, but the runtime surface in `src/`
+stays separate from the experiment code in `experiments/`.
 
 ## Runtime
 
-The keepable runtime is the bit-string execution core:
+The runtime is the bit-string execution core:
 
 - `itty-bit-string`: word-backed bit storage and bitwise primitives.
 - `itty-bit-string-list`: collections, transpose, condense, weighted condense,
   and vote allocation helpers.
 - `itty-bit-string-map`: mmap-backed storage for serialized bit strings.
 - `itty-vocabulary`: text/bit-string mapping and context encoding.
-- `itty-network`: feed nodes and affinity nodes over bit-string lists.
+- `itty-network`: feed nodes and similarity-matching nodes over bit-string
+  lists.
 - `itty-inference`: output selection and vocabulary decoding.
 - `itty-exec-buffer`: staged execution buffers for bitwise plans.
 - `itty-manager`, `itty-work-queue`, `itty-pipeline`: concurrency and task
@@ -35,7 +32,7 @@ The keepable runtime is the bit-string execution core:
 - `itty-position`: locality and Gray-code helpers.
 - `itty-model-metrics`: runtime-oriented density and activation metrics.
 
-These modules form the current runtime architecture.
+These modules form the runtime architecture.
 
 ## Topology
 
@@ -51,21 +48,32 @@ The runtime topology is a layered network over bit-string lists.
 The current runtime supports two node families:
 
 - feed nodes
-- affinity nodes
+- similarity-matching nodes
 
 This topology is list-to-list rather than scalar-to-scalar. A layer does not
 produce one number. It produces a new list of bit strings, and later layers
 operate on that list.
 
-The active experiments use a different topology. Instead of passing a list of
+The experiments use a different topology. Instead of passing a list of
 bit strings through a stack of layers, they keep a collection of stored memory
-entries and ask which entry should answer a probe. Here, a probe is the input
-bit string being used to look up the best matching stored entry.
+entries and score each entry against the input bit string. The winning entry is
+the one whose stored comparison bits match the input most strongly. After that
+selection step, the experiments check whether that same entry can decode its
+stored target cleanly and whether its committed quality state remains valid.
 
-The reason for that change is that the experiments are trying to answer a
-different question from the runtime. A layered network is good for studying how
-bit patterns transform as they move forward through nodes. The current
-experiments are focused on a different problem:
+This experiment topology is mainly about training questions, not about making
+inference itself more complicated. At inference time, the mechanics are simple:
+compare the input against the stored entries, choose the best match, and decode
+that entry's stored target. The harder questions are about training:
+
+- how to decide when to create a new stored entry
+- how to choose the stored comparison bits for that entry
+- how to choose the target and payload metadata for that entry
+- how to update one entry without damaging the entries that were already working
+
+The reason for that change is that the experiments are testing ownership,
+selection, decoding, and post-update rechecking directly. A layered network describes how bit
+patterns move forward through nodes. The experiments described here test:
 
 - can one example claim a stored memory entry?
 - can that claim stay stable when more examples are added?
@@ -73,52 +81,57 @@ experiments are focused on a different problem:
 - can later updates to one entry's stored bits or committed distance improve
   that entry without silently damaging the others?
 
-Those questions are easier to study when ownership is explicit. The experiments
-therefore make the memory entries explicit too. Instead of hiding ownership
-inside several transformation stages, they store a set of candidate entries and
-measure which one wins, how strong the margin is, and whether its stored decode
-state remains valid over time.
+These questions are easier to study when the memory entries are explicit. The
+experiments therefore store a set of candidate entries and measure which one
+wins, how far ahead it is from the next-best match, and whether its stored decode state remains
+valid over time.
 
-That collection is called a route table. The table is just a list of route
-entries. Each route entry stores the bits associated with one candidate owner.
-In the current experiments, a route entry stores:
+The experiment code calls that collection a route table. In plain terms, it is
+just a list of stored entries. Each stored entry holds the bits associated with
+one candidate owner. In these experiments, each stored entry holds:
 
-- a route key, which is the bit string used to compare the entry against a
-  probe
+- a stored comparison bit string, which is compared against the input bit string
+  when choosing an entry
 - a decoder target, which is the bit pattern that entry expects to recover
 - payload metadata such as payload bit count
 - commit state such as the best accepted distance for that entry
 
-When the document says "route", it means one of these stored entries. The
-topology question is not "which layer comes next?" It is "which stored entry
-should own this probe?"
+The current experiments populate these entries directly in code. The tests
+construct small bit strings explicitly and append them to the table one entry
+at a time.
 
-- a probe bit string addresses a route table
-- one route is selected by comparing the probe against each route key
-- the selected route evaluates its own stored decoder target
-- commit updates quality state for that selected route only
+In the entry-selection experiment, the stored comparison bits are supplied
+directly. In the combined experiment, each appended entry gets:
 
-That experimental topology is closer to an associative memory table than to a
+- comparison bits copied from a hand-constructed input pattern
+- a decoder target copied from a hand-constructed payload pattern
+- a payload bit count supplied explicitly
+- an initial committed distance left unset until a successful commit
+
+The topology question in these experiments is not "which layer comes next?" It
+is "which stored entry should own this input bit string?"
+
+- an input bit string addresses a route table
+- one stored entry is selected by comparing the input bit string against each stored
+  comparison bit string
+- the selected entry evaluates its own stored decoder target
+- commit updates quality state for that selected entry only
+
+This topology is closer to an associative memory table than to a
 stack of dense arithmetic layers.
 
-That does not mean the project is moving away from the runtime's layered
-architecture. The point of the experiments is to separate one hard part of the
-design, make it legible, and then bring the result back into the runtime in a
-smaller form.
-
-If the route-table experiments hold up, they would feed back into the main
-architecture as one or more runtime nodes or layers with explicit roles:
+The runtime remains layered. The experiments isolate ownership, decoding, and
+post-update checks so those rules can be stated directly and then reintroduced into the
+runtime as runtime nodes or layers with explicit roles:
 
 - a selection stage that chooses which stored memory entry should answer a
-  probe
+  given input bit string
 - a decode stage that reads that entry's stored target state
-- a replay or commit stage that checks whether updates preserve prior quality
+- a commit-check stage that checks whether updates preserve prior quality
 
-In other words, the experiments are flattening the problem on purpose. They
-pull ownership, decoding, and replay out of the full layer stack so each one
-can be tested directly. Once those rules are stable, they can be reintroduced
-as ordinary parts of a layered network instead of remaining a separate
-experimental world.
+The experiments pull ownership, decoding, and post-update checks out of the full layer
+stack so each one can be tested directly. The runtime can then express those
+same rules inside a layered network.
 
 ## Core Semantics
 
@@ -137,9 +150,13 @@ A zero-valued one-word bit string is a 64-bit container on a 64-bit machine.
 
 ### Feed Node
 
-A feed node applies modulation masks to its inputs, then condenses the result
-into a bit string by vote-like aggregation. It is the basic transformation node
-in the runtime network.
+A feed node is the basic transformation step in the runtime network.
+
+It works in two stages:
+
+- first it applies a set of bit masks to its input bit strings
+- then it combines the masked results into one output bit string by voting bit
+  position by bit position
 
 The feed node's trainable state is its list of modulation masks. Each mask is a
 bit string with the same length as the input width that node expects.
@@ -160,40 +177,46 @@ state. The trainable state of a feed node is still its list of modulation
 masks. Rotation is a fixed parameter attached to the node when the node is
 constructed.
 
-### Affinity Node
+### Similarity-Matching Node
 
-An affinity node is a bit-native content-addressing primitive. It scores probe
-bit strings against stored trait bit strings using popcount-style similarity,
-optionally biased by locality and Gray-position similarity, then condenses the
-selected imprints into an output.
+An affinity node is the runtime's similarity-matching node. It compares an
+input bit string against stored reference bit strings using popcount-style
+similarity, optionally biased by locality and Gray-position similarity, then
+combines the output patterns attached to the strongest matches.
 
-The affinity node's stored state is:
+Its stored state is:
 
-- traits: the matchable reference bit strings
-- imprints: the bit strings emitted or voted when a trait wins
-- probe options: score-length, locality, and Gray-position scoring parameters
+- reference bit strings, called `traits` in the code
+- output bit strings attached to those references, called `imprints` in the code
+- scoring options: score-length, locality, and Gray-position scoring parameters
 
-### Condense
+### Bitwise Voting
 
-To condense is to turn a list of bit strings into one bit string by voting per
-bit position.
+The code uses the word `condense` for turning a list of bit strings into one
+bit string by voting at each bit position.
 
 Current condense variants:
 
 - majority condense: set a bit if a strict majority of inputs set it.
-- weighted condense: assign each input a vote budget, then set a bit if the
-  weighted one-votes cross a strict majority of the total vote budget.
+- weighted condense: first assign each input bit string a vote count. Then,
+  for each bit position, inspect every bit string in the list. If a bit string
+  has a `1` at that position, that counts as a vote for setting the output bit
+  at that same position. In the weighted form, that vote is not just one yes:
+  it contributes the full vote count assigned to that input bit string. If a
+  bit string has a `0` at that position, it contributes nothing at that
+  position. The output bit is set when the total votes in favor of `1` cross a
+  strict majority of all vote counts combined.
 
-Both are threshold condense strategies. The difference is whether every input
+Both are threshold-based voting strategies. The difference is whether every input
 gets one vote or whether different inputs can contribute different vote
 weights.
 
-### Segment-Condense
+### Segment Voting Decoder
 
-Segment-condense is an experimental decoder family where the output is
-interpreted as groups of votes per target bit rather than as one strict
-all-bits-must-agree fold. It treats decoding as vote accumulation across
-segments.
+The code uses the name `segment-condense` for an experimental decoder family in
+which the output is interpreted as groups of votes per target bit rather than
+as one strict all-bits-must-agree fold. It treats decoding as vote accumulation
+across segments.
 
 ## Weights And Stored State
 
@@ -210,11 +233,14 @@ For feed nodes, the weights are modulation masks.
 - a feed node owns a list of masks
 - those masks gate or reshape its input before condense
 
-For affinity nodes, the weights are the stored traits and imprints plus the
-probe options used to score them.
+For similarity-matching nodes, the weights are the stored reference patterns
+and output patterns plus the
+scoring options used to score them.
 
-- traits determine which stored entry matches a probe
-- imprints determine what content that match contributes to the output
+- the reference patterns, called `traits` in the code, determine which stored
+  entry matches an input bit string
+- the output patterns, called `imprints` in the code, determine what content
+  that match contributes to the output
 - options determine how content, locality, and Gray position contribute to the
   score
 
@@ -222,102 +248,134 @@ probe options used to score them.
 
 In the experiments, the main stored state is:
 
-- route keys in the route-key selector
+- stored comparison bit strings in the entry-selection experiment
 - payload targets in the self-describing Gray payload experiment
-- route keys, payload targets, payload bit counts, and committed distances in
-  the combined route-key plus Gray payload experiment
+- stored comparison bit strings, payload targets, payload bit counts, and
+  committed distances in the combined ownership-plus-Gray-payload experiment
 
-These are still weights in the broad sense: they are the persistent bit
+These are weights in the broad sense: they are the persistent bit
 patterns and thresholds that define what the system recognizes and emits.
 
 ### Where Weights Come From
 
 The runtime can load model state from files and execute it through the CLI.
-The experiments build their stored state directly inside focused tests.
+The experiments build their stored state directly inside tests.
 
-At the current stage:
+At present:
 
 - runtime execution assumes the node state already exists
-- experiment tests construct route keys, payloads, and targets explicitly
-- commit records quality state for the selected route after measurement
+- experiment tests construct comparison bit strings, payloads, and targets
+  explicitly
+- commit records quality state for the selected entry after measurement
 
-There is not yet one general-purpose trainer that derives all of these weights
+More concretely, the current tests populate the stored-entry table by calling
+the append functions directly. There is no training procedure yet that:
+
+- decides when to create a new stored entry
+- derives the comparison bits from data
+- derives the decoder target from data
+- fills the payload metadata automatically
+
+There is no general-purpose trainer yet that derives all of these weights
 automatically from arbitrary datasets. The experiments are isolating the
 subproblems that such a trainer would need to solve.
 
-## Ownership And Decoding
+## Selection And Decoding
 
 ### Ownership
 
-Ownership means that a given example is expected to map to a particular route,
+Ownership means that a given example is expected to map to a particular stored
+entry,
 and that later updates should preserve that mapping unless the design
 explicitly reallocates it. The important property is stability: new examples
-should not silently steal an existing owner's route.
+should not silently steal an existing owner's stored entry.
 
-Each route stores a route key, which is the bit string used for addressing.
-The route key gives the experiment a separate addressing layer:
+Each stored entry carries comparison bits, which are the bit string used for
+addressing. Those comparison bits give the experiment a separate addressing
+layer:
 
-- route key: who should own this input?
-- decoder state: how should that route reconstruct its target?
+- comparison bits: which stored entry should own this input?
+- decoder state: how should that stored entry reconstruct its target?
 
-### Route Gap
+### Score Difference
 
-The route gap is the margin between the selected route's similarity score and
-the runner-up score. A positive route gap means the route decision is not tied.
-Larger gaps indicate stronger ownership separation.
+The code uses the name `route gap` for the difference between the selected
+entry's similarity score and the runner-up score. A positive difference means
+the decision is not tied. Larger differences indicate stronger ownership
+separation.
 
-### Route Table
+### Stored Entry Table
 
-A route table is the structure that stores one entry per route. In the combined
+A route table is the structure that stores one entry per candidate owner. In the combined
 prototype that metadata currently includes:
 
-- route key
+- comparison bit string
 - target bit pattern
 - payload bit count
 - committed distance
 
-The route table is the current experimental topology for memory-like ownership.
-One probe selects one route, and only that route's decoder target is measured.
+This table is the experimental topology for memory-like ownership.
+One input bit string selects one entry, and only that entry's decoder target is
+measured.
 
-### Replay
+### Post-Update Checks
 
-Replay means reapplying training or repair to examples that were already
-claimed, in order to verify that newly added work does not regress them.
+Post-update checks mean re-measuring entries that were already claimed after a
+new update has been applied elsewhere, in order to verify that the new update
+did not damage them.
 
-The architectural point is that replay is how ownership stability is checked
-over time.
+The architectural point is that these checks are how ownership stability is
+measured over time.
 
-### Replay Safety
+### Update Safety
 
-Replay safety means a candidate update does not push already-claimed owners
-below their allowed baseline.
+Update safety means a candidate update does not make an already-claimed entry
+perform worse than the best accepted result that has already been recorded for
+that entry.
 
 ### Committed Baseline
 
-A committed baseline is the current minimum quality floor that a route owner is
-allowed to fall below during replay. In practice this is a stored objective
-state such as distance that replay must respect for that route.
+A committed baseline is the best accepted result that has already been recorded
+for a stored entry. In the current experiments, that is the committed distance
+stored for that entry after a successful commit. Later checks compare new
+measurements against that stored distance.
 
-The committed baseline is important because it turns replay from "try things and
-hope old owners survive" into a concrete acceptance rule.
+The committed baseline is important because it turns later verification from
+"try things and hope old owners survive" into a concrete acceptance rule.
 
 ### Decoder
 
-In this project, a decoder is the mechanism that interprets the selected route's
-activation bits as a target bit string. A route may have stable ownership but
+In this project, a decoder is the mechanism that interprets the selected
+entry's activation bits as a target bit string. An entry may have stable
+ownership but
 still fail because its decoder cannot recover the target cleanly.
+
+When this document talks about decoder distance, it means the number of bit
+positions where the produced bits differ from the expected target bits. A
+distance of `0` means an exact match. Larger distances mean more bit
+mismatches.
 
 ### Gray Code
 
 Gray code is a binary encoding where adjacent integer values differ by one bit.
 The runtime already exposes Gray helpers in `itty-position`.
 
-### Gray Offset
+### Gray-Coded Start Position
 
-The Gray offset is the Gray-coded payload start stored in the self-describing
+The code uses the phrase `Gray offset` for the Gray-coded payload start stored in the self-describing
 header. Conceptually:
 
-- payload bits live in a window inside a larger activation.
+- the activation is larger than the target because the network widens the bit
+  width as data moves forward through layers. In the current runtime, feed
+  nodes double their output width, so later activations have more bit positions
+  available than the payload target itself.
+- that extra space then makes it possible to store more than just one payload:
+  it leaves room for a fixed header region, for a payload window at a chosen
+  start position, and for other non-overlapping payload regions elsewhere in
+  the same activation.
+- the target only describes the payload bits that the decoder is supposed to
+  recover.
+- the payload bits therefore live in a window inside that larger activation.
 - the start of that window is encoded as a Gray-coded offset in activation bits
   `0..7`.
 - the decoder reads that fixed header, decodes `payload_start`, and then reads
@@ -326,12 +384,18 @@ header. Conceptually:
 This makes the decoder care both about content and about where that content was
 placed inside the activation.
 
+In the current training direction, that start position is hidden state rather
+than a supervised target. The decoder uses it to find the payload window. The
+trainer does not try to force one specific start position. It only requires the
+header to decode to some valid position and then compares the extracted payload
+against the expected payload.
+
 The `0..7` header range is a storage layout choice, not a voting threshold.
 The current self-describing Gray payload experiments read all 8 header bits,
 decode them as one Gray-coded start position, and then measure exact payload
-bit mismatches. They do not use a rule like "5 of 8 header bits must agree".
+bit mismatches.
 
-### Payload Start
+### Payload Start Position
 
 The payload start is the bit offset inside an activation where the payload
 window begins.
@@ -353,51 +417,43 @@ must preserve:
 - a valid decoded `payload_start`
 - payload bits at the location the header names
 
-### Bundle
+### Bundled Updates
 
 A bundle is an experimental batch of related mask flips or bit changes that are
 applied together because they represent one coherent repair idea.
 
-### Threshold-Crossing Bundle
+### Threshold-Crossing Bundled Updates
 
-A threshold-crossing bundle is a bundle chosen to move vote counts across a
+A threshold-crossing bundled update is a bundle chosen to move vote counts across a
 decoder threshold, typically to convert a target-zero or target-one bit from
 "almost correct" to "correct".
 
-This terminology belongs to the archived feed-model lab and to thresholded vote
-decoders such as condense and segment-condense. The promoted self-describing
-Gray payload experiments are not currently driven by that kind of threshold
-bundle logic. They mainly measure:
+Threshold-crossing bundled updates belong to thresholded vote decoders such as
+bitwise voting and segment voting. The self-describing Gray payload experiments are not
+currently driven by that kind of bundle logic. They mainly measure:
 
-- whether the route selection margin stays positive
+- whether the selected entry stays ahead of the runner-up
 - whether the fixed Gray header decodes a valid payload start
 - how many payload bits disagree with the target
 
 ## Current Experiments
 
-### Feed-Model Lab Archive
+### Entry Selection
 
-`experiments/feed-model-lab/` is an archived experimental tree that is kept out
-of the default runtime surface.
-
-It is built only behind `-Dexperimental_feed_model=true`.
-
-### Route-Key Selector
-
-`experiments/route-key-selector/` is the smallest prototype of explicit
+The entry-selection experiment is the smallest prototype of explicit
 associative ownership. It proves:
 
-- routes can be keyed directly,
-- probes can select the intended owner route,
-- positive route gaps can survive as routes are added,
+- stored entries can be selected directly from stored comparison bits,
+- input bit strings can select the intended owner entry,
+- positive score differences can survive as entries are added,
 - ownership can remain stable across an A/B/C/D growth pattern.
 
-The route-key selector test is intentionally narrow. It is testing only
+This entry-selection test is intentionally narrow. It is testing only
 addressing behavior:
 
-- whether the selected route is the expected owner
+- whether the selected entry is the expected owner
 - whether the selected score beats the runner-up score
-- whether the selected gap stays positive as the table grows
+- whether the score difference stays positive as the table grows
 
 It is not testing payload decoding, decoder repair, or commit policy.
 
@@ -419,68 +475,79 @@ Its current tests check:
 - payload corruption raises distance without corrupting the decoded start
 - header corruption is detected as an invalid header
 
-This is a self-describing decoder experiment. It does not decide route
+The important point is that these tests are checking whether the payload can be
+recovered from whatever valid start position the activation encodes. They are
+not treating the start position itself as a label that must match a separately
+supervised target.
+
+This is a self-describing decoder experiment. It does not decide which stored
+entry should own an input. It does not decide
 ownership. It assumes the caller already knows which target it should compare
 against.
 
-### Route-Key + Gray Payload
+### Ownership + Gray Payload
 
-`experiments/route-key-gray-payload/` is the combined direction:
+The combined ownership-plus-Gray-payload experiment is the current integrated
+direction:
 
-- route key selection provides ownership,
-- the selected route reads `payload_start` from the activation header,
-- self-describing Gray payload scoring measures decoder distance for that route,
-- commit updates the selected route's committed floor without changing route
+- comparison-bit matching provides ownership,
+- the selected entry reads `payload_start` from the activation header,
+- self-describing Gray payload scoring measures decoder distance for that entry,
+- commit updates the selected entry's committed floor without changing
   ownership.
 
 This experiment is testing the interaction between three concerns:
 
-- route selection
-- per-route decoding
-- per-route commit state
+- stored-entry selection
+- per-entry decoding
+- per-entry commit state
 
 Its current tests check:
 
-- A/B/C/D still select the intended routes as the table grows
-- the selected route keeps a positive route gap
-- the selected route can decode a valid `payload_start` from the fixed header
+- A/B/C/D still select the intended stored entries as the table grows
+- the selected entry stays ahead of the runner-up
+- the selected entry can decode a valid `payload_start` from the fixed header
 - the measured distance is zero for the clean A/B/C/D examples
-- commit records a distance floor for the selected route
+- commit records a distance floor for the selected entry
 - later damage raises measured distance while preserving the previously
   committed floor
 
-This is the smallest current prototype that exercises ownership and decoding in
-one path.
+Here too, the decoded start position is treated as internal state. The training
+question is whether the selected activation yields a valid extraction and the
+right payload bits, not whether it uses one predetermined position.
 
-This is the current decomposition of the promoted ideas:
+This prototype exercises ownership and decoding in one path.
 
-- route key: ownership and addressing
-- self-describing Gray payload: decoding and alignment within the selected route
-- replay: preservation of committed owners over time
+The experiments decompose into:
+
+- comparison bits: ownership and addressing
+- self-describing Gray payload: decoding and alignment within the selected entry
+- post-update checks: preservation of committed owners over time
 
 ## Current Decomposition
 
-The current promoted path separates routing and decoding:
+The experiments separate routing and decoding:
 
-- route key determines ownership,
-- route table stores one route entry at a time,
-- decoder quality is measured within the owned route,
-- replay checks whether committed owners remain stable.
+- comparison-bit matching determines ownership,
+- the stored-entry table stores one entry per candidate owner,
+- decoder quality is measured within the owned entry,
+- post-update checks determine whether committed owners remain stable.
 
 ## What The Experiments Are Testing
 
 The experiments are decomposing training into smaller questions.
 
-### Route-Key Question
+### Ownership Question
 
 Can the system allocate stable owners in bit space?
 
-The route-key selector answers that by measuring whether a probe continues to
-select the same route with a positive gap as other routes are added.
+The entry-selection experiment answers that by measuring whether the same
+input bit string continues to select the same stored entry with a positive
+score difference as other entries are added.
 
 ### Decoder Question
 
-Can one route represent both payload content and payload location in a way that
+Can one stored entry represent both payload content and payload location in a way that
 can be decoded directly from the activation?
 
 The self-describing Gray payload experiment answers that by fixing the header
@@ -488,54 +555,62 @@ position and checking whether the decoded start and payload content agree.
 
 ### Combined Question
 
-Can stable ownership and per-route decoding coexist without conflating the
+Can stable ownership and per-entry decoding coexist without conflating the
 two problems?
 
-The combined experiment answers that by selecting one route with the route key,
-measuring only that route's self-describing payload distance, and tracking a
-committed distance floor per route.
+The combined experiment answers that by selecting one stored entry with its
+stored comparison bits, measuring only that entry's self-describing payload
+distance, and tracking a committed distance floor per entry.
+
+That means the training objective is payload recovery, plus the requirement
+that the chosen start position be valid. The chosen position itself is not a
+supervised output.
 
 ## Toward A General-Purpose Trainer
 
-The codebase now has an execution runtime and three focused experimental
-components. A general-purpose trainer would need to connect those pieces into a
+The codebase has an execution runtime and three experimental components. A
+general-purpose trainer would need to connect those pieces into a
 full learning loop.
 
 ### What Exists Now
 
 - a layered bit-string runtime
-- feed and affinity execution nodes
-- route-key ownership selection
+- feed and similarity-matching execution nodes
+- comparison-based ownership selection
 - a self-describing payload encoding
-- per-route measurement and commit bookkeeping
+- per-entry measurement and commit bookkeeping
 
 ### What Is Still Missing
 
 #### Topology Growth
 
-The project still needs a policy for when to allocate a new route, when to
-reuse an existing one, and how route tables connect to larger network
+The project needs a policy for when to allocate a new stored entry, when to
+reuse an existing one, and how stored-entry tables connect to larger network
 topologies.
 
 #### Weight Update Rules
 
-The project still needs update rules that can derive useful modulation masks,
-traits, imprints, route keys, and payload activations from examples rather than
+The project needs update rules that can derive useful modulation masks,
+reference patterns, output patterns, comparison bit strings, and payload activations from examples rather than
 from hand-constructed tests.
 
 #### Decoder Writing
 
 The self-describing payload experiment can measure a payload and decode its
-start, but a general trainer still needs a write rule that decides:
+start, but a general trainer needs a write rule that decides:
 
 - where payload bits should be placed in the activation
 - how the header should be set
 - how that write should be repaired when the distance is non-zero
 
-#### Replay Policy
+That write rule does not need to aim for one fixed position. It only needs to
+produce an activation whose header points to a valid payload window and whose
+extracted payload matches the training target.
 
-The combined prototype tracks committed distance per route. A general trainer
-still needs a replay scheduler that decides:
+#### Post-Update Check Policy
+
+The combined prototype tracks committed distance per stored entry. A general trainer
+needs a scheduler for re-checking committed entries that decides:
 
 - which previously claimed owners must be revisited
 - which candidate updates are allowed
@@ -544,51 +619,46 @@ still needs a replay scheduler that decides:
 
 #### Multi-Layer Credit Assignment
 
-The runtime supports layered execution, but the experiments do not yet define a
+The runtime supports layered execution, but the experiments do not define a
 general way to assign credit across several trainable stages. A complete
 trainer needs a bit-native update path that can move useful information through
 more than one ownership or decoder layer.
 
 #### Dataset And Objective Surface
 
-The current experiments are small, explicit test scenarios. A general trainer
-still needs:
+The experiments are small, explicit test scenarios. A general trainer needs:
 
 - a dataset loop
 - train/validation splits
 - stable objective reporting
 - stopping criteria
-- regression suites for ownership, decoding, and replay behavior
+- regression suites for ownership, decoding, and post-update behavior
 
 #### Model Serialization
 
-The runtime can execute model state from files, but the promoted experiments do
-not yet define one unified on-disk format for route tables, decoder state,
-replay state, and layer topology.
+The runtime can execute model state from files, but the experiments do
+not define one unified on-disk format for stored-entry tables, decoder state,
+commit-check state, and layer topology.
 
 ### Practical Next Step
 
 The most direct path from the current code to a broader trainer is:
 
-1. define a trainable route-table format with explicit per-route state
+1. define a trainable stored-entry-table format with explicit per-entry state
 2. define one write-and-repair rule for self-describing payload activations
-3. define one replay scheduler with commit acceptance rules
+3. define one re-check scheduler with commit acceptance rules
 4. connect that loop to a small benchmark dataset
-5. expand from one route table to a multi-layer training topology only after
-   the single-table trainer is stable
+5. expand from one stored-entry table to a multi-layer training topology only
+   after the single-table trainer is stable
 
 ## Build Surface
 
-Meson exposes two experiment toggles:
+Meson exposes one experiment toggle:
 
-- `experimental_feed_model=false`: build the archived feed-model lab only when
-  explicitly requested.
-- `experimental_prototypes=true`: build the small standalone route-key,
-  Gray-payload, and combined prototypes.
-
-The default runtime should remain usable even if the feed-model archive is
-ignored entirely.
+- `experimental_prototypes=true`: build the small standalone
+  entry-selection, self-describing-Gray-payload, and combined prototypes.
 
 ## Notes
 
-Long-form experiment notes live under `notes/`.
+The architecture described here lives in this document and in the code under
+`src/` and `experiments/`.

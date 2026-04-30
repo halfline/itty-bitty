@@ -2,20 +2,14 @@ project ('itty-bitty', 'c', default_options : ['c_std=c11'])
 add_project_arguments('-D_GNU_SOURCE', language: 'c')
 cc = meson.get_compiler('c')
 math_dep = cc.find_library('m', required: false)
-experimental_feed_model = get_option('experimental_feed_model')
 experimental_prototypes = get_option('experimental_prototypes')
 runtime_include_dirs = include_directories('src')
-feed_model_include_dirs = include_directories('experiments/feed-model-lab/src')
 prototype_include_dirs = include_directories(
         'experiments/route-key-selector',
         'experiments/route-key-gray-payload',
         'experiments/self-describing-gray-payload',
 )
 project_include_dirs = [runtime_include_dirs]
-
-if experimental_feed_model
-    project_include_dirs += [feed_model_include_dirs]
-endif
 
 if experimental_prototypes
     project_include_dirs += [prototype_include_dirs]
@@ -26,6 +20,7 @@ library_sources = [
         'src/itty-bit-string.c',
         'src/itty-bit-string-list.c',
         'src/itty-bit-string-map.c',
+        'src/itty-decoder.c',
         'src/itty-exec-buffer.c',
         'src/itty-inference.c',
         'src/itty-manager.c',
@@ -33,16 +28,10 @@ library_sources = [
         'src/itty-network.c',
         'src/itty-pipeline.c',
         'src/itty-position.c',
+        'src/itty-trainer.c',
         'src/itty-vocabulary.c',
         'src/itty-work-queue.c',
 ]
-
-if experimental_feed_model
-    library_sources += [
-        'experiments/feed-model-lab/src/itty-feed-model.c',
-        'experiments/feed-model-lab/src/itty-training-observation.c',
-    ]
-endif
 
 if experimental_prototypes
     library_sources += [
@@ -58,7 +47,20 @@ libittybitty = library('ittybitty',
                        dependencies: math_dep)
 
 executable ('itty-bitty',
-            sources: 'src/main.c',
+            sources: 'src/decoder/main.c',
+            include_directories: project_include_dirs,
+            link_with: libittybitty,
+            install: true)
+
+executable ('itty-bitty-trainer',
+            sources: 'src/trainer/main.c',
+            include_directories: project_include_dirs,
+            link_with: libittybitty,
+            install: true)
+
+executable ('itty-bitty-harness',
+            sources: 'src/harness/main.c',
+            include_directories: project_include_dirs,
             link_with: libittybitty,
             install: true)
 
@@ -67,6 +69,7 @@ test_sources = [
         'src/tests/test-itty-bit-string.c',
         'src/tests/test-itty-bit-string-list.c',
         'src/tests/test-itty-bit-string-map.c',
+        'src/tests/test-itty-decoder.c',
         'src/tests/test-itty-exec-buffer.c',
         'src/tests/test-itty-inference.c',
         'src/tests/test-itty-manager.c',
@@ -77,14 +80,6 @@ test_sources = [
         'src/tests/test-itty-vocabulary.c',
         'src/tests/test-itty-work-queue.c'
 ]
-
-if experimental_feed_model
-    test_sources += [
-        'experiments/feed-model-lab/tests/test-itty-feed-model-metrics.c',
-        'experiments/feed-model-lab/tests/test-itty-feed-model.c',
-        'experiments/feed-model-lab/tests/test-itty-training-observation.c',
-    ]
-endif
 
 if experimental_prototypes
     test_sources += [
@@ -100,6 +95,6 @@ foreach test_source : test_sources
                                  sources: [test_source],
                                  include_directories: project_include_dirs,
                                  link_with: libittybitty)
-    test_timeout = test_name == 'test-itty-training-observation' or test_name == 'test-itty-feed-model' ? 120 : 30
+    test_timeout = 30
     test(test_name + '-test', test_executable, timeout: test_timeout)
 endforeach

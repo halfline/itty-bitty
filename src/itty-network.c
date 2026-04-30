@@ -3,6 +3,7 @@
 #include "itty-bit-string.h"
 #include "itty-bit-string-list-private.h"
 #include "itty-bit-string-private.h"
+#include "itty-decoder.h"
 #include "itty-exec-buffer.h"
 #include "itty-manager.h"
 
@@ -16,11 +17,13 @@
 
 #define ITTY_NETWORK_BUFFER_INPUT "network input"
 #define ITTY_NETWORK_BUFFER_MASK "network mask"
+#define ITTY_NETWORK_BUFFER_VOTES "network votes"
 #define ITTY_NETWORK_BUFFER_MODULATED_INPUT "network modulated input"
 #define ITTY_NETWORK_BUFFER_CONDENSED_OUTPUT "network condensed output"
 #define ITTY_NETWORK_BUFFER_LAYER_OUTPUT "network layer output"
 
 typedef enum {
+        ITTY_NETWORK_NODE_ADAPTER,
         ITTY_NETWORK_NODE_FEED,
         ITTY_NETWORK_NODE_AFFINITY
 } itty_network_node_kind_t;
@@ -28,6 +31,9 @@ typedef enum {
 struct itty_network_node_t {
         itty_network_node_kind_t kind;
         union {
+                struct {
+                        itty_bit_string_t *modulation_mask;
+                } adapter;
                 struct {
                         itty_bit_string_list_t *modulation_masks;
                         size_t                  rotation;
@@ -55,6 +61,8 @@ typedef struct {
         itty_exec_buffer_t       *exec_buffer;
         itty_bit_string_list_t   *layer_outputs;
         itty_exec_buffer_slice_t **modulated_slices_by_node;
+        itty_exec_buffer_slice_t *vote_slices_by_node;
+        size_t                  **votes_by_node;
         size_t                   *modulated_counts;
         size_t                   *max_modulated_words_by_node;
         itty_exec_buffer_slice_t *condensed_slices;
@@ -65,6 +73,15 @@ typedef enum {
         ITTY_NETWORK_LAYER_RUNNER_FEED_PLAN,
         ITTY_NETWORK_LAYER_RUNNER_MIXED
 } itty_network_layer_runner_kind_t;
+
+itty_network_node_t *
+itty_network_adapter_node_new (itty_bit_string_t *modulation_mask)
+{
+        itty_network_node_t *node = malloc (sizeof (itty_network_node_t));
+        node->kind = ITTY_NETWORK_NODE_ADAPTER;
+        node->adapter.modulation_mask = modulation_mask;
+        return node;
+}
 
 itty_network_node_t *
 itty_network_feed_node_new (itty_bit_string_list_t *modulation_masks)
@@ -107,6 +124,9 @@ itty_network_node_free (itty_network_node_t *node)
         if (!node)
                 return;
         switch (node->kind) {
+        case ITTY_NETWORK_NODE_ADAPTER:
+                itty_bit_string_free (node->adapter.modulation_mask);
+                break;
         case ITTY_NETWORK_NODE_FEED:
                 itty_bit_string_list_free (node->feed.modulation_masks);
                 break;
@@ -205,12 +225,39 @@ itty_bit_string_list_append_steal_all (itty_bit_string_list_t *destination,
 }
 
 static itty_bit_string_t *
+itty_network_adapter_node_run (itty_network_node_t *node,
+                               itty_bit_string_t   *input_bit_string)
+{
+        if (!input_bit_string)
+                return itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+
+        return itty_bit_string_exclusive_or (input_bit_string, node->adapter.modulation_mask);
+}
+
+static itty_bit_string_t *
 itty_network_feed_node_run (itty_network_node_t      *node,
                             itty_bit_string_list_t  *current_input)
 {
         itty_bit_string_list_t *modulated_inputs = itty_bit_string_list_exclusive_or (current_input,
                                                                                       node->feed.modulation_masks);
-        itty_bit_string_t *condensed_output = itty_bit_string_list_condense (modulated_inputs);
+        size_t input_count = itty_bit_string_list_get_length (modulated_inputs);
+        size_t *votes = calloc (input_count, sizeof (size_t));
+        itty_bit_string_t *condensed_output;
+
+        if (!votes) {
+                itty_bit_string_list_free (modulated_inputs);
+                return NULL;
+        }
+
+        for (size_t input_index = 0; input_index < input_count; input_index++) {
+                itty_bit_string_t *input_bit_string = itty_bit_string_list_fetch (current_input, input_index);
+                votes[input_index] = itty_decoder_get_score_vote_count (input_bit_string);
+        }
+
+        condensed_output = itty_bit_string_list_weighted_condense (modulated_inputs,
+                                                                   votes,
+                                                                   input_count);
+        free (votes);
         itty_bit_string_list_free (modulated_inputs);
 
         if (!condensed_output)
@@ -235,7 +282,16 @@ itty_network_layer_run (itty_network_layer_t   *layer,
         itty_network_node_t *node;
 
         while (itty_network_layer_iterator_next (&layer_iterator, &node)) {
-                if (node->kind == ITTY_NETWORK_NODE_FEED) {
+                if (node->kind == ITTY_NETWORK_NODE_ADAPTER) {
+                        itty_bit_string_t *input_bit_string = itty_bit_string_list_fetch (current_input,
+                                                                                           layer_iterator.current_index - 1);
+                        itty_bit_string_t *output = itty_network_adapter_node_run (node, input_bit_string);
+                        if (!output) {
+                                itty_bit_string_list_free (layer_outputs);
+                                return NULL;
+                        }
+                        itty_bit_string_list_append (layer_outputs, output);
+                } else if (node->kind == ITTY_NETWORK_NODE_FEED) {
                         itty_bit_string_t *doubled_output = itty_network_feed_node_run (node, current_input);
                         if (!doubled_output) {
                                 itty_bit_string_list_free (layer_outputs);
@@ -296,6 +352,12 @@ itty_network_feed_layer_plan_free (itty_network_feed_layer_plan_t *plan,
                 itty_bit_string_list_free (plan->layer_outputs);
 
         itty_exec_buffer_free (plan->exec_buffer);
+        free (plan->vote_slices_by_node);
+        if (plan->votes_by_node) {
+                for (size_t node_index = 0; node_index < plan->number_of_nodes; node_index++)
+                        free (plan->votes_by_node[node_index]);
+        }
+        free (plan->votes_by_node);
         if (plan->modulated_slices_by_node) {
                 for (size_t node_index = 0; node_index < plan->number_of_nodes; node_index++)
                         free (plan->modulated_slices_by_node[node_index]);
@@ -322,15 +384,21 @@ build_feed_layer_modulation_stage (itty_network_feed_layer_plan_t *plan,
                 size_t mask_count = itty_bit_string_list_get_length (node->feed.modulation_masks);
                 size_t modulated_count = input_count < mask_count ? input_count : mask_count;
                 itty_exec_buffer_slice_t *modulated_slices = NULL;
+                size_t *votes = NULL;
                 size_t max_modulated_words = 0;
 
                 if (modulated_count > 0) {
                         modulated_slices = calloc (modulated_count, sizeof (itty_exec_buffer_slice_t));
-                        if (!modulated_slices)
+                        votes = calloc (modulated_count, sizeof (size_t));
+                        if (!modulated_slices || !votes) {
+                                free (modulated_slices);
+                                free (votes);
                                 return false;
+                        }
                 }
 
                 plan->modulated_slices_by_node[node_index] = modulated_slices;
+                plan->votes_by_node[node_index] = votes;
                 plan->modulated_counts[node_index] = modulated_count;
 
                 for (size_t i = 0; i < modulated_count; i++) {
@@ -367,8 +435,24 @@ build_feed_layer_modulation_stage (itty_network_feed_layer_plan_t *plan,
                                                        itty_exec_buffer_get_word_slice (input_buffer, 0, input_words),
                                                        itty_exec_buffer_get_word_slice (mask_buffer, 0, mask_words)))
                                 return false;
+
+                        votes[i] = itty_decoder_get_score_vote_count (input_bit_string);
                 }
                 plan->max_modulated_words_by_node[node_index] = max_modulated_words;
+
+                if (modulated_count > 0) {
+                        itty_exec_buffer_id_t votes_buffer = itty_exec_buffer_register_words (plan->exec_buffer,
+                                                                                              votes,
+                                                                                              modulated_count,
+                                                                                              ITTY_EXEC_BUFFER_ACCESS_READ_ONLY,
+                                                                                              ITTY_NETWORK_BUFFER_VOTES);
+                        if (votes_buffer == ITTY_EXEC_BUFFER_INVALID_ID)
+                                return false;
+
+                        plan->vote_slices_by_node[node_index] = itty_exec_buffer_get_word_slice (votes_buffer,
+                                                                                                  0,
+                                                                                                  modulated_count);
+                }
         }
 
         return true;
@@ -391,10 +475,11 @@ build_feed_layer_condense_stage (itty_network_feed_layer_plan_t *plan)
                 plan->condensed_slices[node_index] = itty_exec_buffer_get_word_slice (condensed_buffer,
                                                                                       0,
                                                                                       plan->max_modulated_words_by_node[node_index]);
-                if (!itty_exec_buffer_add_condense (plan->exec_buffer,
-                                                    plan->condensed_slices[node_index],
-                                                    plan->modulated_slices_by_node[node_index],
-                                                    plan->modulated_counts[node_index]))
+                if (!itty_exec_buffer_add_weighted_condense (plan->exec_buffer,
+                                                             plan->condensed_slices[node_index],
+                                                             plan->modulated_slices_by_node[node_index],
+                                                             plan->vote_slices_by_node[node_index],
+                                                             plan->modulated_counts[node_index]))
                         return false;
         }
 
@@ -448,6 +533,8 @@ itty_network_feed_layer_plan_new (itty_network_layer_t   *layer,
 
         if (plan->number_of_nodes > 0) {
                 plan->modulated_slices_by_node = calloc (plan->number_of_nodes, sizeof (itty_exec_buffer_slice_t *));
+                plan->vote_slices_by_node = calloc (plan->number_of_nodes, sizeof (itty_exec_buffer_slice_t));
+                plan->votes_by_node = calloc (plan->number_of_nodes, sizeof (size_t *));
                 plan->modulated_counts = calloc (plan->number_of_nodes, sizeof (size_t));
                 plan->max_modulated_words_by_node = calloc (plan->number_of_nodes, sizeof (size_t));
                 plan->condensed_slices = calloc (plan->number_of_nodes, sizeof (itty_exec_buffer_slice_t));
@@ -456,6 +543,8 @@ itty_network_feed_layer_plan_new (itty_network_layer_t   *layer,
         if (!plan->layer_outputs || !plan->exec_buffer ||
             (plan->number_of_nodes > 0 &&
              (!plan->modulated_slices_by_node ||
+              !plan->vote_slices_by_node ||
+              !plan->votes_by_node ||
               !plan->modulated_counts ||
               !plan->max_modulated_words_by_node ||
               !plan->condensed_slices)) ||
@@ -494,7 +583,15 @@ itty_network_layer_run_mixed_with_manager (itty_network_layer_t   *layer,
         for (size_t node_index = 0; node_index < layer->number_of_nodes; node_index++) {
                 itty_network_node_t *node = layer->nodes[node_index];
 
-                if (node->kind == ITTY_NETWORK_NODE_FEED) {
+                if (node->kind == ITTY_NETWORK_NODE_ADAPTER) {
+                        itty_bit_string_t *input_bit_string = itty_bit_string_list_fetch (current_input, node_index);
+                        itty_bit_string_t *output = itty_network_adapter_node_run (node, input_bit_string);
+                        if (!output) {
+                                itty_bit_string_list_free (layer_outputs);
+                                return NULL;
+                        }
+                        itty_bit_string_list_append (layer_outputs, output);
+                } else if (node->kind == ITTY_NETWORK_NODE_FEED) {
                         itty_bit_string_t *output = itty_network_feed_node_run (node, current_input);
                         if (!output) {
                                 itty_bit_string_list_free (layer_outputs);
@@ -607,6 +704,13 @@ append_mixed_network_layer_plan_presentation (char                    **presenta
 
         for (size_t node_index = 0; node_index < layer->number_of_nodes; node_index++) {
                 itty_network_node_t *node = layer->nodes[node_index];
+
+                if (node->kind == ITTY_NETWORK_NODE_ADAPTER) {
+                        snprintf (header, sizeof (header), "network adapter node %zu\n", node_index);
+                        if (!append_to_network_plan_presentation (presentation, presentation_length, header))
+                                return false;
+                        continue;
+                }
 
                 if (node->kind == ITTY_NETWORK_NODE_FEED) {
                         snprintf (header, sizeof (header), "network feed node %zu\n", node_index);

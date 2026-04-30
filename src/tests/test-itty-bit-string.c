@@ -45,6 +45,31 @@ test_itty_bit_string_append_zeros (void)
 }
 
 void
+test_itty_bit_string_set_prefix_run (void)
+{
+        itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        char *representation;
+
+        itty_bit_string_append_word (bit_string, 0);
+        itty_bit_string_set_prefix_run (bit_string, 8, 8, 5);
+        representation = itty_bit_string_present (bit_string, ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL);
+        assert (strcmp (representation, "0000000000001f00") == 0);
+        free (representation);
+
+        itty_bit_string_set_prefix_run (bit_string, 8, 8, 2);
+        representation = itty_bit_string_present (bit_string, ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL);
+        assert (strcmp (representation, "0000000000000300") == 0);
+        free (representation);
+
+        itty_bit_string_set_prefix_run (bit_string, 8, 8, 99);
+        representation = itty_bit_string_present (bit_string, ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL);
+        assert (strcmp (representation, "000000000000ff00") == 0);
+        free (representation);
+
+        itty_bit_string_free (bit_string);
+}
+
+void
 test_itty_bit_string_exclusive_nor (void)
 {
         itty_bit_string_t *a = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
@@ -310,6 +335,7 @@ main (void)
         test_itty_bit_string_new ();
         test_itty_bit_string_append_word ();
         test_itty_bit_string_append_zeros ();
+        test_itty_bit_string_set_prefix_run ();
         test_itty_bit_string_exclusive_nor ();
         test_itty_bit_string_exclusive_or ();
         test_itty_bit_string_combine ();

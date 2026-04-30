@@ -96,6 +96,35 @@ itty_bit_string_append_zeros (itty_bit_string_t *bit_string,
         }
 }
 
+void
+itty_bit_string_set_prefix_run (itty_bit_string_t *bit_string,
+                                size_t             start_bit,
+                                size_t             max_length,
+                                size_t             run_length)
+{
+        size_t bit_capacity;
+
+        assert (bit_string->mutability != ITTY_BIT_STRING_MUTABILITY_READ_ONLY);
+
+        if (run_length > max_length)
+                run_length = max_length;
+
+        bit_capacity = itty_bit_string_get_length (bit_string);
+        if (start_bit >= bit_capacity)
+                return;
+
+        if (start_bit + max_length > bit_capacity)
+                max_length = bit_capacity - start_bit;
+
+        for (size_t bit_index = 0; bit_index < max_length; bit_index++) {
+                itty_bit_string_set_bit (bit_string,
+                                         start_bit + bit_index,
+                                         bit_index < run_length);
+        }
+
+        bit_string->pop_count_computed = false;
+}
+
 itty_bit_string_t *
 itty_bit_string_exclusive_nor (itty_bit_string_t *a,
                                itty_bit_string_t *b)
