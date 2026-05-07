@@ -45,6 +45,31 @@ test_itty_bit_string_append_zeros (void)
 }
 
 void
+test_itty_bit_string_set_prefix_run (void)
+{
+        itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
+        char *representation;
+
+        itty_bit_string_append_word (bit_string, 0);
+        itty_bit_string_set_prefix_run (bit_string, 8, 8, 5);
+        representation = itty_bit_string_present (bit_string, ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL);
+        assert (strcmp (representation, "0000000000001f00") == 0);
+        free (representation);
+
+        itty_bit_string_set_prefix_run (bit_string, 8, 8, 2);
+        representation = itty_bit_string_present (bit_string, ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL);
+        assert (strcmp (representation, "0000000000000300") == 0);
+        free (representation);
+
+        itty_bit_string_set_prefix_run (bit_string, 8, 8, 99);
+        representation = itty_bit_string_present (bit_string, ITTY_BIT_STRING_PRESENTATION_FORMAT_HEXADECIMAL);
+        assert (strcmp (representation, "000000000000ff00") == 0);
+        free (representation);
+
+        itty_bit_string_free (bit_string);
+}
+
+void
 test_itty_bit_string_exclusive_nor (void)
 {
         itty_bit_string_t *a = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
@@ -271,33 +296,33 @@ test_itty_bit_string_get_length (void)
 {
         itty_bit_string_t *bit_string_1 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         itty_bit_string_append_word (bit_string_1, 0b1100);
-        assert (itty_bit_string_get_length (bit_string_1) == 4);
+        assert (itty_bit_string_get_length (bit_string_1) == ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
         itty_bit_string_free (bit_string_1);
 
         itty_bit_string_t *bit_string_2 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         itty_bit_string_append_word (bit_string_2, 0);
         itty_bit_string_append_word (bit_string_2, 0);
         itty_bit_string_append_word (bit_string_2, 0b1111);
-        assert (itty_bit_string_get_length (bit_string_2) == 4);
+        assert (itty_bit_string_get_length (bit_string_2) == 3 * ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
         itty_bit_string_free (bit_string_2);
 
         itty_bit_string_t *bit_string_3 = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         itty_bit_string_append_word (bit_string_3, 0);
-        assert (itty_bit_string_get_length (bit_string_3) == 0);
+        assert (itty_bit_string_get_length (bit_string_3) == ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
         itty_bit_string_free (bit_string_3);
 
         printf ("All test cases passed!\n");
 }
 
 void
-test_itty_bit_string_get_bit_capacity (void)
+test_itty_bit_string_get_length_reports_capacity (void)
 {
         itty_bit_string_t *bit_string = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         itty_bit_string_append_word (bit_string, 0);
         itty_bit_string_append_word (bit_string, 0);
 
-        assert (itty_bit_string_get_length (bit_string) == 0);
-        assert (itty_bit_string_get_bit_capacity (bit_string) == 2 * ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
+        assert (itty_bit_string_get_length (bit_string) == 2 * ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
+        assert (itty_bit_string_get_length (bit_string) == 2 * ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
 
         itty_bit_string_free (bit_string);
 
@@ -310,6 +335,7 @@ main (void)
         test_itty_bit_string_new ();
         test_itty_bit_string_append_word ();
         test_itty_bit_string_append_zeros ();
+        test_itty_bit_string_set_prefix_run ();
         test_itty_bit_string_exclusive_nor ();
         test_itty_bit_string_exclusive_or ();
         test_itty_bit_string_combine ();
@@ -325,7 +351,7 @@ main (void)
         test_itty_bit_string_reduce_rotated_by_half_wraps ();
         test_itty_bit_string_reduce_by_half ();
         test_itty_bit_string_get_length ();
-        test_itty_bit_string_get_bit_capacity ();
+        test_itty_bit_string_get_length_reports_capacity ();
 
         printf ("All itty-bit-string tests passed.\n");
         return 0;

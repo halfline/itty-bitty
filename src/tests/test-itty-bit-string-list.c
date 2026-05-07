@@ -228,13 +228,15 @@ test_itty_bit_string_list_transpose (void)
 
         itty_bit_string_list_t *transposed_list = itty_bit_string_list_transpose (list);
         assert (transposed_list != NULL);
-        assert (transposed_list->count == 4);
+        assert (transposed_list->count == ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
 
-        // Verify the transposed bits
-        char *representation_1 = itty_bit_string_present (transposed_list->bit_strings[0], ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY);
-        char *representation_2 = itty_bit_string_present (transposed_list->bit_strings[1], ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY);
-        char *representation_3 = itty_bit_string_present (transposed_list->bit_strings[2], ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY);
-        char *representation_4 = itty_bit_string_present (transposed_list->bit_strings[3], ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY);
+        for (size_t i = 0; i < ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 4; i++)
+                assert (itty_bit_string_get_pop_count (transposed_list->bit_strings[i]) == 0);
+
+        char *representation_1 = itty_bit_string_present (transposed_list->bit_strings[ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 4], ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY);
+        char *representation_2 = itty_bit_string_present (transposed_list->bit_strings[ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 3], ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY);
+        char *representation_3 = itty_bit_string_present (transposed_list->bit_strings[ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 2], ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY);
+        char *representation_4 = itty_bit_string_present (transposed_list->bit_strings[ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1], ITTY_BIT_STRING_PRESENTATION_FORMAT_BINARY);
         assert (strcmp (representation_1, "0000000000000000000000000000000000000000000000000000000000000111") == 0);
         assert (strcmp (representation_2, "0000000000000000000000000000000000000000000000000000000000000101") == 0);
         assert (strcmp (representation_3, "0000000000000000000000000000000000000000000000000000000000000110") == 0);
@@ -261,9 +263,13 @@ test_itty_bit_string_list_transpose_more_inputs_than_bits (void)
 
         itty_bit_string_list_t *transposed_list = itty_bit_string_list_transpose (list);
         assert (transposed_list != NULL);
-        assert (transposed_list->count == 1);
-        assert (transposed_list->bit_strings[0]->number_of_words == 2);
-        assert (itty_bit_string_get_pop_count (transposed_list->bit_strings[0]) == 65);
+        assert (transposed_list->count == ITTY_BIT_STRING_WORD_SIZE_IN_BITS);
+
+        for (size_t i = 0; i < ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1; i++)
+                assert (itty_bit_string_get_pop_count (transposed_list->bit_strings[i]) == 0);
+
+        assert (transposed_list->bit_strings[ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1]->number_of_words == 2);
+        assert (itty_bit_string_get_pop_count (transposed_list->bit_strings[ITTY_BIT_STRING_WORD_SIZE_IN_BITS - 1]) == 65);
 
         itty_bit_string_list_free (transposed_list);
         itty_bit_string_list_free (list);

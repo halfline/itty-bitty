@@ -260,7 +260,7 @@ test_itty_affinity_allows_explicit_score_length (void)
 }
 
 static void
-test_itty_affinity_plan_rejects_probe_shorter_than_score_length (void)
+test_itty_affinity_plan_accepts_probe_capacity_for_score_length (void)
 {
         itty_bit_string_list_t *traits = itty_bit_string_list_new ();
         itty_bit_string_list_t *imprints = itty_bit_string_list_new ();
@@ -277,7 +277,9 @@ test_itty_affinity_plan_rejects_probe_shorter_than_score_length (void)
         itty_affinity_probe_options_t options = {
                 .total_votes = 3
         };
-        assert (itty_affinity_plan_probe (plan, probe, &options) == NULL);
+        itty_bit_string_t *output = itty_affinity_plan_probe (plan, probe, &options);
+        assert (output != NULL);
+        itty_bit_string_free (output);
 
         itty_affinity_plan_free (plan);
         itty_affinity_free (affinity);
@@ -484,7 +486,7 @@ main (void)
         test_itty_affinity_gray_position_score_breaks_content_tie ();
         test_itty_affinity_scores_over_probe_length ();
         test_itty_affinity_allows_explicit_score_length ();
-        test_itty_affinity_plan_rejects_probe_shorter_than_score_length ();
+        test_itty_affinity_plan_accepts_probe_capacity_for_score_length ();
         test_itty_affinity_probe_list_uses_position_per_probe ();
         test_itty_affinity_probe_list_with_manager_matches_sync ();
         test_itty_affinity_plan_reuses_graph_for_fixed_width_probes ();

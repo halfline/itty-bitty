@@ -3,10 +3,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
-#include "itty-bit-string.c"
-#include "itty-bit-string-list.c"
-#include "itty-bit-string-map.c"
-#include "itty-vocabulary.c"
+#include "itty-bit-string.h"
+#include "itty-bit-string-map.h"
+#include "itty-vocabulary.h"
 
 static char *
 create_temp_file (const char *content, size_t size)
@@ -18,7 +17,7 @@ create_temp_file (const char *content, size_t size)
                 return NULL;
         }
 
-        if (write (fd, content, size) != size) {
+        if (write (fd, content, size) != (ssize_t) size) {
                 close (fd);
                 free (filename);
                 return NULL;
@@ -41,7 +40,7 @@ test_itty_vocabulary_new (void)
 
         itty_vocabulary_t *vocabulary = itty_vocabulary_new (text_file, bit_string_file);
         assert (vocabulary != NULL);
-        assert (vocabulary->count == 3);
+        assert (itty_vocabulary_get_count (vocabulary) == 3);
 
         itty_vocabulary_free (vocabulary);
         remove (text_file);
@@ -138,39 +137,7 @@ test_itty_vocabulary_decode_nearest (void)
 }
 
 void
-test_itty_vocabulary_decode_nearest_folds_activation (void)
-{
-        const char *text_content = " apple\n banana\n cherry\n";
-        size_t bit_string_words[] = { 0x01, 0x0a, 0x0c };
-
-        char *text_file = create_temp_file (text_content, strlen (text_content));
-        char *bit_string_file = create_temp_file ((char *) bit_string_words, sizeof (bit_string_words));
-
-        itty_vocabulary_t *vocabulary = itty_vocabulary_new (text_file, bit_string_file);
-        assert (vocabulary != NULL);
-
-        itty_bit_string_t *activation = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
-        itty_bit_string_append_word (activation, 0x0e);
-        itty_bit_string_append_word (activation, 0x0a);
-
-        char *text = NULL;
-        size_t distance = 0;
-        assert (itty_vocabulary_decode_nearest (vocabulary, activation, &text, &distance));
-        assert (text != NULL);
-        assert (strcmp (text, " banana") == 0);
-        assert (distance == 0);
-
-        free (text);
-        itty_bit_string_free (activation);
-        itty_vocabulary_free (vocabulary);
-        remove (text_file);
-        remove (bit_string_file);
-        free (text_file);
-        free (bit_string_file);
-}
-
-void
-test_itty_vocabulary_decode_nearest_rejects_uneven_fold (void)
+test_itty_vocabulary_decode_nearest_rejects_width_mismatch (void)
 {
         const char *text_content = " apple\n";
         size_t bit_string_words[] = { 0x01 };
@@ -248,8 +215,7 @@ main (void)
         test_itty_vocabulary_translate_to_bit_string ();
         test_itty_vocabulary_translate_to_text ();
         test_itty_vocabulary_decode_nearest ();
-        test_itty_vocabulary_decode_nearest_folds_activation ();
-        test_itty_vocabulary_decode_nearest_rejects_uneven_fold ();
+        test_itty_vocabulary_decode_nearest_rejects_width_mismatch ();
         test_itty_vocabulary_write_to_file ();
 
         printf ("All tests passed.\n");

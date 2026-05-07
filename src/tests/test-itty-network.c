@@ -100,6 +100,19 @@ create_network (void)
 }
 
 static itty_network_t *
+create_adapter_network (void)
+{
+        itty_network_t *network = itty_network_new ();
+        itty_network_layer_t *layer = itty_network_layer_new ();
+
+        itty_network_layer_append (layer, itty_network_adapter_node_new (create_bit_string (0b0011)));
+        itty_network_layer_append (layer, itty_network_adapter_node_new (create_bit_string (0b0101)));
+        itty_network_append (network, layer);
+
+        return network;
+}
+
+static itty_network_t *
 create_affinity_network (void)
 {
         itty_network_t *network = itty_network_new ();
@@ -406,11 +419,12 @@ test_itty_network_layer_present_feed_layer (void)
         assert (strstr (presentation, "stage 2: name=network double outputs") != NULL);
         assert (strstr (presentation, "name=network input") != NULL);
         assert (strstr (presentation, "name=network mask") != NULL);
+        assert (strstr (presentation, "name=network votes") != NULL);
         assert (strstr (presentation, "name=network modulated input") != NULL);
         assert (strstr (presentation, "name=network condensed output") != NULL);
         assert (strstr (presentation, "name=network layer output") != NULL);
         assert (strstr (presentation, "command 0: XOR") != NULL);
-        assert (strstr (presentation, "command 2: CONDENSE") != NULL);
+        assert (strstr (presentation, "command 2: WEIGHTED_CONDENSE") != NULL);
         assert (strstr (presentation, "command 3: DOUBLE") != NULL);
         free (presentation);
 
@@ -506,10 +520,28 @@ test_itty_network_present_plan_empty_network (void)
         itty_network_free (network);
 }
 
+static void
+test_itty_network_adapter_layer (void)
+{
+        itty_network_t *network = create_adapter_network ();
+        itty_bit_string_list_t *input = create_input_list ();
+        itty_bit_string_list_t *output = itty_network_feed (network, input);
+        size_t *first_output_words = itty_bit_string_get_words (itty_bit_string_list_fetch (output, 0));
+        size_t *second_output_words = itty_bit_string_get_words (itty_bit_string_list_fetch (output, 1));
+
+        assert (itty_bit_string_list_get_length (output) == 2);
+        assert (first_output_words[0] == (0b1111 ^ 0b0011));
+        assert (second_output_words[0] == (0b1111 ^ 0b0101));
+
+        free_feed_result (input, output);
+        itty_network_free (network);
+}
+
 int
 main (void)
 {
         test_itty_network_affinity_node_new_rejects_shape_mismatch ();
+        test_itty_network_adapter_layer ();
         test_itty_network_feed_with_manager ();
         test_itty_network_feed_with_manager_edge_cases ();
         test_itty_network_affinity_node_matches_affinity_probe_list ();
