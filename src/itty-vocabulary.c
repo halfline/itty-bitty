@@ -115,33 +115,6 @@ itty_vocabulary_translate_to_text (itty_vocabulary_t *vocabulary,
         return NULL;
 }
 
-static itty_bit_string_t *
-fold_activation_to_vocabulary_width (itty_bit_string_t *activation,
-                                     size_t             vocabulary_words)
-{
-        size_t activation_words = itty_bit_string_get_number_of_words (activation);
-
-        if (vocabulary_words == 0)
-                return NULL;
-
-        itty_bit_string_t *current_activation = activation;
-        while (activation_words > vocabulary_words) {
-                if (activation_words % 2 != 0 || activation_words / 2 < vocabulary_words) {
-                        if (current_activation != activation)
-                                itty_bit_string_free (current_activation);
-                        return NULL;
-                }
-
-                itty_bit_string_t *reduced_activation = itty_bit_string_reduce_by_half (current_activation);
-                if (current_activation != activation)
-                        itty_bit_string_free (current_activation);
-                current_activation = reduced_activation;
-                activation_words = itty_bit_string_get_number_of_words (current_activation);
-        }
-
-        return current_activation;
-}
-
 bool
 itty_vocabulary_decode_nearest (itty_vocabulary_t *vocabulary,
                                 itty_bit_string_t *activation,
@@ -156,9 +129,10 @@ itty_vocabulary_decode_nearest (itty_vocabulary_t *vocabulary,
 
         itty_bit_string_t *first_bit_string = itty_bit_string_list_fetch (vocabulary->bit_strings, 0);
         size_t vocabulary_words = itty_bit_string_get_number_of_words (first_bit_string);
-        itty_bit_string_t *folded_activation = fold_activation_to_vocabulary_width (activation,
-                                                                                    vocabulary_words);
-        if (!folded_activation)
+        if (vocabulary_words == 0)
+                return false;
+
+        if (itty_bit_string_get_number_of_words (activation) != vocabulary_words)
                 return false;
 
         size_t best_index = 0;
@@ -166,7 +140,7 @@ itty_vocabulary_decode_nearest (itty_vocabulary_t *vocabulary,
         bool found_one = false;
         for (size_t i = 0; i < vocabulary->count; i++) {
                 itty_bit_string_t *current_bit_string = itty_bit_string_list_fetch (vocabulary->bit_strings, i);
-                itty_bit_string_t *difference = itty_bit_string_exclusive_or (folded_activation,
+                itty_bit_string_t *difference = itty_bit_string_exclusive_or (activation,
                                                                               current_bit_string);
                 size_t current_distance = itty_bit_string_get_pop_count (difference);
                 itty_bit_string_free (difference);
@@ -177,9 +151,6 @@ itty_vocabulary_decode_nearest (itty_vocabulary_t *vocabulary,
                         best_distance = current_distance;
                 }
         }
-
-        if (folded_activation != activation)
-                itty_bit_string_free (folded_activation);
 
         if (!found_one)
                 return false;
