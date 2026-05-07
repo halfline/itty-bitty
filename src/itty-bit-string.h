@@ -47,6 +47,10 @@ void itty_bit_string_append_word (itty_bit_string_t *bit_string,
 
 void itty_bit_string_append_zeros (itty_bit_string_t *bit_string,
                                    size_t             count);
+void itty_bit_string_set_prefix_run (itty_bit_string_t *bit_string,
+                                     size_t             start_bit,
+                                     size_t             max_length,
+                                     size_t             run_length);
 
 itty_bit_string_t *itty_bit_string_exclusive_nor (itty_bit_string_t *a,
                                                   itty_bit_string_t *b);
