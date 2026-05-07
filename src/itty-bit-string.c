@@ -21,8 +21,6 @@ itty_bit_string_new (itty_bit_string_mutability_t mutability)
         bit_string->number_of_words = 0;
         bit_string->pop_count = 0;
         bit_string->pop_count_computed = false;
-        bit_string->bit_length = 0;
-        bit_string->bit_length_computed = false;
         bit_string->mutability = mutability;
         return bit_string;
 }
@@ -38,8 +36,6 @@ itty_bit_string_clone (itty_bit_string_t *bit_string)
         clone->number_of_words = bit_string->number_of_words;
         clone->pop_count = bit_string->pop_count;
         clone->pop_count_computed = bit_string->pop_count_computed;
-        clone->bit_length = bit_string->bit_length;
-        clone->bit_length_computed = bit_string->bit_length_computed;
 
         if (clone->number_of_words == 0)
                 return clone;
@@ -87,7 +83,6 @@ itty_bit_string_append_word (itty_bit_string_t *bit_string,
         bit_string->words[bit_string->number_of_words] = word;
         bit_string->number_of_words++;
         bit_string->pop_count_computed = false;
-        bit_string->bit_length_computed = false;
 }
 
 void
@@ -241,20 +236,7 @@ itty_bit_string_get_pop_count (itty_bit_string_t *bit_string)
 size_t
 itty_bit_string_get_length (itty_bit_string_t *bit_string)
 {
-        if (!bit_string->bit_length_computed) {
-                bit_string->bit_length = 0;
-                for (size_t i = 0; i < bit_string->number_of_words; i++) {
-                        if (bit_string->words[i] == 0)
-                                continue;
-
-                        size_t leading_zeros = __builtin_clzll (bit_string->words[i]);
-                        size_t word_bit_length = ITTY_BIT_STRING_WORD_SIZE_IN_BITS - leading_zeros;
-                        bit_string->bit_length = ((bit_string->number_of_words - i - 1) * ITTY_BIT_STRING_WORD_SIZE_IN_BITS) + word_bit_length;
-                        break;
-                }
-                bit_string->bit_length_computed = true;
-        }
-        return bit_string->bit_length;
+        return itty_bit_string_get_number_of_words (bit_string) * ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
 }
 
 size_t
@@ -297,12 +279,6 @@ size_t
 itty_bit_string_get_number_of_words (itty_bit_string_t *bit_string)
 {
         return bit_string->number_of_words;
-}
-
-size_t
-itty_bit_string_get_bit_capacity (itty_bit_string_t *bit_string)
-{
-        return itty_bit_string_get_number_of_words (bit_string) * ITTY_BIT_STRING_WORD_SIZE_IN_BITS;
 }
 
 void
@@ -399,7 +375,7 @@ static itty_bit_string_t *
 itty_bit_string_rotate_left (itty_bit_string_t *bit_string,
                              size_t             rotation)
 {
-        size_t bit_capacity = itty_bit_string_get_bit_capacity (bit_string);
+        size_t bit_capacity = itty_bit_string_get_length (bit_string);
         itty_bit_string_t *rotated = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         rotated->number_of_words = bit_string->number_of_words;
 
@@ -424,7 +400,7 @@ static itty_bit_string_t *
 itty_bit_string_rotate_right (itty_bit_string_t *bit_string,
                               size_t             rotation)
 {
-        size_t bit_capacity = itty_bit_string_get_bit_capacity (bit_string);
+        size_t bit_capacity = itty_bit_string_get_length (bit_string);
         itty_bit_string_t *rotated = itty_bit_string_new (ITTY_BIT_STRING_MUTABILITY_READ_WRITE);
         rotated->number_of_words = bit_string->number_of_words;
 
