@@ -1,0 +1,4 @@
+option('experimental_prototypes',
+       type: 'boolean',
+       value: true,
+       description: 'Build standalone experimental prototypes')
